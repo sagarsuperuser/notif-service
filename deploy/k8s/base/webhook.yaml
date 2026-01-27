@@ -22,7 +22,7 @@ spec:
       containers:
         - name: webhook
           image: notif-webhook:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           envFrom:

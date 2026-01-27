@@ -8,15 +8,18 @@ resources:
 
 images:
   - name: notif-api
-    newName: yourrepo/notif-api
-    newTag: REPLACE_ME
-  - name: notif-webhook
-    newName: yourrepo/notif-webhook
-    newTag: REPLACE_ME
-  - name: notif-worker
-    newName: yourrepo/notif-worker
-    newTag: REPLACE_ME
+    newName: ghcr.io/sagarsuperuser/notif-service/notif-api
+    newTag: sha-583f5e8
 
-patchesStrategicMerge:
-  - ingress-patch.yaml
-  - keda-patch.yaml
+  - name: notif-webhook
+    newName: ghcr.io/sagarsuperuser/notif-service/notif-webhook
+    newTag: sha-583f5e8
+
+  - name: notif-worker
+    newName: ghcr.io/sagarsuperuser/notif-service/notif-worker
+    newTag: sha-583f5e8
+  
+
+
+patches:
+  - path: pullsecret-patch.yaml
