@@ -11,8 +11,10 @@ spec:
   maxReplicaCount: 25
   triggers:
     - type: aws-sqs-queue
+      authenticationRef:
+        name: aws-sqs-auth
       metadata:
-        queueURL: https://sqs.ap-south-1.amazonaws.com/123456789012/notif-send.fifo
+        queueURL: https://sqs.ap-south-1.amazonaws.com/139831607173/notif-send.fifo
         queueLength: "200"
         activationQueueLength: "20"
         awsRegion: ap-south-1
