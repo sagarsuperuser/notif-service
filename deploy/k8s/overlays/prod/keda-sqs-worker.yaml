@@ -1,0 +1,18 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: notif-worker-sqs
+spec:
+  scaleTargetRef:
+    name: notif-worker
+  pollingInterval: 10
+  cooldownPeriod: 180
+  minReplicaCount: 0
+  maxReplicaCount: 25
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: https://sqs.ap-south-1.amazonaws.com/123456789012/notif-send.fifo
+        queueLength: "200"
+        activationQueueLength: "20"
+        awsRegion: ap-south-1

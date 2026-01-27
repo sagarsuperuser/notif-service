@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - ingress-public-webhook.yaml
+  - keda-sqs-worker.yaml
+
+images:
+  - name: notif-api
+    newName: yourrepo/notif-api
+    newTag: REPLACE_ME
+  - name: notif-webhook
+    newName: yourrepo/notif-webhook
+    newTag: REPLACE_ME
+  - name: notif-worker
+    newName: yourrepo/notif-worker
+    newTag: REPLACE_ME
+
+patchesStrategicMerge:
+  - ingress-patch.yaml
+  - keda-patch.yaml

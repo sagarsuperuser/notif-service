@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notif-config
+data:
+  # Common
+  AWS_REGION: "ap-south-1"
+  MAX_SMS_PER_DAY: "1000000"
+
+  # Worker / SQS tuning
+  WORKER_CONCURRENCY: "20"
+  SQS_WAIT_TIME: "20"
+  SQS_MAX_MSGS: "10"
+  SQS_VISIBILITY_TIMEOUT: "60"
+
+  # Twilio protection knobs (per pod)
+  TWILIO_RPS_PER_POD: "5"
+  TWILIO_BURST: "10"
+
+  # LocalStack (DEV only; remove in prod)
+  LOCALSTACK_ENDPOINT: "http://host.docker.internal:4566"
