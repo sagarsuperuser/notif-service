@@ -34,7 +34,7 @@ spec:
       http:
         paths:
           # keep exact Twilio path
-          - path: /v1/webhooks/twilio/status
+          - path: /
             pathType: Prefix
             backend:
               service:
