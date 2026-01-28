@@ -7,7 +7,7 @@ spec:
     name: notif-worker
   pollingInterval: 10
   cooldownPeriod: 180
-  minReplicaCount: 0
+  minReplicaCount: 1
   maxReplicaCount: 25
   triggers:
     - type: aws-sqs-queue

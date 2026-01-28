@@ -3,9 +3,10 @@ kind: Kustomization
 
 resources:
   - ../../base
-  - ingress-public-webhook.yaml
+  - ingress-hosts.yaml
   - keda-sqs-worker.yaml
   - keda-triggerauth-aws.yaml
+
 
 images:
   - name: notif-api
