@@ -28,5 +28,11 @@ bash deploy/k8s/cluster-addons/cert-manager/install.sh
 
 # 3) Choose issuer (start with staging)
 kubectl apply -f deploy/k8s/cluster-addons/cert-manager/clusterissuer-letsencrypt-staging.yaml
+
+#4) apply ingress
+kubectl apply -f deploy/k8s/overlays/prod/ingress-hosts.yaml
+
 # later:
 # kubectl apply -f deploy/k8s/cluster-addons/cert-manager/clusterissuer-letsencrypt-prod.yaml
+# update cert-manager.io/cluster-issuer: letsencrypt-prod
+# kubectl apply -f deploy/k8s/overlays/prod/ingress-hosts.yaml

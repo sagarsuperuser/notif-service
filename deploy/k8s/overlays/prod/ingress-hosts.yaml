@@ -1,10 +1,52 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: notif-ingress
+  name: notif-api-ingress
   annotations:
     kubernetes.io/ingress.class: nginx
-    cert-manager.io/cluster-issuer: letsencrypt-staging
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+    # MVP: allow HTTP + HTTPS together
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+
+    # minimal but useful
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+
+    # basic auth for API
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: notif-api-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+spec:
+  ingressClassName: nginx
+
+  tls:
+    - hosts:
+        - api.sagarwaidande.org
+      secretName: notif-api-tls
+
+  rules:
+    - host: api.sagarwaidande.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: notif-api-svc
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: notif-webhook-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 
     # MVP: allow HTTP + HTTPS together
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
@@ -20,24 +62,10 @@ spec:
 
   tls:
     - hosts:
-        - api.sagarwaidande.org
-      secretName: notif-api-tls
-    - hosts:
         - webhook.sagarwaidande.org
       secretName: notif-webhook-tls
 
   rules:
-    - host: api.sagarwaidande.org
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: notif-api-svc
-                port:
-                  number: 80
-
     - host: webhook.sagarwaidande.org
       http:
         paths:
