@@ -1,0 +1,22 @@
+controller:
+  kind: Deployment
+
+  service:
+    type: NodePort
+    nodePorts:
+      http: 30080
+      https: 30443
+    externalTrafficPolicy: Local
+
+  ingressClassResource:
+    name: nginx
+    enabled: true
+    default: true
+
+  ingressClass: nginx
+
+  admissionWebhooks:
+    enabled: true
+
+  metrics:
+    enabled: true

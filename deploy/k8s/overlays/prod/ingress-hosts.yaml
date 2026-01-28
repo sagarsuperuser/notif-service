@@ -4,11 +4,12 @@ metadata:
   name: notif-ingress
   annotations:
     kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-staging
 
-    # MVP: keep http working even if you later add TLS
+    # MVP: allow HTTP + HTTPS together
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
 
-    # keep minimal but useful
+    # minimal but useful
     nginx.ingress.kubernetes.io/limit-rps: "20"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
@@ -16,8 +17,16 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "1m"
 spec:
   ingressClassName: nginx
+
+  tls:
+    - hosts:
+        - api.sagarwaidande.org
+      secretName: notif-api-tls
+    - hosts:
+        - webhook.sagarwaidande.org
+      secretName: notif-webhook-tls
+
   rules:
-    # --- API host ---
     - host: api.sagarwaidande.org
       http:
         paths:
@@ -29,12 +38,11 @@ spec:
                 port:
                   number: 80
 
-    # --- Webhook host ---
     - host: webhook.sagarwaidande.org
       http:
         paths:
-          # keep exact Twilio path
-          - path: /
+          # keep only Twilio endpoint exposed
+          - path: /v1/webhooks/twilio/status
             pathType: Prefix
             backend:
               service:
