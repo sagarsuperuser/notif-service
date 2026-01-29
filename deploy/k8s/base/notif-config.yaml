@@ -16,6 +16,3 @@ data:
   # Twilio protection knobs (per pod)
   TWILIO_RPS_PER_POD: "5"
   TWILIO_BURST: "10"
-
-  # LocalStack (DEV only; remove in prod)
-  LOCALSTACK_ENDPOINT: "http://host.docker.internal:4566"
