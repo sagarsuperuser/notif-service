@@ -1,2 +1,7 @@
 .env*
 *.txt
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.DS_Store

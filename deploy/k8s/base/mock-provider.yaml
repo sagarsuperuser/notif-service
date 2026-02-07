@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notif-mock-provider
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: notif-mock-provider
+  template:
+    metadata:
+      labels:
+        app: notif-mock-provider
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: mock-provider
+          image: notif-mock-provider:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: notif-config
+            - secretRef:
+                name: notif-secrets
+          env:
+            - name: PORT
+              value: "8080"
+            - name: MOCK_OUTCOME_MODE
+              value: "weighted"
+            - name: MOCK_OUTCOMES
+              value: "ok"
+            - name: MOCK_SUCCESS_RATE
+              value: "0.95"
+            - name: MOCK_FAILURE_TYPES
+              value: "undelivered,failed,rate_limit,bad_request,server_error,timeout"
+            - name: MOCK_FAILURE_WEIGHTS
+              value: "undelivered:2,failed:3,rate_limit:4,bad_request:1,server_error:1,timeout:1"
+            - name: MOCK_WEBHOOK_URL
+              value: "http://notif-webhook-svc/v1/webhooks/twilio/status"
+            - name: MOCK_WEBHOOK_DELAY_MS
+              value: "1000"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notif-mock-provider-svc
+  labels:
+    app: notif-mock-provider
+spec:
+  type: ClusterIP
+  selector:
+    app: notif-mock-provider
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

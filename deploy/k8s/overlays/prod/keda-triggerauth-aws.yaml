@@ -1,0 +1,12 @@
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: aws-sqs-auth
+spec:
+  secretTargetRef:
+    - parameter: awsAccessKeyID
+      name: notif-secrets
+      key: AWS_ACCESS_KEY_ID
+    - parameter: awsSecretAccessKey
+      name: notif-secrets
+      key: AWS_SECRET_ACCESS_KEY

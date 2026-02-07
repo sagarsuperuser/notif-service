@@ -11,10 +11,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"notif/internal/awsutil"
 	"notif/internal/config"
-	"notif/internal/httpapi"
+	"notif/internal/httpserver"
 	"notif/internal/logging"
 	"notif/internal/observability"
 	sqsqueue "notif/internal/queue/sqs"
@@ -24,9 +25,8 @@ import (
 )
 
 func main() {
-	logging.Init("api")
-
 	cfg := config.LoadAPI()
+	logging.Init("api", cfg.LogFormat)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -37,13 +37,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	sqsClient, err := awsutil.NewSQSClient(ctx, cfg.AWSRegion)
+	sqsClient, err := awsutil.NewSQSClient(ctx, cfg.AWSRegion, cfg.LocalstackEndpoint)
 	if err != nil {
 		slog.Error("api sqs client init failed", "err", err)
 		os.Exit(1)
 	}
 
-	observability.Register(prometheus.DefaultRegisterer)
+	observability.RegisterAPI(prometheus.DefaultRegisterer)
 
 	store := pg.New(db)
 	producer := &sqsqueue.Producer{SQS: sqsClient, QueueURL: cfg.SQSQueueURL}
@@ -54,27 +54,43 @@ func main() {
 		MaxPerDay: cfg.MaxSMSPerDay,
 	}
 
-	s := httpapi.New()
-	api := &httpapi.API{
+	s := httpserver.New()
+	s.Mux.Use(httpserver.Metrics(observability.APIRequests))
+	s.Mux.Use(httpserver.Logging)
+	api := &httpserver.API{
 		Svc:   svc,
 		IDGen: util.NewMessageID,
 	}
 	api.Register(s.Mux)
 
-	s.Mux.HandleFunc("/healthz", httpapi.Healthz())
-	s.Mux.HandleFunc("/readyz", httpapi.Readyz(2*time.Second, func(ctx context.Context) error {
+	s.Mux.HandleFunc("/healthz", httpserver.Healthz()).Methods(http.MethodGet)
+	s.Mux.HandleFunc("/readyz", httpserver.Readyz(2*time.Second, func(ctx context.Context) error {
 		return db.Ping(ctx)
-	}))
+	})).Methods(http.MethodGet)
 
-	handler := httpapi.Logging(s.Mux)
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: handler,
+		Handler: s.Mux,
 	}
+	metricsSrv := &http.Server{
+		Addr:    ":" + cfg.MetricsPort,
+		Handler: promhttp.Handler(),
+	}
+
+	metricsErrCh := make(chan error, 1)
+	go func() {
+		slog.Info("api metrics listening", "port", cfg.MetricsPort)
+		metricsErrCh <- metricsSrv.ListenAndServe()
+	}()
+
+	slog.Info("api listening", "port", cfg.Port)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ListenAndServe()
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		sig := <-sigCh
 		slog.Info("api shutdown", "signal", sig.String())
@@ -82,12 +98,20 @@ func main() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		_ = srv.Shutdown(shutdownCtx)
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("api listening", "port", cfg.Port)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("api server failed", "err", err)
-		os.Exit(1)
+	select {
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("api server failed", "err", err)
+			os.Exit(1)
+		}
+	case err := <-metricsErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("api metrics server failed", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	db.Close()

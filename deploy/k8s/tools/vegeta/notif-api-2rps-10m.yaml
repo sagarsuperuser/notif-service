@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vegeta-notif-api-2rps-10m
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: vegeta
+          image: peterevans/vegeta:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "POST http://notif-api-svc/v1/sms/messages" | vegeta attack \
+                -rate=2/s -duration=10m -timeout=5s \
+                -header="Content-Type: application/json" \
+                -body=/data/body.json | tee /tmp/results.bin | vegeta report
+          volumeMounts:
+            - name: payload
+              mountPath: /data
+      volumes:
+        - name: payload
+          configMap:
+            name: vegeta-notif-api-payload
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vegeta-notif-api-payload
+data:
+  body.json: |
+    {
+      "tenantId": "foodapp",
+      "idempotencyKey": "vegeta-${RANDOM}",
+      "to": "+919003021770",
+      "templateId": "txn_confirm_v1",
+      "vars": {
+        "name": "Test",
+        "ref": "vegeta"
+      }
+    }

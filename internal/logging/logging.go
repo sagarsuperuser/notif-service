@@ -6,10 +6,10 @@ import (
 	"strings"
 )
 
-// Init sets a JSON (default) or text slog handler based on LOG_FORMAT.
+// Init sets a JSON (default) or text slog handler based on the provided format.
 // Supported: "json" (default), "text".
-func Init(service string) *slog.Logger {
-	format := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_FORMAT")))
+func Init(service, format string) *slog.Logger {
+	format = strings.ToLower(strings.TrimSpace(format))
 	opts := &slog.HandlerOptions{}
 
 	var handler slog.Handler

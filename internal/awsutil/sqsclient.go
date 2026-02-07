@@ -2,7 +2,6 @@ package awsutil
 
 import (
 	"context"
-	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	configv2 "github.com/aws/aws-sdk-go-v2/config"
@@ -10,9 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
-func NewSQSClient(ctx context.Context, region string) (*sqs.Client, error) {
-	endpoint := os.Getenv("LOCALSTACK_ENDPOINT") // e.g. http://localhost:4566 for LocalStack
-
+func NewSQSClient(ctx context.Context, region, endpoint string) (*sqs.Client, error) {
 	// Always load config normally
 	opts := []func(*configv2.LoadOptions) error{
 		configv2.WithRegion(region),
@@ -30,7 +27,7 @@ func NewSQSClient(ctx context.Context, region string) (*sqs.Client, error) {
 		return nil, err
 	}
 
-	// For LocalStack: set service client BaseEndpoint (v2-style, not deprecated)
+	// For LocalStack: set service client BaseEndpoint (v2-style)
 	if endpoint != "" {
 		return sqs.NewFromConfig(cfg, func(o *sqs.Options) {
 			o.BaseEndpoint = aws.String(endpoint)

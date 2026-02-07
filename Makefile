@@ -4,6 +4,7 @@ LS_CONTAINER = notif-localstack
 ENV_FILE=.env.local
 
 .PHONY: up down logs reset queues migrate seed init test test-integration k8s-up k8s-down k8s-restart k8s-secrets
+.PHONY: docker-build k3d-import k3d-build-import
 
 up:
 	$(COMPOSE) up -d
@@ -49,15 +50,15 @@ env:
 
 run-api: env
 	@set -a; . ./$(ENV_FILE); set +a; \
-	PORT=$${API_PORT:-8080} go run ./cmd/api
+	PORT=$${API_PORT:-8080} METRICS_PORT=$${API_METRICS_PORT:-9090} go run ./cmd/api
 
 run-worker: env
 	@set -a; . ./$(ENV_FILE); set +a; \
-	PORT=$${WORKER_PORT:-8082} go run ./cmd/worker
+	PORT=$${WORKER_PORT:-8082} METRICS_PORT=$${WORKER_METRICS_PORT:-9090} go run ./cmd/worker
 
 run-webhook: env
 	@set -a; . ./$(ENV_FILE); set +a; \
-	PORT=$${WEBHOOK_PORT:-8081} go run ./cmd/webhook
+	PORT=$${WEBHOOK_PORT:-8081} METRICS_PORT=$${WEBHOOK_METRICS_PORT:-9090} go run ./cmd/webhook
 
 
 test:
@@ -67,15 +68,28 @@ test-integration: env
 	@set -a; . ./$(ENV_FILE); set +a; \
 	go test -tags=integration ./tests/integration -v
 
+docker-build:
+	docker build -t notif-api:dev --build-arg CMD=api .
+	docker build -t notif-worker:dev --build-arg CMD=worker .
+	docker build -t notif-webhook:dev --build-arg CMD=webhook .
+	docker build -t notif-mock-provider:dev --build-arg CMD=mock-provider .
+
+k3d-import:
+	k3d image import notif-api:dev notif-worker:dev notif-webhook:dev notif-mock-provider:dev -c notif
+
+k3d-build-import: docker-build k3d-import
+
+
+k8s-restart:
+	kubectl rollout restart deploy/notif-api deploy/notif-worker deploy/notif-webhook
 
 k8s-up:
 	kubectl apply -k deploy/k8s/overlays/dev
+	
 
 k8s-down:
 	kubectl delete -k deploy/k8s/overlays/dev
 
-k8s-restart:
-	kubectl rollout restart deploy/notif-api deploy/notif-worker deploy/notif-webhook
 
 k8s-secrets:
 	kubectl create secret generic notif-secrets --from-env-file=.env.secrets \

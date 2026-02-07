@@ -12,14 +12,16 @@ import (
 	"notif/internal/observability"
 	"notif/internal/providers/twilio"
 	sqsqueue "notif/internal/queue/sqs"
+	"notif/internal/store"
 	"notif/internal/util"
 )
 
 type Store interface {
-	GetMessageForWorker(ctx context.Context, msgID string) (tenantID, to, templateID, campaignID, state, providerMsgID string, vars map[string]string, err error)
-	InsertAttempt(ctx context.Context, msgID, provider, providerMsgID string, httpStatus int, errCode, errMsg string, reqJSON, respJSON any) error
-	SetProviderDetails(ctx context.Context, msgID, provider, providerMsgID, state string, now time.Time) error
-	MarkMessageState(ctx context.Context, msgID, state, lastError string, now time.Time) error
+	GetMessageForWorker(ctx context.Context, msgID string) (store.MessageForWorker, error)
+	InsertAttempt(ctx context.Context, in store.ProviderAttempt) error
+	SetProviderDetails(ctx context.Context, in store.ProviderDetailsUpdate) error
+	MarkMessageState(ctx context.Context, in store.MessageStateUpdate) error
+	ClaimMessage(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (bool, error)
 }
 
 type TwilioSender interface {
@@ -27,37 +29,68 @@ type TwilioSender interface {
 }
 
 type Processor struct {
-	Store     Store
-	Sender    TwilioSender
-	Templates map[string]string
-	Limiter   *rate.Limiter
-	Breaker   *gobreaker.CircuitBreaker
+	Store           Store
+	Sender          TwilioSender
+	Templates       map[string]string
+	Limiter         *rate.Limiter
+	Breaker         *gobreaker.CircuitBreaker
+	ClaimStaleAfter time.Duration
 }
 
 func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
-	tenantID, to, templateID, campaignID, state, providerMsgID, vars, err := p.Store.GetMessageForWorker(ctx, job.MessageID)
+	started := util.NowUTC()
+	processed := false
+	result := "success"
+
+	defer func() {
+		if processed {
+			observability.WorkerProcessed.WithLabelValues(result).Inc()
+			observability.WorkerProcessingSeconds.Observe(time.Since(started).Seconds())
+		}
+	}()
+
+	msg, err := p.Store.GetMessageForWorker(ctx, job.MessageID)
 	if err != nil {
 		return err
 	}
 
 	// Idempotent consumer: skip final or already submitted with SID
-	if state == "suppressed" || state == "delivered" || state == "failed" {
+	if msg.State == "suppressed" || msg.State == "delivered" || msg.State == "failed" {
 		return nil
 	}
-	if providerMsgID != "" && state == "submitted" {
+	if msg.ProviderMsgID != "" && msg.State == "submitted" {
 		return nil
 	}
 
-	bodyTmpl, ok := p.Templates[templateID]
-	if !ok || bodyTmpl == "" {
-		_ = p.Store.MarkMessageState(ctx, job.MessageID, "failed", "template_not_found", time.Now())
-		return errors.New("template_not_found: " + templateID)
+	// Claim before sending to avoid duplicate processing.
+	claimed, err := p.Store.ClaimMessage(ctx, job.MessageID, util.NowUTC(), p.claimStaleAfter())
+	if err != nil {
+		return err
 	}
-	body := util.RenderTemplate(bodyTmpl, vars)
+	if !claimed {
+		return nil
+	}
+	processed = true
+
+	bodyTmpl, ok := p.Templates[msg.TemplateID]
+	if !ok || bodyTmpl == "" {
+		result = "failure_invalid_template"
+		if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{
+			ID:        job.MessageID,
+			State:     "failed",
+			LastError: "template_not_found",
+			Now:       util.NowUTC(),
+		}); err != nil {
+			return err
+		}
+		return errors.New("template_not_found: " + msg.TemplateID)
+	}
+	body := util.RenderTemplate(bodyTmpl, msg.Vars)
 
 	// Send with small retries on transient issues
 	var lastErr error
-	start := time.Now()
+	start := util.NowUTC()
+	endToEndRecorded := false
 
 	for attempt := 0; attempt < 3; attempt++ {
 		// 1) Rate limit before calling Twilio (per pod)
@@ -68,17 +101,19 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 			if err != nil {
 				// If we can't even acquire a token, treat as transient (don't mark failed)
 				observability.TwilioSend.WithLabelValues("rate_limited_local", "0").Inc()
+				lastErr = err
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
 		}
 
 		// 2) Circuit breaker wraps the Twilio call
-		resAny, err := p.executeWithBreaker(ctx, to, body)
+		resAny, err := p.executeWithBreaker(ctx, msg.To, body)
 
 		// 3) Handle breaker open (fail fast; let SQS redrive later)
 		if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
-			observability.TwilioSend.WithLabelValues("cb_open", "0").Inc()
+			observability.TwilioSend.WithLabelValues("failed_cb_open", "0").Inc()
+			result = "failure_throttled_cb"
 			// IMPORTANT: do NOT mark message failed; this is transient provider protection.
 			return err
 		}
@@ -93,12 +128,31 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 
 			observability.TwilioSend.WithLabelValues("ok", strconv.Itoa(httpStatus)).Inc()
 			observability.TwilioLatency.Observe(time.Since(start).Seconds())
+			if !endToEndRecorded {
+				observability.EndToEndLatency.Observe(time.Since(msg.CreatedAt).Seconds())
+				endToEndRecorded = true
+			}
 
-			_ = p.Store.InsertAttempt(ctx, job.MessageID, "twilio", resp.Sid, httpStatus, "", "", map[string]any{
-				"to": to, "templateId": templateID, "campaignId": campaignID, "tenantId": tenantID,
-			}, jsonRaw(raw))
+			if err := p.Store.InsertAttempt(ctx, store.ProviderAttempt{
+				MessageID:     job.MessageID,
+				Provider:      "twilio",
+				ProviderMsgID: resp.Sid,
+				HTTPStatus:    httpStatus,
+				RequestJSON: map[string]any{
+					"to": msg.To, "templateId": msg.TemplateID, "campaignId": msg.CampaignID, "tenantId": msg.TenantID,
+				},
+				ResponseJSON: jsonRaw(raw),
+			}); err != nil {
+				return err
+			}
 
-			if err := p.Store.SetProviderDetails(ctx, job.MessageID, "twilio", resp.Sid, "submitted", time.Now()); err != nil {
+			if err := p.Store.SetProviderDetails(ctx, store.ProviderDetailsUpdate{
+				ID:            job.MessageID,
+				Provider:      "twilio",
+				ProviderMsgID: resp.Sid,
+				State:         "submitted",
+				Now:           util.NowUTC(),
+			}); err != nil {
 				return err
 			}
 			return nil
@@ -115,22 +169,51 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 		}
 
 		observability.TwilioSend.WithLabelValues("error", strconv.Itoa(httpStatus)).Inc()
+		if !endToEndRecorded {
+			observability.EndToEndLatency.Observe(time.Since(msg.CreatedAt).Seconds())
+			endToEndRecorded = true
+		}
 
-		_ = p.Store.InsertAttempt(ctx, job.MessageID, "twilio", "", httpStatus, "", err.Error(), map[string]any{
-			"to": to, "templateId": templateID, "campaignId": campaignID, "tenantId": tenantID,
-		}, map[string]any{
-			"raw": string(raw),
-		})
+		if err := p.Store.InsertAttempt(ctx, store.ProviderAttempt{
+			MessageID:  job.MessageID,
+			Provider:   "twilio",
+			HTTPStatus: httpStatus,
+			ErrorMsg:   err.Error(),
+			RequestJSON: map[string]any{
+				"to": msg.To, "templateId": msg.TemplateID, "campaignId": msg.CampaignID, "tenantId": msg.TenantID,
+			},
+			ResponseJSON: map[string]any{
+				"raw": string(raw),
+			},
+		}); err != nil {
+			return err
+		}
 
 		if !twilio.ShouldRetry(err, httpStatus) {
-			_ = p.Store.MarkMessageState(ctx, job.MessageID, "failed", "twilio_non_retryable", time.Now())
+			result = "failure_non_retryable"
+			if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{
+				ID:        job.MessageID,
+				State:     "failed",
+				LastError: "twilio_non_retryable",
+				Now:       util.NowUTC(),
+			}); err != nil {
+				return err
+			}
 			return err
 		}
 
 		time.Sleep(twilio.Backoff(attempt))
 	}
 
-	_ = p.Store.MarkMessageState(ctx, job.MessageID, "failed", "twilio_retry_exhausted", time.Now())
+	if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{
+		ID:        job.MessageID,
+		State:     "failed",
+		LastError: "twilio_retry_exhausted",
+		Now:       util.NowUTC(),
+	}); err != nil {
+		return err
+	}
+	result = "failure_retry_exhausted"
 	return lastErr
 }
 
@@ -153,6 +236,13 @@ func (p *Processor) executeWithBreaker(ctx context.Context, to, body string) (an
 		return call()
 	}
 	return p.Breaker.Execute(call)
+}
+
+func (p *Processor) claimStaleAfter() time.Duration {
+	if p.ClaimStaleAfter <= 0 {
+		return 2 * time.Minute
+	}
+	return p.ClaimStaleAfter
 }
 
 func jsonRaw(b []byte) any { return map[string]any{"raw": string(b)} }

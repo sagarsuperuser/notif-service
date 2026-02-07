@@ -38,7 +38,7 @@ CREATE TABLE messages (
   template_id      TEXT NOT NULL,
   vars_json        JSONB NOT NULL,
   campaign_id      TEXT NULL,
-  state            TEXT NOT NULL, -- queued|suppressed|submitted|delivered|failed
+  state            TEXT NOT NULL, -- queued|processing|suppressed|submitted|delivered|failed
   provider         TEXT NULL,      -- "twilio"
   provider_msg_id  TEXT NULL,      -- Twilio MessageSid
   last_error       TEXT NULL,

@@ -1,0 +1,71 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-notif-api-2rps-10m
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args: ["run", "/scripts/notif-api-2rps-10m.js"]
+          env:
+            - name: API_URL
+              value: "http://notif-api-svc/v1/sms/messages"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-notif-api-2rps-10m
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-notif-api-2rps-10m
+data:
+  notif-api-2rps-10m.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+
+    export const options = {
+      vus: 10,
+      duration: '10m',
+      rps: 20,
+    };
+
+    const API_URL = __ENV.API_URL || 'http://notif-api-svc/v1/sms/messages';
+
+    export default function () {
+      const now = Date.now();
+      const key = `k6-${__VU}-${__ITER}-${now}`;
+
+      const payload = JSON.stringify({
+        tenantId: 'foodapp',
+        idempotencyKey: key,
+        to: '+919003021770',
+        templateId: 'txn_confirm_v1',
+        vars: {
+          name: 'Test',
+          ref: key,
+        },
+      });
+
+      const params = {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Run': 'k6-notif-api-2rps-10m',
+        },
+      };
+
+      const res = http.post(API_URL, payload, params);
+      check(res, {
+        'status is 2xx': (r) => r.status >= 200 && r.status < 300,
+      });
+
+      sleep(1);
+    }
