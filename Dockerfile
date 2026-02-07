@@ -14,9 +14,11 @@ COPY . .
 
 # Which binary to build: api | worker | webhook
 ARG CMD=api
+ARG TARGETOS=linux
+ARG TARGETARCH
 
 # Build a static-ish binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${CMD}
 
 # ---- runtime ----

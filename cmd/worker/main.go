@@ -13,15 +13,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"notif/internal/awsutil"
 	"notif/internal/config"
-	"notif/internal/httpapi"
+	"notif/internal/httpserver"
 	"notif/internal/logging"
 	"notif/internal/observability"
 	"notif/internal/providers/twilio"
 	sqsqueue "notif/internal/queue/sqs"
 	"notif/internal/store/pg"
+	"notif/internal/util"
 	workerproc "notif/internal/worker"
 
 	"github.com/sony/gobreaker"
@@ -29,9 +31,8 @@ import (
 )
 
 func main() {
-	logging.Init("worker")
-
 	cfg := config.LoadWorker()
+	logging.Init("worker", cfg.LogFormat)
 
 	// Use a root ctx we can cancel
 	ctx, cancel := context.WithCancel(context.Background())
@@ -44,41 +45,27 @@ func main() {
 	defer db.Close()
 	store := pg.New(db)
 
-	sqsClient, err := awsutil.NewSQSClient(ctx, cfg.AWSRegion)
+	sqsClient, err := awsutil.NewSQSClient(ctx, cfg.AWSRegion, cfg.LocalstackEndpoint)
 	if err != nil {
 		slog.Error("worker sqs client init failed", "err", err)
 		os.Exit(1)
 	}
 
-	startupCtx, startupCancel := context.WithTimeout(ctx, 3*time.Second)
-	defer startupCancel()
-
-	if err := db.Ping(startupCtx); err != nil {
-		slog.Error("db not reachable", "err", err)
-		os.Exit(1)
-	}
-	if _, err := sqsClient.GetQueueAttributes(startupCtx, &sqs.GetQueueAttributesInput{
-		QueueUrl:       &cfg.SQSQueueURL,
-		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameQueueArn},
-	}); err != nil {
-		slog.Error("sqs not reachable", "err", err)
-		os.Exit(1)
-	}
-
 	reg := prometheus.DefaultRegisterer
-	observability.Register(reg)
+	observability.RegisterWorker(reg)
 
 	consumer := &sqsqueue.Consumer{
-		SQS: sqsClient, QueueURL: cfg.SQSQueueURL,
+		SQS:               sqsClient,
+		QueueURL:          cfg.SQSQueueURL,
 		WaitTimeSeconds:   cfg.SQSWaitTime,
 		MaxMessages:       cfg.SQSMaxMsgs,
 		VisibilityTimeout: cfg.SQSVizTimeout,
 	}
 
-	// health server (liveness + readiness)
-	healthMux := httpapi.New().Mux
-	healthMux.HandleFunc("/healthz", httpapi.Healthz())
-	healthMux.HandleFunc("/readyz", httpapi.Readyz(2*time.Second,
+	// health server (dependency checks)
+	healthMux := httpserver.New().Mux
+	healthMux.Use(httpserver.Logging)
+	healthMux.HandleFunc("/healthz", httpserver.Readyz(2*time.Second,
 		func(c context.Context) error { return db.Ping(c) },
 		func(c context.Context) error {
 			_, err := sqsClient.GetQueueAttributes(c, &sqs.GetQueueAttributesInput{
@@ -87,11 +74,15 @@ func main() {
 			})
 			return err
 		},
-	))
+	)).Methods(http.MethodGet)
 
 	healthSrv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: httpapi.Logging(healthMux),
+		Handler: healthMux,
+	}
+	metricsSrv := &http.Server{
+		Addr:    ":" + cfg.MetricsPort,
+		Handler: promhttp.Handler(),
 	}
 
 	healthErrCh := make(chan error, 1)
@@ -99,14 +90,20 @@ func main() {
 		slog.Info("worker health listening", "port", cfg.Port)
 		healthErrCh <- healthSrv.ListenAndServe()
 	}()
+	metricsErrCh := make(chan error, 1)
+	go func() {
+		slog.Info("worker metrics listening", "port", cfg.MetricsPort)
+		metricsErrCh <- metricsSrv.ListenAndServe()
+	}()
 
 	// Twilio + limiter/breaker + processor
-	tw := &twilio.Client{
+	sender := &twilio.Client{
 		AccountSID:          cfg.TwilioAccountSID,
 		AuthToken:           cfg.TwilioAuthToken,
 		HTTP:                &http.Client{Timeout: 8 * time.Second},
 		MessagingServiceSID: cfg.TwilioMessagingServiceSID,
 		FromNumber:          cfg.TwilioFromNumber,
+		BaseURL:             cfg.TwilioBaseURL,
 	}
 	limiter := rate.NewLimiter(rate.Limit(cfg.TwilioRPSPerPod), cfg.TwilioBurst)
 	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
@@ -119,11 +116,12 @@ func main() {
 		"txn_confirm_v1": "Hi {name}, your request is confirmed. Ref: {ref}. Thanks.",
 	}
 	processor := &workerproc.Processor{
-		Store:     store,
-		Sender:    tw,
-		Templates: templates,
-		Limiter:   limiter,
-		Breaker:   cb,
+		Store:           store,
+		Sender:          sender,
+		Templates:       templates,
+		Limiter:         limiter,
+		Breaker:         cb,
+		ClaimStaleAfter: time.Duration(cfg.SQSVizTimeout) * time.Second,
 	}
 
 	// start polling
@@ -131,7 +129,7 @@ func main() {
 	go func() {
 		slog.Info("worker starting poll", "queue_url", cfg.SQSQueueURL)
 		pollErrCh <- consumer.PollConcurrent(ctx, cfg.WorkerConcurrency, func(ctx context.Context, job sqsqueue.SMSJob) (err error) {
-			start := time.Now()
+			start := util.NowUTC()
 			slog.Info("worker job start", "message_id", job.MessageID)
 			defer func() {
 				if err != nil {
@@ -169,6 +167,11 @@ func main() {
 			slog.Error("worker health server failed", "err", err)
 			os.Exit(1)
 		}
+	case err := <-metricsErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("worker metrics server failed", "err", err)
+			os.Exit(1)
+		}
 	case sig := <-sigCh:
 		slog.Info("worker shutdown", "signal", sig.String())
 	}
@@ -178,6 +181,7 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = healthSrv.Shutdown(shutdownCtx)
+	_ = metricsSrv.Shutdown(shutdownCtx)
 
 	select {
 	case <-pollErrCh:

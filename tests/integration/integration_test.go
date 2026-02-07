@@ -22,10 +22,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"notif/internal/domain"
+	"notif/internal/httpserver"
 	"notif/internal/providers/twilio"
 	sqsqueue "notif/internal/queue/sqs"
 	"notif/internal/service"
+	"notif/internal/store"
 	"notif/internal/store/pg"
+	"notif/internal/util"
 	workerproc "notif/internal/worker"
 )
 
@@ -40,7 +43,7 @@ func TestConsentOptedOutSuppressed(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store := pg.New(db)
+	dbStore := pg.New(db)
 
 	tenantID := "t1"
 	phone := "+15551234567"
@@ -57,7 +60,7 @@ func TestConsentOptedOutSuppressed(t *testing.T) {
 	}
 
 	svc := &service.NotificationService{
-		Store:     store,
+		Store:     dbStore,
 		Queue:     noopQueue{},
 		MaxPerDay: 10,
 	}
@@ -68,7 +71,7 @@ func TestConsentOptedOutSuppressed(t *testing.T) {
 		To:             phone,
 		TemplateID:     "tpl-1",
 		Vars:           map[string]string{"name": "a"},
-	}, "msg-1", time.Now())
+	}, "msg-1", util.NowUTC())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -85,7 +88,7 @@ func TestCapExceededSuppressed(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store := pg.New(db)
+	dbStore := pg.New(db)
 
 	tenantID := "t2"
 	phone := "+15557654321"
@@ -102,7 +105,7 @@ func TestCapExceededSuppressed(t *testing.T) {
 	}
 
 	svc := &service.NotificationService{
-		Store:     store,
+		Store:     dbStore,
 		Queue:     noopQueue{},
 		MaxPerDay: 1,
 	}
@@ -113,7 +116,7 @@ func TestCapExceededSuppressed(t *testing.T) {
 		To:             phone,
 		TemplateID:     "tpl-2",
 		Vars:           map[string]string{"name": "b"},
-	}, "msg-2", time.Now())
+	}, "msg-2", util.NowUTC())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -129,7 +132,7 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store := pg.New(db)
+	dbStore := pg.New(db)
 
 	tenantID := "t3"
 	phone := "+15550001111"
@@ -137,7 +140,7 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 	seedTenantOptedIn(t, db, tenantID, phone)
 
 	svc := &service.NotificationService{
-		Store:     store,
+		Store:     dbStore,
 		Queue:     noopQueue{},
 		MaxPerDay: 10,
 	}
@@ -148,7 +151,7 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 		To:             phone,
 		TemplateID:     "tpl-3",
 		Vars:           map[string]string{"name": "c"},
-	}, "msg-3", time.Now())
+	}, "msg-3", util.NowUTC())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -158,7 +161,13 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 
 	assertMessageStateDB(t, db, "msg-3", string(domain.StateQueued))
 
-	if err := store.SetProviderDetails(ctx, "msg-3", "twilio", "SM123", "submitted", time.Now()); err != nil {
+	if err := dbStore.SetProviderDetails(ctx, store.ProviderDetailsUpdate{
+		ID:            "msg-3",
+		Provider:      "twilio",
+		ProviderMsgID: "SM123",
+		State:         "submitted",
+		Now:           util.NowUTC(),
+	}); err != nil {
 		t.Fatalf("set provider details: %v", err)
 	}
 	assertMessageStateDB(t, db, "msg-3", string(domain.StateSubmitted))
@@ -179,45 +188,17 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "bad form", 400)
-			return
-		}
+	s := httpserver.New()
+	webhook := &httpserver.Webhook{
+		Store:           dbStore,
+		VerifySignature: twilio.VerifySignature,
+		AuthToken:       authToken,
+		PublicURL:       publicURL,
+	}
+	webhook.Register(s.Mux)
 
-		gotSig := r.Header.Get("X-Twilio-Signature")
-		if !twilio.VerifySignature(authToken, publicURL, gotSig, r.PostForm) {
-			http.Error(w, "invalid signature", 401)
-			return
-		}
-
-		msgSid := r.PostForm.Get("MessageSid")
-		status := r.PostForm.Get("MessageStatus")
-		errCode := r.PostForm.Get("ErrorCode")
-
-		_ = store.InsertDeliveryEvent(r.Context(), "twilio", msgSid, status, errCode, r.PostForm, nil)
-
-		newState := ""
-		switch status {
-		case "delivered":
-			newState = "delivered"
-		case "failed", "undelivered":
-			newState = "failed"
-		default:
-			w.WriteHeader(200)
-			return
-		}
-
-		_, _ = store.UpdateMessageByProviderMsgID(r.Context(), "twilio", msgSid, newState, errCode, time.Now())
-		w.WriteHeader(200)
-	})
-
-	handler.ServeHTTP(rr, req)
-	if rr.Code != 200 {
+	s.Mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
 
@@ -229,7 +210,7 @@ func TestWorkerQueuedToSubmitted(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	store := pg.New(db)
+	dbStore := pg.New(db)
 
 	tenantID := "t4"
 	phone := "+15550002222"
@@ -248,7 +229,7 @@ func TestWorkerQueuedToSubmitted(t *testing.T) {
 	}
 
 	p := &workerproc.Processor{
-		Store:     store,
+		Store:     dbStore,
 		Sender:    fakeTwilioSender{sid: "SM999"},
 		Templates: map[string]string{templateID: "Hi {name}, ref {ref}"},
 	}

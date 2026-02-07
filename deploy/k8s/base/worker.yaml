@@ -21,10 +21,11 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: worker
-          image: notif-worker:local
+          image: notif-worker:dev
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
+            - containerPort: 9090
           envFrom:
             - configMapRef:
                 name: notif-config
@@ -33,21 +34,15 @@ spec:
           env:
             - name: PORT
               value: "8080"
+            - name: METRICS_PORT
+              value: "9090"
           resources:
             requests:
-              cpu: "300m"
+              cpu: "400m"
               memory: "512Mi"
             limits:
               cpu: "1500m"
               memory: "1Gi"
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 8080
-            initialDelaySeconds: 3
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz
@@ -62,3 +57,18 @@ spec:
             runAsUser: 65532
             capabilities:
               drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notif-worker-svc
+  labels:
+    app: notif-worker
+spec:
+  type: ClusterIP
+  selector:
+    app: notif-worker
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090

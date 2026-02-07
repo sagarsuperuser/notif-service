@@ -113,10 +113,8 @@ func (c *Consumer) PollConcurrent(ctx context.Context, workers int, handler Hand
 						QueueUrl:      &c.QueueURL,
 						ReceiptHandle: m.ReceiptHandle,
 					})
-				} else {
-					slog.Error("sqs handler error", "err", err)
-					// do NOT delete => SQS redrive/DLQ handles it
 				}
+				// If err != nil: do NOT delete => SQS redrive/DLQ handles it
 			}
 		}()
 	}

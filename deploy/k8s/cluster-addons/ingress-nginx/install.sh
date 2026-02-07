@@ -13,7 +13,8 @@ kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$NAMESPACE"
 helm upgrade --install "$RELEASE" ingress-nginx/ingress-nginx \
   -n "$NAMESPACE" \
   --version "$CHART_VERSION" \
-  -f "$(dirname "$0")/values.yaml" \
-  --wait --timeout 5m --atomic
+  --wait --timeout 5m --rollback-on-failure \
+  -f "$(dirname "$0")/values.yaml"
+  
 
 kubectl -n "$NAMESPACE" get svc ingress-nginx-controller -o wide

@@ -11,9 +11,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"notif/internal/config"
-	"notif/internal/httpapi"
+	"notif/internal/httpserver"
 	"notif/internal/logging"
 	"notif/internal/observability"
 	"notif/internal/providers/twilio"
@@ -21,9 +22,8 @@ import (
 )
 
 func main() {
-	logging.Init("webhook")
-
 	cfg := config.LoadWebhook()
+	logging.Init("webhook", cfg.LogFormat)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -33,69 +33,51 @@ func main() {
 		slog.Error("webhook db connect failed", "err", err)
 		os.Exit(1)
 	}
-	store := pg.New(db)
+	dbStore := pg.New(db)
 
 	reg := prometheus.DefaultRegisterer
-	observability.Register(reg)
+	observability.RegisterWebhook(reg)
 
-	s := httpapi.New()
-	s.Mux.HandleFunc("/v1/webhooks/twilio/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
+	s := httpserver.New()
+	s.Mux.Use(httpserver.Metrics(observability.WebhookRequests))
+	s.Mux.Use(httpserver.Logging)
 
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "bad form", 400)
-			return
-		}
-		sig := r.Header.Get("X-Twilio-Signature")
-		if !twilio.VerifySignature(cfg.TwilioAuthToken, cfg.PublicWebhookURL, sig, r.PostForm) {
-			http.Error(w, "invalid signature", 401)
-			return
-		}
-
-		msgSid := r.PostForm.Get("MessageSid")
-		status := r.PostForm.Get("MessageStatus")
-		errCode := r.PostForm.Get("ErrorCode")
-
-		observability.WebhookEvents.WithLabelValues(status).Inc()
-
-		if err := store.InsertDeliveryEvent(r.Context(), "twilio", msgSid, status, errCode, r.PostForm, nil); err != nil {
-		}
-
-		// map Twilio status -> our state
-		newState := ""
-		switch status {
-		case "delivered":
-			newState = "delivered"
-		case "failed", "undelivered":
-			newState = "failed"
-		default:
-			// intermediate; do not downgrade state
-			w.WriteHeader(200)
-			return
-		}
-
-		if _, err := store.UpdateMessageByProviderMsgID(r.Context(), "twilio", msgSid, newState, errCode, time.Now()); err != nil {
-		}
-		w.WriteHeader(200)
-	})
-
-	s.Mux.HandleFunc("/healthz", httpapi.Healthz())
-	s.Mux.HandleFunc("/readyz", httpapi.Readyz(2*time.Second, func(ctx context.Context) error {
+	s.Mux.HandleFunc("/healthz", httpserver.Healthz()).Methods(http.MethodGet)
+	s.Mux.HandleFunc("/readyz", httpserver.Readyz(2*time.Second, func(ctx context.Context) error {
 		return db.Ping(ctx)
-	}))
+	})).Methods(http.MethodGet)
 
-	handler := httpapi.Logging(s.Mux)
+	webhook := &httpserver.Webhook{
+		Store:           dbStore,
+		VerifySignature: twilio.VerifySignature,
+		AuthToken:       cfg.TwilioAuthToken,
+		PublicURL:       cfg.PublicWebhookURL,
+	}
+	webhook.Register(s.Mux)
+
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: handler,
+		Handler: s.Mux,
 	}
+	metricsSrv := &http.Server{
+		Addr:    ":" + cfg.MetricsPort,
+		Handler: promhttp.Handler(),
+	}
+
+	metricsErrCh := make(chan error, 1)
+	go func() {
+		slog.Info("webhook metrics listening", "port", cfg.MetricsPort)
+		metricsErrCh <- metricsSrv.ListenAndServe()
+	}()
+
+	slog.Info("webhook listening", "port", cfg.Port)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ListenAndServe()
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		sig := <-sigCh
 		slog.Info("webhook shutdown", "signal", sig.String())
@@ -103,12 +85,20 @@ func main() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		_ = srv.Shutdown(shutdownCtx)
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("webhook listening", "port", cfg.Port)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("webhook server failed", "err", err)
-		os.Exit(1)
+	select {
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("webhook server failed", "err", err)
+			os.Exit(1)
+		}
+	case err := <-metricsErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("webhook metrics server failed", "err", err)
+			os.Exit(1)
+		}
 	}
 	db.Close()
 }

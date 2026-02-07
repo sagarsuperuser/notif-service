@@ -12,10 +12,13 @@ This folder contains **cluster-level dependencies** that you install **once per 
   - `install.sh` installs/updates the Helm release in `ingress-nginx` namespace.
 
 - `cert-manager/`  
-  Installs **cert-manager** and provides **Let’s Encrypt ClusterIssuers**.
-  - `clusterissuer-letsencrypt-staging.yaml` (use first)
-  - `clusterissuer-letsencrypt-prod.yaml` (use after staging works)
+  Installs **cert-manager** for TLS certificate automation.
   - `install.sh` installs/updates cert-manager in `cert-manager` namespace.
+
+- `prometheus/`  
+  Installs **kube-prometheus-stack** (Prometheus + Alertmanager + Grafana).
+  - `values-k3s.yaml` config for k3s with local-path storage.
+  - `install.sh` installs/updates the Helm release in `monitoring` namespace.
 
 ## Install order
 
@@ -26,13 +29,15 @@ bash deploy/k8s/cluster-addons/ingress-nginx/install.sh
 # 2) cert-manager
 bash deploy/k8s/cluster-addons/cert-manager/install.sh
 
-# 3) Choose issuer (start with staging)
-kubectl apply -f deploy/k8s/cluster-addons/cert-manager/clusterissuer-letsencrypt-staging.yaml
+# 3) Prometheus stack
+bash deploy/k8s/cluster-addons/prometheus/install.sh
 
-#4) apply ingress
+# 4) Choose issuer (start with staging, later prod)
+kubectl apply -f deploy/k8s/overlays/dev/clusterissuer-letsencrypt-staging.yaml
+
+#5) apply ingress
 kubectl apply -f deploy/k8s/overlays/prod/ingress-hosts.yaml
 
 # later:
-# kubectl apply -f deploy/k8s/cluster-addons/cert-manager/clusterissuer-letsencrypt-prod.yaml
-# update cert-manager.io/cluster-issuer: letsencrypt-prod
+# kubectl apply -f deploy/k8s/overlays/prod/clusterissuer-letsencrypt-prod.yaml
 # kubectl apply -f deploy/k8s/overlays/prod/ingress-hosts.yaml

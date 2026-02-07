@@ -6,14 +6,15 @@ import (
 
 	"notif/internal/domain"
 	"notif/internal/observability"
+	"notif/internal/store"
 	"notif/internal/util"
 )
 
 type Store interface {
-	FindMessageByIdempotency(ctx context.Context, tenantID, idemKey string) (msgID, state string, found bool, err error)
-	InsertMessage(ctx context.Context, msgID, tenantID, idemKey, to, templateID string, vars map[string]string, campaignID string, state string, now time.Time) error
-	MarkMessageState(ctx context.Context, msgID, state, lastError string, now time.Time) error
-	GetMessage(ctx context.Context, msgID string) (any, bool, error)
+	FindMessageByIdempotency(ctx context.Context, tenantID, idemKey string) (store.IdempotencyResult, error)
+	InsertMessage(ctx context.Context, in store.MessageInsert) error
+	MarkMessageState(ctx context.Context, in store.MessageStateUpdate) error
+	GetMessage(ctx context.Context, msgID string) (store.Message, bool, error)
 	IsSuppressed(ctx context.Context, tenantID, phone string) (bool, error)
 	IsOptedIn(ctx context.Context, tenantID, phone string) (bool, error)
 	IncrementDailyCap(ctx context.Context, tenantID, phone string, day time.Time, maxPerDay int) (allowed bool, newCount int, err error)
@@ -33,23 +34,39 @@ func (s *NotificationService) CreateAndEnqueueSMS(ctx context.Context, req domai
 	req.To = util.NormalizePhone(req.To)
 
 	// 1) idempotency
-	if mid, st, found, err := s.Store.FindMessageByIdempotency(ctx, req.TenantID, req.IdempotencyKey); err != nil {
+	if res, err := s.Store.FindMessageByIdempotency(ctx, req.TenantID, req.IdempotencyKey); err != nil {
 		return domain.CreateResponse{}, err
-	} else if found {
-		return domain.CreateResponse{MessageID: mid, State: st}, nil
+	} else if res.Found {
+		return domain.CreateResponse{MessageID: res.MessageID, State: res.State}, nil
 	}
 
 	// 2) create message row
-	if err := s.Store.InsertMessage(ctx, messageID, req.TenantID, req.IdempotencyKey, req.To, req.TemplateID, req.Vars, req.CampaignID, string(domain.StateQueued), now); err != nil {
+	if err := s.Store.InsertMessage(ctx, store.MessageInsert{
+		ID:         messageID,
+		TenantID:   req.TenantID,
+		IdemKey:    req.IdempotencyKey,
+		To:         req.To,
+		TemplateID: req.TemplateID,
+		Vars:       req.Vars,
+		CampaignID: req.CampaignID,
+		State:      string(domain.StateQueued),
+		Now:        now,
+	}); err != nil {
 		return domain.CreateResponse{}, err
 	}
 
 	// 3) suppression
-	if sup, err := s.Store.IsSuppressed(ctx, req.TenantID, req.To); err != nil {
+	isSup, err := s.Store.IsSuppressed(ctx, req.TenantID, req.To)
+	if err != nil {
 		return domain.CreateResponse{}, err
-	} else if sup {
-		observability.Suppressed.WithLabelValues("suppression_list").Inc()
-		if err := s.Store.MarkMessageState(ctx, messageID, string(domain.StateSuppressed), "suppressed", now); err != nil {
+	} else if isSup {
+		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
+			ID:        messageID,
+			State:     string(domain.StateSuppressed),
+			LastError: "suppressed",
+			Now:       now,
+		}); err != nil {
+			return domain.CreateResponse{}, err
 		}
 		return domain.CreateResponse{MessageID: messageID, State: string(domain.StateSuppressed)}, nil
 	}
@@ -58,8 +75,12 @@ func (s *NotificationService) CreateAndEnqueueSMS(ctx context.Context, req domai
 	if ok, err := s.Store.IsOptedIn(ctx, req.TenantID, req.To); err != nil {
 		return domain.CreateResponse{}, err
 	} else if !ok {
-		observability.Suppressed.WithLabelValues("not_opted_in").Inc()
-		if err := s.Store.MarkMessageState(ctx, messageID, string(domain.StateSuppressed), "not_opted_in", now); err != nil {
+		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
+			ID:        messageID,
+			State:     string(domain.StateSuppressed),
+			LastError: "not_opted_in",
+			Now:       now,
+		}); err != nil {
 		}
 		return domain.CreateResponse{MessageID: messageID, State: string(domain.StateSuppressed)}, nil
 	}
@@ -70,8 +91,12 @@ func (s *NotificationService) CreateAndEnqueueSMS(ctx context.Context, req domai
 		return domain.CreateResponse{}, err
 	}
 	if !allowed {
-		observability.Suppressed.WithLabelValues("cap_exceeded").Inc()
-		if err := s.Store.MarkMessageState(ctx, messageID, string(domain.StateSuppressed), "cap_exceeded", now); err != nil {
+		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
+			ID:        messageID,
+			State:     string(domain.StateSuppressed),
+			LastError: "cap_exceeded",
+			Now:       now,
+		}); err != nil {
 		}
 		return domain.CreateResponse{MessageID: messageID, State: string(domain.StateSuppressed)}, nil
 	}
@@ -79,7 +104,12 @@ func (s *NotificationService) CreateAndEnqueueSMS(ctx context.Context, req domai
 	// 6) enqueue
 	if err := s.Queue.EnqueueSMS(ctx, req.TenantID, messageID, req.IdempotencyKey, req.To, req.TemplateID, req.Vars, req.CampaignID); err != nil {
 		observability.Enqueues.WithLabelValues("error").Inc()
-		if err := s.Store.MarkMessageState(ctx, messageID, string(domain.StateFailed), "enqueue_failed", now); err != nil {
+		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
+			ID:        messageID,
+			State:     string(domain.StateFailed),
+			LastError: "enqueue_failed",
+			Now:       now,
+		}); err != nil {
 		}
 		return domain.CreateResponse{}, err
 	}
@@ -88,6 +118,6 @@ func (s *NotificationService) CreateAndEnqueueSMS(ctx context.Context, req domai
 	return domain.CreateResponse{MessageID: messageID, State: string(domain.StateQueued)}, nil
 }
 
-func (s *NotificationService) GetMessage(ctx context.Context, msgID string) (any, bool, error) {
+func (s *NotificationService) GetMessage(ctx context.Context, msgID string) (store.Message, bool, error) {
 	return s.Store.GetMessage(ctx, msgID)
 }

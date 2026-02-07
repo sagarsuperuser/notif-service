@@ -1,0 +1,66 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    grafana_dashboard: "1"
+
+configMapGenerator:
+  - name: notif-grafana-overall
+    namespace: monitoring
+    files:
+      - dashboards/overall/notif-overall-dashboard.json
+  - name: notif-grafana-api
+    namespace: monitoring
+    files:
+      - dashboards/api/notif-api-dashboard.json
+  - name: notif-grafana-worker
+    namespace: monitoring
+    files:
+      - dashboards/worker/notif-worker-dashboard.json
+  - name: notif-grafana-webhook
+    namespace: monitoring
+    files:
+      - dashboards/webhook/notif-webhook-dashboard.json
+  - name: notif-grafana-provider
+    namespace: monitoring
+    files:
+      - dashboards/provider/notif-provider-dashboard.json
+
+patches:
+  - target:
+      kind: ConfigMap
+      name: notif-grafana-overall
+    patch: |-
+      - op: add
+        path: /metadata/annotations/grafana_folder
+        value: "Notif / Overall"
+  - target:
+      kind: ConfigMap
+      name: notif-grafana-api
+    patch: |-
+      - op: add
+        path: /metadata/annotations/grafana_folder
+        value: "Notif / API"
+  - target:
+      kind: ConfigMap
+      name: notif-grafana-worker
+    patch: |-
+      - op: add
+        path: /metadata/annotations/grafana_folder
+        value: "Notif / Worker"
+  - target:
+      kind: ConfigMap
+      name: notif-grafana-webhook
+    patch: |-
+      - op: add
+        path: /metadata/annotations/grafana_folder
+        value: "Notif / Webhook"
+  - target:
+      kind: ConfigMap
+      name: notif-grafana-provider
+    patch: |-
+      - op: add
+        path: /metadata/annotations/grafana_folder
+        value: "Notif / Provider"

@@ -19,6 +19,7 @@ type Client struct {
 
 	MessagingServiceSID string
 	FromNumber          string
+	BaseURL             string
 }
 
 type SendRequest struct {
@@ -47,7 +48,11 @@ func (c *Client) SendSMS(ctx context.Context, req SendRequest) (SendResponse, in
 		form.Set("From", c.FromNumber)
 	}
 
-	endpoint := "https://api.twilio.com/2010-04-01/Accounts/" + c.AccountSID + "/Messages.json"
+	baseURL := strings.TrimRight(c.BaseURL, "/")
+	if baseURL == "" {
+		baseURL = "https://api.twilio.com"
+	}
+	endpoint := baseURL + "/2010-04-01/Accounts/" + c.AccountSID + "/Messages.json"
 	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	httpReq.SetBasicAuth(c.AccountSID, c.AuthToken)
@@ -82,8 +87,7 @@ func ShouldRetry(err error, httpStatus int) bool {
 		if errors.As(err, &ne) && ne.Timeout() {
 			return true
 		}
-		// generic network
-		return true
+		return false
 	}
 	if httpStatus == 429 || httpStatus == 408 {
 		return true

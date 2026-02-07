@@ -3,6 +3,12 @@ kind: Kustomization
 
 resources:
   - api.yaml
+  - api-hpa.yaml
   - webhook.yaml
+  - webhook-hpa.yaml
   - worker.yaml
+  - mock-provider.yaml
   - notif-config.yaml
+  - servicemonitors.yaml
+  - ingress-hosts.yaml
+  - ../../grafana

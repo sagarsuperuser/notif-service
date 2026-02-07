@@ -3,7 +3,7 @@ kind: Kustomization
 
 resources:
   - ../../base
-  - ingress-hosts.yaml
+  - clusterissuer-letsencrypt-prod.yaml
   - keda-sqs-worker.yaml
   - keda-triggerauth-aws.yaml
 
