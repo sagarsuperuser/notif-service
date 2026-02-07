@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -65,3 +65,39 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  update-kustomize-tags:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update prod image tags
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          tag="sha-${short_sha}"
+          export TAG="$tag"
+          python - <<'PY'
+          import pathlib
+          import re
+          import os
+
+          tag = os.environ["TAG"]
+          path = pathlib.Path("deploy/k8s/overlays/prod/kustomization.yaml")
+          data = path.read_text()
+          data = re.sub(r"^\\s*newTag:\\s*.+$", f"    newTag: {tag}", data, flags=re.MULTILINE)
+          path.write_text(data)
+          PY
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain | grep -q .; then
+            git add deploy/k8s/overlays/prod/kustomization.yaml
+            git commit -m "chore: update prod image tags [skip ci]"
+            git push
+          fi
