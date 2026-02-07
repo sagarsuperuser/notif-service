@@ -90,6 +90,8 @@ jobs:
           data = re.sub(r"^\\s*newTag:\\s*.+$", f"    newTag: {tag}", data, flags=re.MULTILINE)
           path.write_text(data)
           PY
+          echo "Updated newTag to ${tag}"
+          git --no-pager diff -- deploy/k8s/overlays/prod/kustomization.yaml || true
 
       - name: Commit and push
         run: |
