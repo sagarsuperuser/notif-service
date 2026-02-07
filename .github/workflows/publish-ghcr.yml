@@ -79,6 +79,8 @@ jobs:
           short_sha="${GITHUB_SHA:0:7}"
           tag="sha-${short_sha}"
           export TAG="$tag"
+          echo "Before update:"
+          grep -n "newTag" deploy/k8s/overlays/prod/kustomization.yaml || true
           python - <<'PY'
           import pathlib
           import re
@@ -91,6 +93,10 @@ jobs:
           path.write_text(data)
           PY
           echo "Updated newTag to ${tag}"
+          echo "After update:"
+          grep -n "newTag" deploy/k8s/overlays/prod/kustomization.yaml || true
+          echo "git status:"
+          git status --porcelain
           git --no-pager diff -- deploy/k8s/overlays/prod/kustomization.yaml || true
 
       - name: Commit and push
