@@ -18,7 +18,7 @@ spec:
         - name: ghcr-pull
       containers:
         - name: mock-provider
-          image: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider:amd64
+          image: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
