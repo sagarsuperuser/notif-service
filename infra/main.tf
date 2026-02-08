@@ -138,17 +138,6 @@ resource "aws_security_group" "nodes" {
   description = "k3s nodes SG"
   vpc_id      = aws_vpc.this.id
 
-  # SSH from bastion (optional)
-  dynamic "ingress" {
-    for_each = var.key_name == null ? [] : [1]
-    content {
-      from_port       = 22
-      to_port         = 22
-      protocol        = "tcp"
-      security_groups = [aws_security_group.bastion.id]
-    }
-  }
-
   egress {
     from_port   = 0
     to_port     = 0
@@ -157,6 +146,17 @@ resource "aws_security_group" "nodes" {
   }
 
   tags = { Name = "${local.name}-nodes-sg" }
+}
+
+# SSH from bastion (optional)
+resource "aws_security_group_rule" "nodes_ssh_from_bastion" {
+  count                    = var.key_name == null ? 0 : 1
+  type                     = "ingress"
+  security_group_id        = aws_security_group.nodes.id
+  from_port                = 22
+  to_port                  = 22
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.bastion.id
 }
 
 # node-to-node (self-referencing rules)
@@ -202,13 +202,6 @@ resource "aws_security_group" "api_nlb" {
   description = "Internal API NLB SG"
   vpc_id      = aws_vpc.this.id
 
-  ingress {
-    from_port       = 6443
-    to_port         = 6443
-    protocol        = "tcp"
-    security_groups = [aws_security_group.bastion.id] # only bastion can reach API LB
-  }
-
   egress {
     from_port       = 6443
     to_port         = 6443
@@ -217,6 +210,24 @@ resource "aws_security_group" "api_nlb" {
   }
 
   tags = { Name = "${local.name}-api-nlb-sg" }
+}
+
+resource "aws_security_group_rule" "api_nlb_6443_from_bastion" {
+  type                     = "ingress"
+  security_group_id        = aws_security_group.api_nlb.id
+  from_port                = 6443
+  to_port                  = 6443
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.bastion.id
+}
+
+resource "aws_security_group_rule" "api_nlb_6443_from_nodes" {
+  type                     = "ingress"
+  security_group_id        = aws_security_group.api_nlb.id
+  from_port                = 6443
+  to_port                  = 6443
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.nodes.id
 }
 # Nodes allow 6443 only from api-nlb SG + node self (k3s server comms)
 resource "aws_security_group_rule" "nodes_6443_from_api_nlb" {
@@ -243,19 +254,6 @@ resource "aws_security_group" "ingress_nlb" {
   description = "Ingress NLB SG"
   vpc_id      = aws_vpc.this.id
 
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   egress {
     from_port       = var.ingress_http_nodeport
     to_port         = var.ingress_https_nodeport
@@ -264,6 +262,24 @@ resource "aws_security_group" "ingress_nlb" {
   }
 
   tags = { Name = "${local.name}-ingress-nlb-sg" }
+}
+
+resource "aws_security_group_rule" "ingress_nlb_80_from_world" {
+  type              = "ingress"
+  security_group_id = aws_security_group.ingress_nlb.id
+  from_port         = 80
+  to_port           = 80
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+}
+
+resource "aws_security_group_rule" "ingress_nlb_443_from_world" {
+  type              = "ingress"
+  security_group_id = aws_security_group.ingress_nlb.id
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
 }
 
 resource "aws_security_group_rule" "nodes_nodeports_from_ingress_nlb" {
@@ -281,13 +297,6 @@ resource "aws_security_group" "rds" {
   description = "RDS SG"
   vpc_id      = aws_vpc.this.id
 
-  ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.nodes.id]
-  }
-
   egress {
     from_port   = 0
     to_port     = 0
@@ -296,6 +305,15 @@ resource "aws_security_group" "rds" {
   }
 
   tags = { Name = "${local.name}-rds-sg" }
+}
+
+resource "aws_security_group_rule" "rds_5432_from_nodes" {
+  type                     = "ingress"
+  security_group_id        = aws_security_group.rds.id
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.nodes.id
 }
 
 # -------------------------
@@ -445,8 +463,9 @@ resource "aws_instance" "bastion" {
 # k3s server user_data templates
 locals {
   k3s_common = <<-EOT
+    #!/bin/bash
     set -euo pipefail
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${var.k3s_version} sh -s -
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${var.k3s_version} sh -s - \
   EOT
 
   server1_user_data = <<-EOT
@@ -454,7 +473,8 @@ locals {
       --cluster-init \
       --token ${random_password.k3s_token.result} \
       --tls-san ${aws_lb.api.dns_name} \
-      --write-kubeconfig-mode 644
+      --write-kubeconfig-mode 644 \
+      --disable traefik
   EOT
 
   server_join_user_data = <<-EOT
@@ -462,7 +482,8 @@ locals {
       --server https://${aws_lb.api.dns_name}:6443 \
       --token ${random_password.k3s_token.result} \
       --tls-san ${aws_lb.api.dns_name} \
-      --write-kubeconfig-mode 644
+      --write-kubeconfig-mode 644 \
+      --disable traefik
   EOT
 
   agent_user_data = <<-EOT

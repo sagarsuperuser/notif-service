@@ -26,6 +26,8 @@ jobs:
             cmd: worker
           - name: notif-webhook
             cmd: webhook
+          - name: notif-mock-provider
+            cmd: mock-provider
 
     steps:
       - name: Checkout
