@@ -35,10 +35,10 @@ queues:
 	echo "Done.";'
 
 migrate:
-	psql "$(PG_DSN)" -f migrations/001_init.sql
+	psql "$(PG_DSN)" -f deploy/k8s/jobs/sql/001_init.sql
 
 seed:
-	psql "$(PG_DSN)" -f migrations/seed.sql
+	psql "$(PG_DSN)" -f deploy/k8s/jobs/sql/seed.sql
 
 
 init: up queues migrate seed

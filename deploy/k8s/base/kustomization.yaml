@@ -3,9 +3,8 @@ kind: Kustomization
 
 resources:
   - api.yaml
-  - api-hpa.yaml
+  - hpa.yaml
   - webhook.yaml
-  - webhook-hpa.yaml
   - worker.yaml
   - mock-provider.yaml
   - notif-config.yaml

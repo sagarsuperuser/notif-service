@@ -67,3 +67,9 @@ variable "db_instance_class" {
   type    = string
   default = "db.t4g.small" # change if needed
 }
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+  default   = null
+}

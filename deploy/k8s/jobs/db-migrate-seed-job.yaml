@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notif-db-migrate-seed
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate-seed
+          image: postgres:17-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              test -n "${DB_DSN:-}" || { echo "DB_DSN is required"; exit 1; }
+              psql "$DB_DSN" -v ON_ERROR_STOP=1 -f /sql/001_init.sql
+              psql "$DB_DSN" -v ON_ERROR_STOP=1 -f /sql/seed.sql
+          envFrom:
+            - secretRef:
+                name: notif-secrets
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+              readOnly: true
+      volumes:
+        - name: sql
+          configMap:
+            name: notif-db-sql

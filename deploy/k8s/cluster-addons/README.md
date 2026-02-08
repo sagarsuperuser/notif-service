@@ -20,6 +20,10 @@ This folder contains **cluster-level dependencies** that you install **once per 
   - `values-k3s.yaml` config for k3s with local-path storage.
   - `install.sh` installs/updates the Helm release in `monitoring` namespace.
 
+- `keda/`
+  Installs **KEDA** for event-driven autoscaling (for example SQS-based worker scaling).
+  - `install.sh` installs/updates the Helm release in `keda` namespace.
+
 ## Install order
 
 ```bash
@@ -32,10 +36,13 @@ bash deploy/k8s/cluster-addons/cert-manager/install.sh
 # 3) Prometheus stack
 bash deploy/k8s/cluster-addons/prometheus/install.sh
 
-# 4) Choose issuer (start with staging, later prod)
+# 4) KEDA
+bash deploy/k8s/cluster-addons/keda/install.sh
+
+# 5) Choose issuer (start with staging, later prod)
 kubectl apply -f deploy/k8s/overlays/dev/clusterissuer-letsencrypt-staging.yaml
 
-#5) apply ingress
+# 6) apply ingress
 kubectl apply -f deploy/k8s/overlays/prod/ingress-hosts.yaml
 
 # later:

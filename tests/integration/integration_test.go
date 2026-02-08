@@ -320,7 +320,7 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 		t.Fatalf("connect test db: %v", err)
 	}
 
-	sqlPath := filepath.Join("..", "..", "migrations", "001_init.sql")
+	sqlPath := filepath.Join("..", "..", "deploy", "k8s", "jobs", "sql", "001_init.sql")
 	sqlBytes, err := os.ReadFile(sqlPath)
 	if err != nil {
 		db.Close()

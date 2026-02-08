@@ -12,6 +12,7 @@ locals {
 
   public_subnet_cidrs  = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i)]
   private_subnet_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i + 10)]
+  db_master_password   = coalesce(var.db_password, random_password.db_password.result)
 }
 
 # -------------------------
@@ -474,6 +475,7 @@ locals {
       --token ${random_password.k3s_token.result} \
       --tls-san ${aws_lb.api.dns_name} \
       --write-kubeconfig-mode 644 \
+      --node-taint node-role.kubernetes.io/control-plane=true:NoSchedule \
       --disable traefik
   EOT
 
@@ -483,6 +485,7 @@ locals {
       --token ${random_password.k3s_token.result} \
       --tls-san ${aws_lb.api.dns_name} \
       --write-kubeconfig-mode 644 \
+      --node-taint node-role.kubernetes.io/control-plane=true:NoSchedule \
       --disable traefik
   EOT
 
@@ -571,8 +574,7 @@ resource "aws_lb_target_group_attachment" "ingress_workers_https" {
 # -------------------------
 resource "random_password" "db_password" {
   length           = 24
-  special          = true
-  override_special = "!#$%&()*+,-.:;<=>?[]^_{|}~"
+  special          = false
 }
 
 resource "aws_db_subnet_group" "db" {
@@ -587,10 +589,11 @@ resource "aws_db_instance" "postgres" {
   instance_class    = var.db_instance_class
   allocated_storage = 50
   storage_type      = "gp3"
+  apply_immediately = true
 
   db_name  = var.db_name
   username = var.db_username
-  password = random_password.db_password.result
+  password = local.db_master_password
 
   publicly_accessible = false
   skip_final_snapshot = true
