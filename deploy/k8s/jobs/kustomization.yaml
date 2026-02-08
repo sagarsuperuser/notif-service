@@ -4,8 +4,12 @@ kind: Kustomization
 resources:
   - db-migrate-seed-job.yaml
 
+generatorOptions:
+  disableNameSuffixHash: true
+
 configMapGenerator:
   - name: notif-db-sql
     files:
       - sql/001_init.sql
       - sql/seed.sql
+      - sql/phones.txt

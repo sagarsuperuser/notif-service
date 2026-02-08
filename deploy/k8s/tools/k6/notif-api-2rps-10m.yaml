@@ -18,10 +18,19 @@ spec:
           volumeMounts:
             - name: scripts
               mountPath: /scripts
+            - name: phone-pool
+              mountPath: /phone-pool
+              readOnly: true
       volumes:
         - name: scripts
           configMap:
             name: k6-notif-api-2rps-10m
+        - name: phone-pool
+          configMap:
+            name: notif-db-sql
+            items:
+              - key: phones.txt
+                path: phones.txt
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -33,21 +42,28 @@ data:
     import { check, sleep } from 'k6';
 
     export const options = {
-      vus: 10,
+      vus: 50,
       duration: '10m',
-      rps: 20,
+      rps: 60,
     };
 
     const API_URL = __ENV.API_URL || 'http://notif-api-svc/v1/sms/messages';
+    const rawPhones = open('/phone-pool/phones.txt');
+    const PHONE_POOL = rawPhones
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
 
     export default function () {
       const now = Date.now();
       const key = `k6-${__VU}-${__ITER}-${now}`;
+      const idx = (__VU + __ITER) % PHONE_POOL.length;
+      const to = PHONE_POOL[idx];
 
       const payload = JSON.stringify({
         tenantId: 'foodapp',
         idempotencyKey: key,
-        to: '+919003021770',
+        to,
         templateId: 'txn_confirm_v1',
         vars: {
           name: 'Test',

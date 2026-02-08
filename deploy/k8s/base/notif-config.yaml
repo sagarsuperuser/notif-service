@@ -5,7 +5,9 @@ metadata:
 data:
   # Common
   AWS_REGION: "ap-south-1"
+  SQS_QUEUE_URL: "https://sqs.ap-south-1.amazonaws.com/139831607173/notif-prod-test-send.fifo"
   MAX_SMS_PER_DAY: "1000000"
+  PUBLIC_WEBHOOK_URL: "http://notif-webhook-svc/v1/webhooks/twilio/status"
 
   # Worker / SQS tuning
   WORKER_CONCURRENCY: "20"
@@ -13,6 +15,9 @@ data:
   SQS_MAX_MSGS: "10"
   SQS_VISIBILITY_TIMEOUT: "60"
 
-  # Twilio protection knobs (per pod)
+  # Twilio endpoint config
+  TWILIO_BASE_URL: "http://notif-mock-provider-svc"
+
+  # Twilio throttling knobs (per pod)
   TWILIO_RPS_PER_POD: "5"
   TWILIO_BURST: "10"

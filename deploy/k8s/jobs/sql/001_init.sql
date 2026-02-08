@@ -1,10 +1,10 @@
-CREATE TABLE tenants (
+CREATE TABLE IF NOT EXISTS tenants (
   id         TEXT PRIMARY KEY,
   name       TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE consents (
+CREATE TABLE IF NOT EXISTS consents (
   tenant_id  TEXT NOT NULL,
   phone      TEXT NOT NULL,
   channel    TEXT NOT NULL, -- "sms"
@@ -13,7 +13,7 @@ CREATE TABLE consents (
   PRIMARY KEY (tenant_id, phone, channel)
 );
 
-CREATE TABLE suppression_list (
+CREATE TABLE IF NOT EXISTS suppression_list (
   tenant_id  TEXT NOT NULL,
   phone      TEXT NOT NULL,
   reason     TEXT NOT NULL,
@@ -21,7 +21,7 @@ CREATE TABLE suppression_list (
   PRIMARY KEY (tenant_id, phone)
 );
 
-CREATE TABLE send_caps_daily (
+CREATE TABLE IF NOT EXISTS send_caps_daily (
   tenant_id  TEXT NOT NULL,
   phone      TEXT NOT NULL,
   day        DATE NOT NULL,
@@ -30,7 +30,7 @@ CREATE TABLE send_caps_daily (
   PRIMARY KEY (tenant_id, phone, day)
 );
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   id               TEXT PRIMARY KEY,
   tenant_id        TEXT NOT NULL,
   idempotency_key  TEXT NOT NULL,
@@ -47,11 +47,11 @@ CREATE TABLE messages (
   UNIQUE (tenant_id, idempotency_key)
 );
 
-CREATE INDEX idx_messages_tenant_campaign_created ON messages (tenant_id, campaign_id, created_at);
-CREATE INDEX idx_messages_tenant_phone_created ON messages (tenant_id, to_phone, created_at);
-CREATE INDEX idx_messages_provider_msg_id ON messages (provider, provider_msg_id);
+CREATE INDEX IF NOT EXISTS idx_messages_tenant_campaign_created ON messages (tenant_id, campaign_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_tenant_phone_created ON messages (tenant_id, to_phone, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_provider_msg_id ON messages (provider, provider_msg_id);
 
-CREATE TABLE provider_attempts (
+CREATE TABLE IF NOT EXISTS provider_attempts (
   id              BIGSERIAL PRIMARY KEY,
   message_id      TEXT NOT NULL REFERENCES messages(id),
   provider        TEXT NOT NULL,
@@ -64,7 +64,7 @@ CREATE TABLE provider_attempts (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE delivery_events (
+CREATE TABLE IF NOT EXISTS delivery_events (
   id            BIGSERIAL PRIMARY KEY,
   provider      TEXT NOT NULL,
   provider_msg_id TEXT NOT NULL,
@@ -76,4 +76,4 @@ CREATE TABLE delivery_events (
   received_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_delivery_events_provider_msg ON delivery_events (provider, provider_msg_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_events_provider_msg ON delivery_events (provider, provider_msg_id);

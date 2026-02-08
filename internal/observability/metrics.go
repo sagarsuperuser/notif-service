@@ -20,17 +20,29 @@ var (
 		[]string{"result", "http_status"},
 	)
 	TwilioLatency = prometheus.NewHistogram(
-		prometheus.HistogramOpts{Name: "twilio_send_latency_seconds", Help: "Twilio send latency"},
+		prometheus.HistogramOpts{
+			Name:    "twilio_send_latency_seconds",
+			Help:    "Twilio send latency",
+			Buckets: []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 3, 5, 8, 13, 21},
+		},
 	)
 	EndToEndLatency = prometheus.NewHistogram(
-		prometheus.HistogramOpts{Name: "notif_end_to_end_latency_seconds", Help: "API accepted to provider attempt result"},
+		prometheus.HistogramOpts{
+			Name:    "notif_end_to_end_latency_seconds",
+			Help:    "API accepted to provider attempt result",
+			Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600},
+		},
 	)
 	WorkerProcessed = prometheus.NewCounterVec(
 		prometheus.CounterOpts{Name: "notif_worker_processed_total", Help: "Worker processed results"},
 		[]string{"result"},
 	)
 	WorkerProcessingSeconds = prometheus.NewHistogram(
-		prometheus.HistogramOpts{Name: "notif_worker_processing_seconds", Help: "Worker processing duration"},
+		prometheus.HistogramOpts{
+			Name:    "notif_worker_processing_seconds",
+			Help:    "Worker processing duration",
+			Buckets: []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60},
+		},
 	)
 	WebhookEvents = prometheus.NewCounterVec(
 		prometheus.CounterOpts{Name: "twilio_webhook_events_total", Help: "Webhook events"},

@@ -4,4 +4,5 @@
 *.tfstate
 *.tfstate.backup
 *.tfplan
+*.tfout
 .DS_Store

@@ -4,11 +4,22 @@ VALUES ('foodapp', 'Food App (Local)')
 ON CONFLICT (id) DO NOTHING;
 
 -- 2) Consents (so you can test opted_in vs opted_out)
--- Use these numbers consistently in curl tests.
+-- Read opted-in phone pool from mounted file /sql/phones.txt
+DROP TABLE IF EXISTS seed_phones;
+CREATE TEMP TABLE seed_phones (
+  phone TEXT PRIMARY KEY
+);
+\copy seed_phones(phone) FROM '/sql/phones.txt' WITH (FORMAT text);
+
 INSERT INTO consents (tenant_id, phone, channel, status)
-VALUES
-  ('foodapp', '+919003021770', 'sms', 'opted_in'),
-  ('foodapp', '+918888888888', 'sms', 'opted_out')
+SELECT 'foodapp', phone, 'sms', 'opted_in'
+FROM seed_phones
+ON CONFLICT (tenant_id, phone, channel)
+DO UPDATE SET status = EXCLUDED.status, updated_at = now();
+
+-- Explicit opted-out example
+INSERT INTO consents (tenant_id, phone, channel, status)
+VALUES ('foodapp', '+918888888888', 'sms', 'opted_out')
 ON CONFLICT (tenant_id, phone, channel)
 DO UPDATE SET status = EXCLUDED.status, updated_at = now();
 
