@@ -21,7 +21,7 @@ images:
     newName: ghcr.io/sagarsuperuser/notif-service/notif-worker
     newTag: sha-6080921
 
-  - name: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider
+  - name: notif-mock-provider
     newName: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider
     newTag: sha-6080921
   

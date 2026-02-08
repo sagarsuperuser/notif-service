@@ -14,12 +14,10 @@ spec:
         app: notif-mock-provider
     spec:
       terminationGracePeriodSeconds: 10
-      imagePullSecrets:
-        - name: ghcr-pull
       containers:
         - name: mock-provider
-          image: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider:latest
-          imagePullPolicy: Always
+          image: notif-mock-provider:dev
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           envFrom:
