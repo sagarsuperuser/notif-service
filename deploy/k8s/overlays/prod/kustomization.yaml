@@ -20,6 +20,10 @@ images:
   - name: notif-worker
     newName: ghcr.io/sagarsuperuser/notif-service/notif-worker
     newTag: sha-4c5b16d
+
+  - name: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider
+    newName: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider
+    newTag: sha-4c5b16d
   
 
 
