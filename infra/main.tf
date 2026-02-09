@@ -441,6 +441,68 @@ resource "aws_lb_listener" "ingress_443" {
 # -------------------------
 # EC2 instances
 # -------------------------
+# IAM instance profile for k3s nodes (servers + agents).
+# This is used by in-cluster components like the AWS EBS CSI driver to provision/attach EBS volumes.
+data "aws_iam_policy_document" "k3s_nodes_assume_role" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "sts:AssumeRole",
+    ]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "k3s_nodes" {
+  name               = "${local.name}-k3s-nodes"
+  assume_role_policy = data.aws_iam_policy_document.k3s_nodes_assume_role.json
+
+  tags = {
+    Name = "${local.name}-k3s-nodes"
+  }
+}
+
+# Minimal permissions for AWS EBS CSI on k3s-on-EC2.
+resource "aws_iam_role_policy" "k3s_nodes_ebs_csi" {
+  name = "${local.name}-k3s-nodes-ebs-csi"
+  role = aws_iam_role.k3s_nodes.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:AttachVolume",
+          "ec2:CreateSnapshot",
+          "ec2:CreateTags",
+          "ec2:CreateVolume",
+          "ec2:DeleteSnapshot",
+          "ec2:DeleteTags",
+          "ec2:DeleteVolume",
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeInstances",
+          "ec2:DescribeSnapshots",
+          "ec2:DescribeTags",
+          "ec2:DescribeVolumes",
+          "ec2:DescribeVolumesModifications",
+          "ec2:DetachVolume",
+          "ec2:ModifyVolume",
+        ]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "k3s_nodes" {
+  name = "${local.name}-k3s-nodes"
+  role = aws_iam_role.k3s_nodes.name
+}
+
 # Bastion (public)
 resource "aws_instance" "bastion" {
   ami                         = data.aws_ami.ubuntu.id
@@ -513,6 +575,7 @@ resource "aws_instance" "k3s_server" {
   subnet_id              = values(aws_subnet.private)[count.index].id
   vpc_security_group_ids = [aws_security_group.nodes.id]
   key_name               = var.key_name
+  iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
 
   root_block_device {
     volume_size = 50
@@ -547,6 +610,7 @@ resource "aws_instance" "k3s_agent" {
   subnet_id              = values(aws_subnet.private)[count.index % length(values(aws_subnet.private))].id
   vpc_security_group_ids = [aws_security_group.nodes.id]
   key_name               = var.key_name
+  iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
 
   root_block_device {
     volume_size = 50
