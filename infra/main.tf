@@ -529,13 +529,14 @@ resource "aws_lb_target_group_attachment" "api_servers" {
   port             = 6443
 }
 
-# 3 workers (spread across AZs)
+# Workers (spread across AZs)
 resource "aws_instance" "k3s_agent" {
-  count = 3
+  count = var.k3s_agent_count
 
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = values(aws_subnet.private)[count.index].id
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = var.instance_type
+  # Only 3 private subnets (1 per AZ). Distribute agents evenly across them.
+  subnet_id              = values(aws_subnet.private)[count.index % length(values(aws_subnet.private))].id
   vpc_security_group_ids = [aws_security_group.nodes.id]
   key_name               = var.key_name
 
@@ -556,14 +557,14 @@ resource "aws_instance" "k3s_agent" {
 
 # Attach workers to ingress target groups
 resource "aws_lb_target_group_attachment" "ingress_workers_http" {
-  count            = 3
+  count            = var.k3s_agent_count
   target_group_arn = aws_lb_target_group.ingress_http.arn
   target_id        = aws_instance.k3s_agent[count.index].id
   port             = var.ingress_http_nodeport
 }
 
 resource "aws_lb_target_group_attachment" "ingress_workers_https" {
-  count            = 3
+  count            = var.k3s_agent_count
   target_group_arn = aws_lb_target_group.ingress_https.arn
   target_id        = aws_instance.k3s_agent[count.index].id
   port             = var.ingress_https_nodeport
@@ -573,8 +574,8 @@ resource "aws_lb_target_group_attachment" "ingress_workers_https" {
 # RDS Postgres
 # -------------------------
 resource "random_password" "db_password" {
-  length           = 24
-  special          = false
+  length  = 24
+  special = false
 }
 
 resource "aws_db_subnet_group" "db" {

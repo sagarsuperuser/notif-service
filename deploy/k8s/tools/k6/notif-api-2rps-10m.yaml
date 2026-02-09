@@ -44,7 +44,7 @@ data:
     export const options = {
       vus: 50,
       duration: '10m',
-      rps: 60,
+      rps: 20,
     };
 
     const API_URL = __ENV.API_URL || 'http://notif-api-svc/v1/sms/messages';

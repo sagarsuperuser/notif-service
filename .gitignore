@@ -3,6 +3,6 @@
 .terraform/
 *.tfstate
 *.tfstate.backup
-*.tfplan
-*.tfout
+.*tfplan
+.*tfout
 .DS_Store

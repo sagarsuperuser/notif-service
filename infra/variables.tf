@@ -44,6 +44,11 @@ variable "k3s_version" {
   default = "v1.34.3+k3s1"
 }
 
+variable "k3s_agent_count" {
+  type    = number
+  default = 3
+}
+
 # Ingress nodeports for NLB target groups
 variable "ingress_http_nodeport" {
   type    = number

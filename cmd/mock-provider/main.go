@@ -16,7 +16,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,22 +24,21 @@ import (
 )
 
 type config struct {
-	AccountSID          string `envconfig:"TWILIO_ACCOUNT_SID" default:"mock_sid"`
-	AuthToken           string `envconfig:"TWILIO_AUTH_TOKEN" default:"mock_token"`
-	Port                string `envconfig:"PORT" default:"8080"`
-	OutcomeMode         string `envconfig:"MOCK_OUTCOME_MODE" default:"fixed"`
-	OutcomesRaw         string `envconfig:"MOCK_OUTCOMES" default:"ok"`
+	AccountSID          string  `envconfig:"TWILIO_ACCOUNT_SID" default:"mock_sid"`
+	AuthToken           string  `envconfig:"TWILIO_AUTH_TOKEN" default:"mock_token"`
+	Port                string  `envconfig:"PORT" default:"8080"`
+	OutcomeMode         string  `envconfig:"MOCK_OUTCOME_MODE" default:"fixed"`
+	OutcomesRaw         string  `envconfig:"MOCK_OUTCOMES" default:"ok"`
 	SuccessRate         float64 `envconfig:"MOCK_SUCCESS_RATE" default:"0.95"`
 	FailureTypesRaw     string  `envconfig:"MOCK_FAILURE_TYPES" default:"failed"`
 	FailureWeightsRaw   string  `envconfig:"MOCK_FAILURE_WEIGHTS" default:""`
-	DelayMs             int    `envconfig:"MOCK_DELAY_MS" default:"0"`
-	TimeoutDelayMs      int    `envconfig:"MOCK_TIMEOUT_DELAY_MS" default:"12000"`
-	TimeoutMaxPerSec    int    `envconfig:"MOCK_TIMEOUT_MAX_PER_SEC" default:"2"`
-	DefaultWebhookURL   string `envconfig:"MOCK_WEBHOOK_URL" default:""`
-	WebhookDelayMs      int    `envconfig:"MOCK_WEBHOOK_DELAY_MS" default:"500"`
-	WebhookSentDelayMs  int    `envconfig:"MOCK_WEBHOOK_SENT_DELAY_MS" default:"300"`
-	WebhookQueueDelayMs int    `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS" default:"0"`
-	IncludeQueuedFirst  bool   `envconfig:"MOCK_WEBHOOK_INCLUDE_QUEUED" default:"true"`
+	DelayMs             int     `envconfig:"MOCK_DELAY_MS" default:"0"`
+	TimeoutDelayMs      int     `envconfig:"MOCK_TIMEOUT_DELAY_MS" default:"12000"`
+	DefaultWebhookURL   string  `envconfig:"MOCK_WEBHOOK_URL" default:""`
+	WebhookDelayMs      int     `envconfig:"MOCK_WEBHOOK_DELAY_MS" default:"500"`
+	WebhookSentDelayMs  int     `envconfig:"MOCK_WEBHOOK_SENT_DELAY_MS" default:"300"`
+	WebhookQueueDelayMs int     `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS" default:"0"`
+	IncludeQueuedFirst  bool    `envconfig:"MOCK_WEBHOOK_INCLUDE_QUEUED" default:"true"`
 
 	Outcomes          []string
 	FailureTypes      []string
@@ -69,10 +67,6 @@ type server struct {
 	idx    uint64
 	rng    *rand.Rand
 	client *http.Client
-	// rate limit for timeout outcomes
-	timeoutMu          sync.Mutex
-	timeoutWindowStart time.Time
-	timeoutCount       int
 }
 
 func main() {
@@ -183,9 +177,6 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	outcome := s.nextOutcome()
-	if outcome == "timeout" && !s.allowTimeout() {
-		outcome = "ok"
-	}
 	finalStatus, errorCode, sendQueued, sendSent, httpStatus, callErr := classifyOutcome(outcome)
 
 	if callErr != nil {
@@ -207,24 +198,6 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		cb = s.cfg.DefaultWebhookURL
 	}
 	s.maybeWebhookSequence(cb, sid, finalStatus, errorCode, sendQueued, sendSent)
-}
-
-func (s *server) allowTimeout() bool {
-	if s.cfg.TimeoutMaxPerSec <= 0 {
-		return false
-	}
-	s.timeoutMu.Lock()
-	defer s.timeoutMu.Unlock()
-	now := time.Now().Truncate(time.Minute)
-	if s.timeoutWindowStart.IsZero() || !s.timeoutWindowStart.Equal(now) {
-		s.timeoutWindowStart = now
-		s.timeoutCount = 0
-	}
-	if s.timeoutCount >= s.cfg.TimeoutMaxPerSec {
-		return false
-	}
-	s.timeoutCount++
-	return true
 }
 
 func (s *server) maybeWebhookSequence(callbackURL, msgSid, finalStatus string, errorCode int, sendQueued, sendSent bool) {
