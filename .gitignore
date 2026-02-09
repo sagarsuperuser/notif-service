@@ -3,6 +3,7 @@
 .terraform/
 *.tfstate
 *.tfstate.backup
-.*tfplan
-.*tfout
+# Terraform plan/output artifacts
+infra/tfplan*
+infra/tfout*
 .DS_Store

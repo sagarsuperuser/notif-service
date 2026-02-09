@@ -494,6 +494,14 @@ locals {
       --server https://${aws_lb.api.dns_name}:6443 \
       --token ${random_password.k3s_token.result}
   EOT
+
+  agent_mock_user_data = <<-EOT
+    ${local.k3s_common} agent \
+      --server https://${aws_lb.api.dns_name}:6443 \
+      --token ${random_password.k3s_token.result} \
+      --node-label workload=mock-provider \
+      --node-taint workload=mock-provider:NoSchedule
+  EOT
 }
 
 # 3 servers (one per AZ)
@@ -545,7 +553,7 @@ resource "aws_instance" "k3s_agent" {
     volume_type = "gp3"
   }
 
-  user_data = local.agent_user_data
+  user_data = count.index < var.k3s_mock_agent_count ? local.agent_mock_user_data : local.agent_user_data
 
   tags = {
     Name = "${local.name}-k3s-agent-${count.index + 1}"

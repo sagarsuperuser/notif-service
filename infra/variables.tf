@@ -49,6 +49,12 @@ variable "k3s_agent_count" {
   default = 3
 }
 
+variable "k3s_mock_agent_count" {
+  type        = number
+  default     = 0
+  description = "How many agent nodes to dedicate to mock-provider (labeled + tainted at join time)."
+}
+
 # Ingress nodeports for NLB target groups
 variable "ingress_http_nodeport" {
   type    = number
