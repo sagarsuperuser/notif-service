@@ -14,17 +14,6 @@ spec:
         app: notif-mock-provider
     spec:
       terminationGracePeriodSeconds: 10
-      # Run mock-provider only on dedicated nodes:
-      # - label node(s):   kubectl label node <node> workload=mock-provider
-      # - taint node(s):   kubectl taint node <node> workload=mock-provider:NoSchedule
-      # This Deployment tolerates that taint; other workloads won't, so they won't schedule there.
-      nodeSelector:
-        workload: mock-provider
-      tolerations:
-        - key: workload
-          operator: Equal
-          value: mock-provider
-          effect: NoSchedule
       containers:
         - name: mock-provider
           image: notif-mock-provider:dev

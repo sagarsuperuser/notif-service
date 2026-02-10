@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: k6-notif-api-2rps-10m
+  name: k6-notif-api-56rps-30m
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 300
@@ -11,7 +11,7 @@ spec:
       containers:
         - name: k6
           image: grafana/k6:latest
-          args: ["run", "/scripts/notif-api-2rps-10m.js"]
+          args: ["run", "/scripts/notif-api-56rps-30m.js"]
           env:
             - name: API_URL
               value: "http://notif-api-svc/v1/sms/messages"
@@ -24,7 +24,7 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: k6-notif-api-2rps-10m
+            name: k6-notif-api-56rps-30m
         - name: phone-pool
           configMap:
             name: notif-db-sql
@@ -35,16 +35,23 @@ spec:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: k6-notif-api-2rps-10m
+  name: k6-notif-api-56rps-30m
 data:
-  notif-api-2rps-10m.js: |
+  notif-api-56rps-30m.js: |
     import http from 'k6/http';
-    import { check, sleep } from 'k6';
+    import { check } from 'k6';
 
     export const options = {
-      vus: 50,
-      duration: '10m',
-      rps: 20,
+      scenarios: {
+        steady_56rps_30m: {
+          executor: 'constant-arrival-rate',
+          rate: 56,           // ~55.6 rps
+          timeUnit: '1s',
+          duration: '30m',
+          preAllocatedVUs: 80, // start here
+          maxVUs: 300,         // headroom if API slows
+        },
+      },
     };
 
     const API_URL = __ENV.API_URL || 'http://notif-api-svc/v1/sms/messages';
@@ -74,7 +81,7 @@ data:
       const params = {
         headers: {
           'Content-Type': 'application/json',
-          'X-Test-Run': 'k6-notif-api-2rps-10m',
+          'X-Test-Run': 'k6-notif-api-56rps-30m',
         },
       };
 
@@ -82,6 +89,4 @@ data:
       check(res, {
         'status is 2xx': (r) => r.status >= 200 && r.status < 300,
       });
-
-      sleep(1);
     }

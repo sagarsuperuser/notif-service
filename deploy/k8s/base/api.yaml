@@ -38,10 +38,10 @@ spec:
               value: "9090"
           resources:
             requests:
-              cpu: "200m"
+              cpu: "250m"
               memory: "256Mi"
             limits:
-              cpu: "800m"
+              cpu: "500m"
               memory: "512Mi"
           readinessProbe:
             httpGet:

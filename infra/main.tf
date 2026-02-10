@@ -506,7 +506,7 @@ resource "aws_iam_instance_profile" "k3s_nodes" {
 # Bastion (public)
 resource "aws_instance" "bastion" {
   ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
+  instance_type               = var.bastion_instance_type
   subnet_id                   = values(aws_subnet.public)[0].id
   vpc_security_group_ids      = [aws_security_group.bastion.id]
   associate_public_ip_address = true
@@ -557,12 +557,12 @@ locals {
       --token ${random_password.k3s_token.result}
   EOT
 
-  agent_mock_user_data = <<-EOT
+  agent_monitoring_user_data = <<-EOT
     ${local.k3s_common} agent \
       --server https://${aws_lb.api.dns_name}:6443 \
       --token ${random_password.k3s_token.result} \
-      --node-label workload=mock-provider \
-      --node-taint workload=mock-provider:NoSchedule
+      --node-label workload=monitoring \
+      --node-taint workload=monitoring:NoSchedule
   EOT
 }
 
@@ -571,14 +571,14 @@ resource "aws_instance" "k3s_server" {
   count = 3
 
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
+  instance_type          = var.k3s_server_instance_type
   subnet_id              = values(aws_subnet.private)[count.index].id
   vpc_security_group_ids = [aws_security_group.nodes.id]
   key_name               = var.key_name
   iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
 
   root_block_device {
-    volume_size = 50
+    volume_size = var.root_volume_size_server_gb
     volume_type = "gp3"
   }
 
@@ -601,11 +601,12 @@ resource "aws_lb_target_group_attachment" "api_servers" {
 }
 
 # Workers (spread across AZs)
-resource "aws_instance" "k3s_agent" {
-  count = var.k3s_agent_count
+resource "aws_instance" "k3s_agent_ondemand" {
+  count = var.k3s_agent_ondemand_count
 
   ami           = data.aws_ami.ubuntu.id
-  instance_type = var.instance_type
+  # Monitoring workers need more RAM; keep the rest smaller for cost.
+  instance_type = count.index < var.k3s_monitoring_agent_count ? var.k3s_agent_monitoring_instance_type : var.k3s_agent_ondemand_instance_type
   # Only 3 private subnets (1 per AZ). Distribute agents evenly across them.
   subnet_id              = values(aws_subnet.private)[count.index % length(values(aws_subnet.private))].id
   vpc_security_group_ids = [aws_security_group.nodes.id]
@@ -613,33 +614,119 @@ resource "aws_instance" "k3s_agent" {
   iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
 
   root_block_device {
-    volume_size = 50
+    volume_size = count.index < var.k3s_monitoring_agent_count ? var.root_volume_size_monitoring_worker_gb : var.root_volume_size_worker_gb
     volume_type = "gp3"
   }
 
-  user_data = count.index < var.k3s_mock_agent_count ? local.agent_mock_user_data : local.agent_user_data
+  # Dedicate the first N on-demand agents to monitoring via label+taint at join time.
+  user_data = count.index < var.k3s_monitoring_agent_count ? local.agent_monitoring_user_data : local.agent_user_data
 
   tags = {
-    Name = "${local.name}-k3s-agent-${count.index + 1}"
+    Name = "${local.name}-k3s-agent-od-${count.index + 1}"
     Role = "k3s-agent"
   }
 
   depends_on = [aws_lb_listener.api_6443]
 }
 
+resource "aws_launch_template" "k3s_agent_spot" {
+  name_prefix            = "${local.name}-k3s-agent-spot-"
+  image_id               = data.aws_ami.ubuntu.id
+  # Mixed instances policy overrides this; keep a stable default.
+  instance_type          = var.k3s_agent_spot_instance_types[0]
+  key_name               = var.key_name
+  user_data              = base64encode(local.agent_user_data)
+  vpc_security_group_ids = [aws_security_group.nodes.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.k3s_nodes.name
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+
+    ebs {
+      volume_size = var.root_volume_size_worker_gb
+      volume_type = "gp3"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${local.name}-k3s-agent-spot"
+      Role = "k3s-agent"
+    }
+  }
+
+  depends_on = [aws_lb_listener.api_6443]
+}
+
+resource "aws_autoscaling_group" "k3s_agent_spot" {
+  name                = "${local.name}-k3s-agent-spot"
+  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
+
+  min_size         = var.k3s_agent_spot_count
+  max_size         = var.k3s_agent_spot_count
+  desired_capacity = var.k3s_agent_spot_count
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "capacity-optimized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.k3s_agent_spot.id
+        version            = "$Latest"
+      }
+
+      dynamic "override" {
+        for_each = var.k3s_agent_spot_instance_types
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-k3s-agent-spot"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Role"
+    value               = "k3s-agent"
+    propagate_at_launch = true
+  }
+}
+
 # Attach workers to ingress target groups
-resource "aws_lb_target_group_attachment" "ingress_workers_http" {
-  count            = var.k3s_agent_count
+resource "aws_lb_target_group_attachment" "ingress_workers_http_ondemand" {
+  for_each         = { for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id }
   target_group_arn = aws_lb_target_group.ingress_http.arn
-  target_id        = aws_instance.k3s_agent[count.index].id
+  target_id        = each.value
   port             = var.ingress_http_nodeport
 }
 
-resource "aws_lb_target_group_attachment" "ingress_workers_https" {
-  count            = var.k3s_agent_count
+resource "aws_lb_target_group_attachment" "ingress_workers_https_ondemand" {
+  for_each         = { for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id }
   target_group_arn = aws_lb_target_group.ingress_https.arn
-  target_id        = aws_instance.k3s_agent[count.index].id
+  target_id        = each.value
   port             = var.ingress_https_nodeport
+}
+
+resource "aws_autoscaling_attachment" "ingress_workers_http_spot" {
+  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
+  lb_target_group_arn    = aws_lb_target_group.ingress_http.arn
+}
+
+resource "aws_autoscaling_attachment" "ingress_workers_https_spot" {
+  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
+  lb_target_group_arn    = aws_lb_target_group.ingress_https.arn
 }
 
 # -------------------------

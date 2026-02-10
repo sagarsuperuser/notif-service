@@ -13,11 +13,11 @@ data:
   WORKER_CONCURRENCY: "20"
   SQS_WAIT_TIME: "20"
   SQS_MAX_MSGS: "10"
-  SQS_VISIBILITY_TIMEOUT: "60"
+  SQS_VISIBILITY_TIMEOUT: "180"
 
   # Twilio endpoint config
   TWILIO_BASE_URL: "http://notif-mock-provider-svc"
 
   # Twilio throttling knobs (per pod)
-  TWILIO_RPS_PER_POD: "50"
-  TWILIO_BURST: "50"
+  TWILIO_RPS_PER_POD: "100"
+  TWILIO_BURST: "100"
