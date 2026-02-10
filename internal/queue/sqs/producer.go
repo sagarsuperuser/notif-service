@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
@@ -11,6 +12,11 @@ import (
 type Producer struct {
 	SQS      *sqs.Client
 	QueueURL string
+
+	// For FIFO: use bounded, bucketed MessageGroupIds to allow parallelism without exploding cardinality.
+	// Example: tenantA:b1234, where bucket = hash(to) % GroupBuckets.
+	// If GroupBuckets <= 0, defaults to 2000.
+	GroupBuckets int
 }
 
 type SMSJob struct {
@@ -33,7 +39,7 @@ func (p *Producer) EnqueueSMS(ctx context.Context, tenantID, messageID, idempote
 		return err
 	}
 
-	groupID := fmt.Sprintf("%s:%s", tenantID, to) // FIFO ordering per phone
+	groupID := messageGroupIDBucketed(tenantID, to, p.GroupBuckets)
 	_, err = p.SQS.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:               &p.QueueURL,
 		MessageBody:            str(string(body)),
@@ -44,3 +50,13 @@ func (p *Producer) EnqueueSMS(ctx context.Context, tenantID, messageID, idempote
 }
 
 func str(s string) *string { return &s }
+
+func messageGroupIDBucketed(tenantID, to string, buckets int) string {
+	if buckets <= 0 {
+		buckets = 2000
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(to))
+	b := int(h.Sum32() % uint32(buckets))
+	return fmt.Sprintf("%s:b%d", tenantID, b)
+}

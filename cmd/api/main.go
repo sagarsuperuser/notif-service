@@ -46,7 +46,7 @@ func main() {
 	observability.RegisterAPI(prometheus.DefaultRegisterer)
 
 	store := pg.New(db)
-	producer := &sqsqueue.Producer{SQS: sqsClient, QueueURL: cfg.SQSQueueURL}
+	producer := &sqsqueue.Producer{SQS: sqsClient, QueueURL: cfg.SQSQueueURL, GroupBuckets: cfg.SQSGroupBuckets}
 
 	svc := &service.NotificationService{
 		Store:     store,

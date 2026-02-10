@@ -40,6 +40,7 @@ data:
   notif-api-56rps-30m.js: |
     import http from 'k6/http';
     import { check } from 'k6';
+    import exec from 'k6/execution';
 
     export const options = {
       scenarios: {
@@ -61,10 +62,15 @@ data:
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
 
+    if (PHONE_POOL.length === 0) {
+      throw new Error('PHONE_POOL is empty (phones.txt)');
+    }
+
     export default function () {
       const now = Date.now();
-      const key = `k6-${__VU}-${__ITER}-${now}`;
-      const idx = (__VU + __ITER) % PHONE_POOL.length;
+      const it = exec.scenario.iterationInTest;
+      const key = `k6-${__VU}-${it}-${now}`;
+      const idx = it % PHONE_POOL.length;
       const to = PHONE_POOL[idx];
 
       const payload = JSON.stringify({

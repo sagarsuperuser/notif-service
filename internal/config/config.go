@@ -15,6 +15,7 @@ type APIConfig struct {
 	AWSRegion          string `envconfig:"AWS_REGION" required:"true"`
 	SQSQueueURL        string `envconfig:"SQS_QUEUE_URL" required:"true"`
 	LocalstackEndpoint string `envconfig:"LOCALSTACK_ENDPOINT"`
+	SQSGroupBuckets    int    `envconfig:"SQS_GROUP_BUCKETS" default:"2000"`
 }
 
 type WorkerConfig struct {
