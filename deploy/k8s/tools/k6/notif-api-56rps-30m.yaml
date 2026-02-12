@@ -39,7 +39,7 @@ data:
           executor: 'constant-arrival-rate',
           rate: 56,           // ~55.6 rps
           timeUnit: '1s',
-          duration: '30m',
+          duration: '10m',
           preAllocatedVUs: 80, // start here
           maxVUs: 300,         // headroom if API slows
         },
