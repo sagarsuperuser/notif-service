@@ -11,7 +11,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -37,7 +36,13 @@ func main() {
 	// Use a root ctx we can cancel
 	ctx, cancel := context.WithCancel(context.Background())
 
-	db, err := pgxpool.New(ctx, cfg.DBDSN)
+	db, err := pg.NewPool(ctx, cfg.DBDSN, pg.PoolOptions{
+		MaxConns:          cfg.DBPoolMaxConns,
+		MinConns:          cfg.DBPoolMinConns,
+		MaxConnLifetime:   cfg.DBPoolMaxConnLifetime,
+		MaxConnIdleTime:   cfg.DBPoolMaxConnIdleTime,
+		HealthCheckPeriod: cfg.DBPoolHealthCheckPeriod,
+	})
 	if err != nil {
 		slog.Error("worker db connect failed", "err", err)
 		os.Exit(1)

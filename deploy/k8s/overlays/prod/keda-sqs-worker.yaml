@@ -5,16 +5,16 @@ metadata:
 spec:
   scaleTargetRef:
     name: notif-worker
-  pollingInterval: 10
-  cooldownPeriod: 180
-  minReplicaCount: 10
-  maxReplicaCount: 20
+  pollingInterval: 5
+  cooldownPeriod: 90
+  minReplicaCount: 2
+  maxReplicaCount: 60
   triggers:
     - type: aws-sqs-queue
       authenticationRef:
         name: aws-sqs-auth
       metadata:
         queueURL: https://sqs.ap-south-1.amazonaws.com/000000000000/notif-send.fifo
-        queueLength: "200"
-        activationQueueLength: "20"
+        queueLength: "50"
+        activationQueueLength: "5"
         awsRegion: ap-south-1

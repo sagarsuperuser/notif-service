@@ -10,7 +10,7 @@ data:
   PUBLIC_WEBHOOK_URL: "http://notif-webhook-svc/v1/webhooks/twilio/status"
 
   # Worker / SQS tuning
-  WORKER_CONCURRENCY: "20"
+  WORKER_CONCURRENCY: "100"
   SQS_WAIT_TIME: "20"
   SQS_MAX_MSGS: "10"
   SQS_VISIBILITY_TIMEOUT: "180"
@@ -21,3 +21,4 @@ data:
   # Twilio throttling knobs (per pod)
   TWILIO_RPS_PER_POD: "100"
   TWILIO_BURST: "100"
+  SQS_GROUP_BUCKETS: "5000"

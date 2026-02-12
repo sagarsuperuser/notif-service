@@ -12,4 +12,3 @@ configMapGenerator:
     files:
       - sql/001_init.sql
       - sql/seed.sql
-      - sql/phones.txt

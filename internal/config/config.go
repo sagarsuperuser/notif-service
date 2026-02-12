@@ -3,10 +3,15 @@ package config
 import "github.com/kelseyhightower/envconfig"
 
 type APIConfig struct {
-	DBDSN       string `envconfig:"DB_DSN" required:"true"`
-	Port        string `envconfig:"PORT" default:"8080"`
-	MetricsPort string `envconfig:"METRICS_PORT" default:"9090"`
-	LogFormat   string `envconfig:"LOG_FORMAT" default:"json"`
+	DBDSN                   string `envconfig:"DB_DSN" required:"true"`
+	DBPoolMaxConns          int32  `envconfig:"DB_POOL_MAX_CONNS" default:"10"`
+	DBPoolMinConns          int32  `envconfig:"DB_POOL_MIN_CONNS" default:"2"`
+	DBPoolMaxConnLifetime   string `envconfig:"DB_POOL_MAX_CONN_LIFETIME" default:"30m"`
+	DBPoolMaxConnIdleTime   string `envconfig:"DB_POOL_MAX_CONN_IDLE_TIME" default:"10m"`
+	DBPoolHealthCheckPeriod string `envconfig:"DB_POOL_HEALTH_CHECK_PERIOD" default:"30s"`
+	Port                    string `envconfig:"PORT" default:"8080"`
+	MetricsPort             string `envconfig:"METRICS_PORT" default:"9090"`
+	LogFormat               string `envconfig:"LOG_FORMAT" default:"json"`
 
 	// multi-tenant rails
 	MaxSMSPerDay int `envconfig:"MAX_SMS_PER_DAY" default:"2"`
@@ -19,10 +24,15 @@ type APIConfig struct {
 }
 
 type WorkerConfig struct {
-	DBDSN       string `envconfig:"DB_DSN" required:"true"`
-	Port        string `envconfig:"PORT" default:"8080"`
-	MetricsPort string `envconfig:"METRICS_PORT" default:"9090"`
-	LogFormat   string `envconfig:"LOG_FORMAT" default:"json"`
+	DBDSN                   string `envconfig:"DB_DSN" required:"true"`
+	DBPoolMaxConns          int32  `envconfig:"DB_POOL_MAX_CONNS" default:"20"`
+	DBPoolMinConns          int32  `envconfig:"DB_POOL_MIN_CONNS" default:"5"`
+	DBPoolMaxConnLifetime   string `envconfig:"DB_POOL_MAX_CONN_LIFETIME" default:"30m"`
+	DBPoolMaxConnIdleTime   string `envconfig:"DB_POOL_MAX_CONN_IDLE_TIME" default:"5m"`
+	DBPoolHealthCheckPeriod string `envconfig:"DB_POOL_HEALTH_CHECK_PERIOD" default:"30s"`
+	Port                    string `envconfig:"PORT" default:"8080"`
+	MetricsPort             string `envconfig:"METRICS_PORT" default:"9090"`
+	LogFormat               string `envconfig:"LOG_FORMAT" default:"json"`
 
 	// AWS / SQS
 	AWSRegion          string `envconfig:"AWS_REGION" required:"true"`
@@ -42,14 +52,18 @@ type WorkerConfig struct {
 	TwilioBaseURL             string  `envconfig:"TWILIO_BASE_URL" default:"https://api.twilio.com"`
 	TwilioRPSPerPod           float64 `envconfig:"TWILIO_RPS_PER_POD" default:"5"`
 	TwilioBurst               int     `envconfig:"TWILIO_BURST" default:"10"`
-
 }
 
 type WebhookConfig struct {
-	DBDSN       string `envconfig:"DB_DSN" required:"true"`
-	Port        string `envconfig:"PORT" default:"8080"`
-	MetricsPort string `envconfig:"METRICS_PORT" default:"9090"`
-	LogFormat   string `envconfig:"LOG_FORMAT" default:"json"`
+	DBDSN                   string `envconfig:"DB_DSN" required:"true"`
+	DBPoolMaxConns          int32  `envconfig:"DB_POOL_MAX_CONNS" default:"10"`
+	DBPoolMinConns          int32  `envconfig:"DB_POOL_MIN_CONNS" default:"2"`
+	DBPoolMaxConnLifetime   string `envconfig:"DB_POOL_MAX_CONN_LIFETIME" default:"30m"`
+	DBPoolMaxConnIdleTime   string `envconfig:"DB_POOL_MAX_CONN_IDLE_TIME" default:"10m"`
+	DBPoolHealthCheckPeriod string `envconfig:"DB_POOL_HEALTH_CHECK_PERIOD" default:"30s"`
+	Port                    string `envconfig:"PORT" default:"8080"`
+	MetricsPort             string `envconfig:"METRICS_PORT" default:"9090"`
+	LogFormat               string `envconfig:"LOG_FORMAT" default:"json"`
 
 	// Webhook signature verification
 	TwilioAuthToken  string `envconfig:"TWILIO_AUTH_TOKEN" required:"true"`

@@ -36,6 +36,16 @@ spec:
               value: "8080"
             - name: METRICS_PORT
               value: "9090"
+            - name: DB_POOL_MAX_CONNS
+              value: "10"
+            - name: DB_POOL_MIN_CONNS
+              value: "2"
+            - name: DB_POOL_MAX_CONN_LIFETIME
+              value: "30m"
+            - name: DB_POOL_MAX_CONN_IDLE_TIME
+              value: "10m"
+            - name: DB_POOL_HEALTH_CHECK_PERIOD
+              value: "30s"
           resources:
             requests:
               cpu: "250m"

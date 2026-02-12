@@ -42,6 +42,11 @@
           "expr": "histogram_quantile(0.95, sum(rate(notif_end_to_end_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "p95",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(notif_end_to_end_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
         }
       ],
       "title": "End-to-End Latency (API → Provider)",

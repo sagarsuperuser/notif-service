@@ -4,16 +4,9 @@ VALUES ('foodapp', 'Food App (Local)')
 ON CONFLICT (id) DO NOTHING;
 
 -- 2) Consents (so you can test opted_in vs opted_out)
--- Read opted-in phone pool from mounted file /sql/phones.txt
-DROP TABLE IF EXISTS seed_phones;
-CREATE TEMP TABLE seed_phones (
-  phone TEXT PRIMARY KEY
-);
-\copy seed_phones(phone) FROM '/sql/phones.txt' WITH (FORMAT text);
-
 INSERT INTO consents (tenant_id, phone, channel, status)
-SELECT 'foodapp', phone, 'sms', 'opted_in'
-FROM seed_phones
+SELECT 'foodapp', '+199900' || lpad(gs::text, 5, '0'), 'sms', 'opted_in'
+FROM generate_series(0, 99999) AS gs
 ON CONFLICT (tenant_id, phone, channel)
 DO UPDATE SET status = EXCLUDED.status, updated_at = now();
 

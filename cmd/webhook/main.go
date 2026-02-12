@@ -9,7 +9,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -28,7 +27,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	db, err := pgxpool.New(ctx, cfg.DBDSN)
+	db, err := pg.NewPool(ctx, cfg.DBDSN, pg.PoolOptions{
+		MaxConns:          cfg.DBPoolMaxConns,
+		MinConns:          cfg.DBPoolMinConns,
+		MaxConnLifetime:   cfg.DBPoolMaxConnLifetime,
+		MaxConnIdleTime:   cfg.DBPoolMaxConnIdleTime,
+		HealthCheckPeriod: cfg.DBPoolHealthCheckPeriod,
+	})
 	if err != nil {
 		slog.Error("webhook db connect failed", "err", err)
 		os.Exit(1)
