@@ -80,4 +80,10 @@ func RegisterWebhook(reg prometheus.Registerer) {
 		WebhookEvents,
 		WebhookMessageUpdateNotFound,
 	)
+
+	// CounterVec does not emit any time series until a label set is used at least once.
+	// Pre-initialize the expected label values so dashboards/PromQL can see a 0 series.
+	WebhookMessageUpdateNotFound.WithLabelValues("delivered").Add(0)
+	WebhookMessageUpdateNotFound.WithLabelValues("failed").Add(0)
+	WebhookMessageUpdateNotFound.WithLabelValues("undelivered").Add(0)
 }

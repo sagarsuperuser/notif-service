@@ -3,8 +3,9 @@ kind: CronJob
 metadata:
   name: notif-db-reconcile-submitted
 spec:
-  # Every minute. Adjust if you want less churn.
-  schedule: "* * * * *"
+  # Production-friendly: frequent enough to heal, not so frequent it churns.
+  schedule: "*/5 * * * *"
+  startingDeadlineSeconds: 60
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
@@ -15,6 +16,8 @@ spec:
       template:
         spec:
           restartPolicy: Never
+          terminationGracePeriodSeconds: 10
+          activeDeadlineSeconds: 300
           containers:
             - name: reconcile
               image: postgres:17-alpine
@@ -23,10 +26,19 @@ spec:
               args:
                 - |
                   test -n "${DB_DSN:-}" || { echo "DB_DSN is required"; exit 1; }
-                  psql "$DB_DSN" -v ON_ERROR_STOP=1 -f /sql/reconcile-submitted.sql
+                  psql "$DB_DSN" -v ON_ERROR_STOP=1 \
+                    -c "SET statement_timeout='2min'; SET lock_timeout='5s';" \
+                    -f /sql/reconcile-submitted.sql
               envFrom:
                 - secretRef:
                     name: notif-secrets
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "256Mi"
               volumeMounts:
                 - name: sql
                   mountPath: /sql
@@ -35,4 +47,3 @@ spec:
             - name: sql
               configMap:
                 name: notif-db-sql
-

@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -46,7 +47,12 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 
 	observability.WebhookEvents.WithLabelValues(status).Inc()
 
-	if err := w.Store.InsertDeliveryEvent(r.Context(), store.DeliveryEvent{
+	// Don't couple DB writes to the client connection. Providers can time out and disconnect while
+	// we still want to persist and apply the event. Bound it with a timeout instead.
+	dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := w.Store.InsertDeliveryEvent(dbCtx, store.DeliveryEvent{
 		Provider:      "twilio",
 		ProviderMsgID: msgSid,
 		VendorStatus:  status,
@@ -55,6 +61,11 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 		OccurredAt:    nil,
 	}); err != nil {
 		slog.Error("webhook insert delivery event failed", "err", err, "message_sid", msgSid, "status", status)
+		// Treat DB timeouts as transient: ask provider to retry.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(rw, ErrDependency, http.StatusInternalServerError)
 		return
 	}
@@ -76,7 +87,7 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 	var updated bool
 	var lastUpdateErr error
 	for attempt := 0; attempt < 10; attempt++ {
-		updated, lastUpdateErr = w.Store.UpdateMessageByProviderMsgID(r.Context(), store.ProviderMsgUpdate{
+		updated, lastUpdateErr = w.Store.UpdateMessageByProviderMsgID(dbCtx, store.ProviderMsgUpdate{
 			Provider:      "twilio",
 			ProviderMsgID: msgSid,
 			NewState:      newState,
@@ -105,6 +116,10 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 
 	if lastUpdateErr != nil {
 		slog.Error("webhook update message failed", "err", lastUpdateErr, "message_sid", msgSid, "status", status, "new_state", newState)
+		if errors.Is(lastUpdateErr, context.DeadlineExceeded) || errors.Is(lastUpdateErr, context.Canceled) {
+			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(rw, ErrDependency, http.StatusInternalServerError)
 		return
 	}

@@ -12,3 +12,6 @@ k3s_general_spot_count             = 3
 k3s_monitoring_agent_count         = 1
 k3s_mock_provider_agent_count      = 2
 k3s_worker_agent_count             = 2
+
+# RDS sizing (8 GiB RAM)
+db_instance_class = "db.t4g.large"

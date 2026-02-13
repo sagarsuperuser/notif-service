@@ -6,6 +6,11 @@ SQL is loaded from `deploy/k8s/jobs/sql/`.
 This folder also includes a CronJob that reconciles messages stuck in `submitted` by applying the latest terminal
 delivery events (`delivered`/`failed`/`undelivered`) back onto the `messages` table.
 
+The reconciler is designed to be production-safe:
+- Runs every 5 minutes.
+- Uses a statement timeout / lock timeout to avoid long-running DB pressure.
+- Batches updates (see `LIMIT` inside `sql/reconcile-submitted.sql`) so each run is bounded.
+
 ## Run
 
 ```bash
