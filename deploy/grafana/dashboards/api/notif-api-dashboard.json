@@ -34,7 +34,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (status) (rate(notif_api_requests_total{endpoint!~\"^/(healthz|readyz)$\"}[1m]))",
+          "expr": "sum by (status) (rate(notif_api_requests_total{exported_endpoint!~\"^/(healthz|readyz)$\"}[1m]))",
           "legendFormat": "{{status}}",
           "refId": "A"
         }

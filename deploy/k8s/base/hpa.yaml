@@ -46,8 +46,8 @@ spec:
     kind: Deployment
     name: notif-mock-provider
   minReplicas: 1
-  # Dedicated mock-provider capacity: 2 on-demand + 4 spot nodes.
-  maxReplicas: 6
+  # Dedicated mock-provider capacity: 2 on-demand + 7 spot nodes.
+  maxReplicas: 9
   metrics:
     - type: Resource
       resource:

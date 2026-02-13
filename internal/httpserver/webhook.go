@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/gorilla/mux"
 
@@ -69,16 +70,51 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := w.Store.UpdateMessageByProviderMsgID(r.Context(), store.ProviderMsgUpdate{
-		Provider:      "twilio",
-		ProviderMsgID: msgSid,
-		NewState:      newState,
-		LastError:     errCode,
-		Now:           util.NowUTC(),
-	}); err != nil {
-		slog.Error("webhook update message failed", "err", err, "message_sid", msgSid, "status", status, "new_state", newState)
+	// Webhooks can arrive before the worker has persisted provider_msg_id into messages.
+	// If we update once and drop the result, messages can get stuck in "submitted" forever.
+	// Retry briefly; if still not found, return non-2xx so the provider can retry delivery.
+	var updated bool
+	var lastUpdateErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		updated, lastUpdateErr = w.Store.UpdateMessageByProviderMsgID(r.Context(), store.ProviderMsgUpdate{
+			Provider:      "twilio",
+			ProviderMsgID: msgSid,
+			NewState:      newState,
+			LastError:     errCode,
+			Now:           util.NowUTC(),
+		})
+		if lastUpdateErr != nil {
+			break
+		}
+		if updated {
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Backoff: 25ms, 50ms, 75ms, ... up to 250ms. Total worst-case ~1.4s.
+		sleep := time.Duration(25*(attempt+1)) * time.Millisecond
+		t := time.NewTimer(sleep)
+		select {
+		case <-r.Context().Done():
+			t.Stop()
+			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
+			return
+		case <-t.C:
+		}
+	}
+
+	if lastUpdateErr != nil {
+		slog.Error("webhook update message failed", "err", lastUpdateErr, "message_sid", msgSid, "status", status, "new_state", newState)
 		http.Error(rw, ErrDependency, http.StatusInternalServerError)
 		return
 	}
-	rw.WriteHeader(http.StatusOK)
+
+	// Not updated after retries: ask the provider to retry (prevents stuck "submitted").
+	slog.Warn("webhook message not found for provider msg id (retry later)",
+		"provider", "twilio",
+		"message_sid", msgSid,
+		"status", status,
+		"new_state", newState,
+	)
+	http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
 }
