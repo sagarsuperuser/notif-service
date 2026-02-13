@@ -48,6 +48,13 @@ var (
 		prometheus.CounterOpts{Name: "twilio_webhook_events_total", Help: "Webhook events"},
 		[]string{"status"},
 	)
+	WebhookMessageUpdateNotFound = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "notif_webhook_message_update_not_found_total",
+			Help: "Terminal webhook events that could not be applied to messages (no matching provider_msg_id yet)",
+		},
+		[]string{"status"},
+	)
 )
 
 func RegisterAPI(reg prometheus.Registerer) {
@@ -71,5 +78,6 @@ func RegisterWebhook(reg prometheus.Registerer) {
 	reg.MustRegister(
 		WebhookRequests,
 		WebhookEvents,
+		WebhookMessageUpdateNotFound,
 	)
 }

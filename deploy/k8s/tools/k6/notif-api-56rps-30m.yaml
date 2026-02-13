@@ -37,7 +37,7 @@ data:
       scenarios: {
         steady_56rps_30m: {
           executor: 'constant-arrival-rate',
-          rate: 510,           // ~55.6 rps
+          rate: 500,           // ~55.6 rps
           timeUnit: '1s',
           duration: '10m',
           preAllocatedVUs: 600, // start here

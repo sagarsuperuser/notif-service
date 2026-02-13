@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - db-migrate-seed-job.yaml
+  - db-reconcile-submitted-cronjob.yaml
 
 generatorOptions:
   disableNameSuffixHash: true
@@ -12,3 +13,4 @@ configMapGenerator:
     files:
       - sql/001_init.sql
       - sql/seed.sql
+      - sql/reconcile-submitted.sql

@@ -40,6 +40,19 @@ type config struct {
 	WebhookSentDelayMs  int     `envconfig:"MOCK_WEBHOOK_SENT_DELAY_MS" default:"300"`
 	WebhookQueueDelayMs int     `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS" default:"0"`
 	IncludeQueuedFirst  bool    `envconfig:"MOCK_WEBHOOK_INCLUDE_QUEUED" default:"true"`
+	// Delay ranges (ms). If both min/max are >= 0, they take precedence over the fixed delay above.
+	WebhookDelayMinMs      int `envconfig:"MOCK_WEBHOOK_DELAY_MS_MIN" default:"-1"`
+	WebhookDelayMaxMs      int `envconfig:"MOCK_WEBHOOK_DELAY_MS_MAX" default:"-1"`
+	WebhookSentDelayMinMs  int `envconfig:"MOCK_WEBHOOK_SENT_DELAY_MS_MIN" default:"-1"`
+	WebhookSentDelayMaxMs  int `envconfig:"MOCK_WEBHOOK_SENT_DELAY_MS_MAX" default:"-1"`
+	WebhookQueueDelayMinMs int `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS_MIN" default:"-1"`
+	WebhookQueueDelayMaxMs int `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS_MAX" default:"-1"`
+
+	// Webhook retry knobs. Retries happen on non-2xx responses and on retryable errors.
+	WebhookMaxRetries      int `envconfig:"MOCK_WEBHOOK_MAX_RETRIES" default:"8"`
+	WebhookRetryBaseMs     int `envconfig:"MOCK_WEBHOOK_RETRY_BASE_MS" default:"250"`
+	WebhookRetryMaxMs      int `envconfig:"MOCK_WEBHOOK_RETRY_MAX_MS" default:"10000"`
+	WebhookRetryJitterPct  int `envconfig:"MOCK_WEBHOOK_RETRY_JITTER_PCT" default:"20"`
 
 	Outcomes          []string
 	FailureTypes      []string
@@ -49,6 +62,16 @@ type config struct {
 	WebhookDelay      time.Duration
 	WebhookSentDelay  time.Duration
 	WebhookQueueDelay time.Duration
+
+	WebhookDelayMin      time.Duration
+	WebhookDelayMax      time.Duration
+	WebhookSentDelayMin  time.Duration
+	WebhookSentDelayMax  time.Duration
+	WebhookQueueDelayMin time.Duration
+	WebhookQueueDelayMax time.Duration
+
+	WebhookRetryBase    time.Duration
+	WebhookRetryMax     time.Duration
 }
 
 type sendResponse struct {
@@ -136,6 +159,34 @@ func loadConfig() config {
 	cfg.WebhookDelay = time.Duration(cfg.WebhookDelayMs) * time.Millisecond
 	cfg.WebhookSentDelay = time.Duration(cfg.WebhookSentDelayMs) * time.Millisecond
 	cfg.WebhookQueueDelay = time.Duration(cfg.WebhookQueueDelayMs) * time.Millisecond
+
+	cfg.WebhookDelayMin = time.Duration(cfg.WebhookDelayMinMs) * time.Millisecond
+	cfg.WebhookDelayMax = time.Duration(cfg.WebhookDelayMaxMs) * time.Millisecond
+	cfg.WebhookSentDelayMin = time.Duration(cfg.WebhookSentDelayMinMs) * time.Millisecond
+	cfg.WebhookSentDelayMax = time.Duration(cfg.WebhookSentDelayMaxMs) * time.Millisecond
+	cfg.WebhookQueueDelayMin = time.Duration(cfg.WebhookQueueDelayMinMs) * time.Millisecond
+	cfg.WebhookQueueDelayMax = time.Duration(cfg.WebhookQueueDelayMaxMs) * time.Millisecond
+
+	if cfg.WebhookMaxRetries < 0 {
+		cfg.WebhookMaxRetries = 0
+	}
+	if cfg.WebhookRetryBaseMs <= 0 {
+		cfg.WebhookRetryBaseMs = 250
+	}
+	if cfg.WebhookRetryMaxMs <= 0 {
+		cfg.WebhookRetryMaxMs = 10000
+	}
+	if cfg.WebhookRetryJitterPct < 0 {
+		cfg.WebhookRetryJitterPct = 0
+	}
+	cfg.WebhookRetryBase = time.Duration(cfg.WebhookRetryBaseMs) * time.Millisecond
+	cfg.WebhookRetryMax = time.Duration(cfg.WebhookRetryMaxMs) * time.Millisecond
+
+	// If a range is set, sanitize it.
+	cfg.WebhookDelayMin, cfg.WebhookDelayMax = sanitizeRange(cfg.WebhookDelayMin, cfg.WebhookDelayMax)
+	cfg.WebhookSentDelayMin, cfg.WebhookSentDelayMax = sanitizeRange(cfg.WebhookSentDelayMin, cfg.WebhookSentDelayMax)
+	cfg.WebhookQueueDelayMin, cfg.WebhookQueueDelayMax = sanitizeRange(cfg.WebhookQueueDelayMin, cfg.WebhookQueueDelayMax)
+
 	if len(cfg.Outcomes) == 0 {
 		cfg.Outcomes = []string{"ok"}
 	}
@@ -149,6 +200,17 @@ func loadConfig() config {
 		}
 	}
 	return cfg
+}
+
+func sanitizeRange(min, max time.Duration) (time.Duration, time.Duration) {
+	// Both must be set to activate range behavior.
+	if min < 0 || max < 0 {
+		return -1, -1
+	}
+	if max < min {
+		return max, min
+	}
+	return min, max
 }
 
 func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -226,29 +288,154 @@ func (s *server) maybeWebhookSequence(callbackURL, msgSid, finalStatus string, e
 			}
 
 			sig := twilioSignature(s.cfg.AuthToken, callbackURL, form)
-			req, _ := http.NewRequest(http.MethodPost, callbackURL, strings.NewReader(form.Encode()))
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			req.Header.Set("X-Twilio-Signature", sig)
-			_, _ = s.client.Do(req)
+			_ = s.postWebhookWithRetry(context.Background(), callbackURL, sig, form)
 		}
 
 		if s.cfg.IncludeQueuedFirst && sendQueued {
-			if s.cfg.WebhookQueueDelay > 0 {
-				time.Sleep(s.cfg.WebhookQueueDelay)
-			}
+			s.sleepMaybeRange(s.cfg.WebhookQueueDelayMin, s.cfg.WebhookQueueDelayMax, s.cfg.WebhookQueueDelay)
 			post("queued", 0)
 		}
 		if sendSent {
-			if s.cfg.WebhookSentDelay > 0 {
-				time.Sleep(s.cfg.WebhookSentDelay)
-			}
+			s.sleepMaybeRange(s.cfg.WebhookSentDelayMin, s.cfg.WebhookSentDelayMax, s.cfg.WebhookSentDelay)
 			post("sent", 0)
 		}
-		if s.cfg.WebhookDelay > 0 {
-			time.Sleep(s.cfg.WebhookDelay)
-		}
+		s.sleepMaybeRange(s.cfg.WebhookDelayMin, s.cfg.WebhookDelayMax, s.cfg.WebhookDelay)
 		post(finalStatus, errorCode)
 	}()
+}
+
+func (s *server) sleepMaybeRange(min, max, fallback time.Duration) {
+	d := fallback
+	if min >= 0 && max >= 0 {
+		d = s.randDuration(min, max)
+	}
+	if d <= 0 {
+		return
+	}
+	time.Sleep(d)
+}
+
+func (s *server) randDuration(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	span := int64(max - min)
+	s.rngMu.Lock()
+	n := s.rng.Int63n(span + 1)
+	s.rngMu.Unlock()
+	return min + time.Duration(n)
+}
+
+func (s *server) postWebhookWithRetry(ctx context.Context, callbackURL, sig string, form url.Values) error {
+	maxAttempts := s.cfg.WebhookMaxRetries + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-Twilio-Signature", sig)
+
+		resp, err := s.client.Do(req)
+		retryAfter := time.Duration(0)
+		if resp != nil {
+			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+		}
+
+		if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			_ = resp.Body.Close()
+			return nil
+		}
+
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+			_ = resp.Body.Close()
+		}
+
+		// No more attempts left.
+		if attempt == maxAttempts-1 {
+			if err != nil {
+				slog.Error("mock webhook post failed", "url", callbackURL, "attempt", attempt+1, "err", err)
+				return err
+			}
+			slog.Error("mock webhook post failed", "url", callbackURL, "attempt", attempt+1, "status", status)
+			return fmt.Errorf("webhook post failed: status=%d", status)
+		}
+
+		// Retry only on retryable outcomes.
+		if err == nil && !isRetryableStatus(status) {
+			slog.Error("mock webhook post non-retryable", "url", callbackURL, "attempt", attempt+1, "status", status)
+			return fmt.Errorf("webhook post non-retryable: status=%d", status)
+		}
+
+		wait := retryAfter
+		if wait <= 0 {
+			wait = s.retryBackoff(attempt)
+		}
+		slog.Warn("mock webhook post retrying", "url", callbackURL, "attempt", attempt+1, "status", status, "wait_ms", wait.Milliseconds())
+		time.Sleep(wait)
+	}
+
+	return nil
+}
+
+func (s *server) retryBackoff(attempt int) time.Duration {
+	base := s.cfg.WebhookRetryBase
+	max := s.cfg.WebhookRetryMax
+	if base <= 0 {
+		base = 250 * time.Millisecond
+	}
+	if max <= 0 {
+		max = 10 * time.Second
+	}
+
+	// Exponential: base * 2^attempt, capped.
+	wait := base * time.Duration(1<<attempt)
+	if wait > max {
+		wait = max
+	}
+
+	jp := s.cfg.WebhookRetryJitterPct
+	if jp <= 0 {
+		return wait
+	}
+	if jp > 100 {
+		jp = 100
+	}
+
+	// Jitter: +/- jp%.
+	delta := int64(wait) * int64(jp) / 100
+	if delta <= 0 {
+		return wait
+	}
+	s.rngMu.Lock()
+	j := s.rng.Int63n(2*delta+1) - delta
+	s.rngMu.Unlock()
+	return time.Duration(int64(wait) + j)
+}
+
+func isRetryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	// Handle seconds form.
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	// Ignore HTTP-date for now (not needed for our mock/webhook path).
+	return 0
 }
 
 func (s *server) checkBasicAuth(r *http.Request) bool {

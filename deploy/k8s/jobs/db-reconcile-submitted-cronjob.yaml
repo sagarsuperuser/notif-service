@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: notif-db-reconcile-submitted
+spec:
+  # Every minute. Adjust if you want less churn.
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: reconcile
+              image: postgres:17-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  test -n "${DB_DSN:-}" || { echo "DB_DSN is required"; exit 1; }
+                  psql "$DB_DSN" -v ON_ERROR_STOP=1 -f /sql/reconcile-submitted.sql
+              envFrom:
+                - secretRef:
+                    name: notif-secrets
+              volumeMounts:
+                - name: sql
+                  mountPath: /sql
+                  readOnly: true
+          volumes:
+            - name: sql
+              configMap:
+                name: notif-db-sql
+

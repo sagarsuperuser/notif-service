@@ -61,8 +61,28 @@ spec:
               value: "undelivered:2,failed:3,rate_limit:4,bad_request:1,server_error:1,timeout:1"
             - name: MOCK_WEBHOOK_URL
               value: "http://notif-webhook-svc/v1/webhooks/twilio/status"
-            - name: MOCK_WEBHOOK_DELAY_MS
+            # More realistic webhook timing: queued -> sent -> final, with jitter.
+            - name: MOCK_WEBHOOK_QUEUE_DELAY_MS_MIN
+              value: "50"
+            - name: MOCK_WEBHOOK_QUEUE_DELAY_MS_MAX
+              value: "300"
+            - name: MOCK_WEBHOOK_SENT_DELAY_MS_MIN
+              value: "200"
+            - name: MOCK_WEBHOOK_SENT_DELAY_MS_MAX
+              value: "1500"
+            - name: MOCK_WEBHOOK_DELAY_MS_MIN
               value: "1000"
+            - name: MOCK_WEBHOOK_DELAY_MS_MAX
+              value: "8000"
+            # Retry webhook delivery on non-2xx (Twilio-like behavior).
+            - name: MOCK_WEBHOOK_MAX_RETRIES
+              value: "8"
+            - name: MOCK_WEBHOOK_RETRY_BASE_MS
+              value: "250"
+            - name: MOCK_WEBHOOK_RETRY_MAX_MS
+              value: "10000"
+            - name: MOCK_WEBHOOK_RETRY_JITTER_PCT
+              value: "20"
           resources:
             requests:
               cpu: "200m"

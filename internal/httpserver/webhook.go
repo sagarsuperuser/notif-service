@@ -110,6 +110,7 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	// Not updated after retries: ask the provider to retry (prevents stuck "submitted").
+	observability.WebhookMessageUpdateNotFound.WithLabelValues(status).Inc()
 	slog.Warn("webhook message not found for provider msg id (retry later)",
 		"provider", "twilio",
 		"message_sid", msgSid,
