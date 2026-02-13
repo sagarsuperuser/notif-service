@@ -2,6 +2,7 @@
 *.txt
 .terraform/
 *.tfstate
+*.terraform.lock
 *.tfstate.backup
 # Terraform plan/output artifacts
 infra/tfplan*
