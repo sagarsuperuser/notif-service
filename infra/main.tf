@@ -565,6 +565,14 @@ locals {
       --node-taint workload=worker:NoSchedule
   EOT
 
+  agent_mock_provider_user_data = <<-EOT
+    ${local.k3s_common} agent \
+      --server https://${aws_lb.api.dns_name}:6443 \
+      --token ${random_password.k3s_token.result} \
+      --node-label workload=mock-provider \
+      --node-taint workload=mock-provider:NoSchedule
+  EOT
+
   agent_monitoring_user_data = <<-EOT
     ${local.k3s_common} agent \
       --server https://${aws_lb.api.dns_name}:6443 \
@@ -572,6 +580,237 @@ locals {
       --node-label workload=monitoring \
       --node-taint workload=monitoring:NoSchedule
   EOT
+}
+
+# Spot workers (ASG)
+resource "aws_launch_template" "k3s_agent_spot" {
+  name_prefix = "${local.name}-k3s-agent-spot-"
+  image_id    = data.aws_ami.ubuntu.id
+
+  # Mixed instances policy overrides this; keep a stable default.
+  instance_type = var.k3s_agent_spot_instance_types[0]
+  key_name      = var.key_name
+
+  # Join as a worker-dedicated node (label+taint) so it matches worker scheduling.
+  user_data              = base64encode(local.agent_worker_user_data)
+  vpc_security_group_ids = [aws_security_group.nodes.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.k3s_nodes.name
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_size = var.root_volume_size_worker_gb
+      volume_type = "gp3"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${local.name}-k3s-agent-spot"
+      Role = "k3s-agent"
+    }
+  }
+
+  depends_on = [aws_lb_listener.api_6443]
+}
+
+resource "aws_autoscaling_group" "k3s_agent_spot" {
+  name                = "${local.name}-k3s-agent-spot"
+  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
+
+  min_size         = var.k3s_worker_spot_count
+  max_size         = var.k3s_worker_spot_count
+  desired_capacity = var.k3s_worker_spot_count
+
+  # Use mixed instances so AWS can pick from instance types and AZs for capacity.
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "capacity-optimized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.k3s_agent_spot.id
+        version            = "$Latest"
+      }
+
+      dynamic "override" {
+        for_each = var.k3s_agent_spot_instance_types
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-k3s-agent-spot"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Role"
+    value               = "k3s-agent"
+    propagate_at_launch = true
+  }
+}
+
+# Spot nodes for mock-provider (separate ASG so we can use a different taint/label).
+resource "aws_launch_template" "k3s_agent_spot_mock_provider" {
+  name_prefix = "${local.name}-k3s-agent-spot-mock-provider-"
+  image_id    = data.aws_ami.ubuntu.id
+
+  instance_type = var.k3s_mock_provider_spot_instance_types[0]
+  key_name      = var.key_name
+
+  user_data              = base64encode(local.agent_mock_provider_user_data)
+  vpc_security_group_ids = [aws_security_group.nodes.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.k3s_nodes.name
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_size = var.root_volume_size_worker_gb
+      volume_type = "gp3"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${local.name}-k3s-agent-spot-mock-provider"
+      Role = "k3s-agent"
+    }
+  }
+
+  depends_on = [aws_lb_listener.api_6443]
+}
+
+resource "aws_autoscaling_group" "k3s_agent_spot_mock_provider" {
+  name                = "${local.name}-k3s-agent-spot-mock-provider"
+  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
+
+  min_size         = var.k3s_mock_provider_spot_count
+  max_size         = var.k3s_mock_provider_spot_count
+  desired_capacity = var.k3s_mock_provider_spot_count
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "capacity-optimized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.k3s_agent_spot_mock_provider.id
+        version            = "$Latest"
+      }
+
+      dynamic "override" {
+        for_each = var.k3s_mock_provider_spot_instance_types
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-k3s-agent-spot-mock-provider"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Role"
+    value               = "k3s-agent"
+    propagate_at_launch = true
+  }
+}
+
+# Spot nodes for general workloads (no special taints/labels).
+resource "aws_launch_template" "k3s_agent_spot_general" {
+  name_prefix = "${local.name}-k3s-agent-spot-general-"
+  image_id    = data.aws_ami.ubuntu.id
+
+  instance_type = var.k3s_general_spot_instance_types[0]
+  key_name      = var.key_name
+
+  user_data              = base64encode(local.agent_user_data)
+  vpc_security_group_ids = [aws_security_group.nodes.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.k3s_nodes.name
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_size = var.root_volume_size_worker_gb
+      volume_type = "gp3"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${local.name}-k3s-agent-spot-general"
+      Role = "k3s-agent"
+    }
+  }
+
+  depends_on = [aws_lb_listener.api_6443]
+}
+
+resource "aws_autoscaling_group" "k3s_agent_spot_general" {
+  name                = "${local.name}-k3s-agent-spot-general"
+  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
+
+  min_size         = var.k3s_general_spot_count
+  max_size         = var.k3s_general_spot_count
+  desired_capacity = var.k3s_general_spot_count
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "capacity-optimized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.k3s_agent_spot_general.id
+        version            = "$Latest"
+      }
+
+      dynamic "override" {
+        for_each = var.k3s_general_spot_instance_types
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-k3s-agent-spot-general"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Role"
+    value               = "k3s-agent"
+    propagate_at_launch = true
+  }
 }
 
 # 3 servers (one per AZ)
@@ -626,10 +865,11 @@ resource "aws_instance" "k3s_agent_ondemand" {
     volume_type = "gp3"
   }
 
-  # Dedicate the first N on-demand agents to monitoring via label+taint at join time.
+  # Dedicate the first N on-demand agents to special workloads via label+taint at join time.
   user_data = (
     count.index < var.k3s_monitoring_agent_count ? local.agent_monitoring_user_data :
-    count.index < (var.k3s_monitoring_agent_count + var.k3s_worker_agent_count) ? local.agent_worker_user_data :
+    count.index < (var.k3s_monitoring_agent_count + var.k3s_mock_provider_agent_count) ? local.agent_mock_provider_user_data :
+    count.index < (var.k3s_monitoring_agent_count + var.k3s_mock_provider_agent_count + var.k3s_worker_agent_count) ? local.agent_worker_user_data :
     local.agent_user_data
   )
 
@@ -654,6 +894,26 @@ resource "aws_lb_target_group_attachment" "ingress_workers_https_ondemand" {
   target_group_arn = aws_lb_target_group.ingress_https.arn
   target_id        = each.value
   port             = var.ingress_https_nodeport
+}
+
+resource "aws_autoscaling_attachment" "ingress_workers_http_spot" {
+  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
+  lb_target_group_arn    = aws_lb_target_group.ingress_http.arn
+}
+
+resource "aws_autoscaling_attachment" "ingress_workers_https_spot" {
+  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
+  lb_target_group_arn    = aws_lb_target_group.ingress_https.arn
+}
+
+resource "aws_autoscaling_attachment" "ingress_workers_http_spot_general" {
+  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot_general.name
+  lb_target_group_arn    = aws_lb_target_group.ingress_http.arn
+}
+
+resource "aws_autoscaling_attachment" "ingress_workers_https_spot_general" {
+  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot_general.name
+  lb_target_group_arn    = aws_lb_target_group.ingress_https.arn
 }
 
 # -------------------------
@@ -705,6 +965,7 @@ resource "aws_sqs_queue" "main" {
   name                        = "${local.name}-send.fifo"
   fifo_queue                  = true
   content_based_deduplication = true
+  visibility_timeout_seconds  = 60
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn

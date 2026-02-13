@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,6 +67,7 @@ type server struct {
 	cfg    config
 	idx    uint64
 	rng    *rand.Rand
+	rngMu  sync.Mutex
 	client *http.Client
 }
 
@@ -150,20 +152,26 @@ func loadConfig() config {
 }
 
 func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	if !s.checkBasicAuth(r) {
+		s.maybeDelayResponse(r.Context(), start)
 		writeError(w, http.StatusUnauthorized, 20003, "Authentication Error")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
+		s.maybeDelayResponse(r.Context(), start)
 		writeError(w, http.StatusBadRequest, 21620, "Invalid form data")
 		return
 	}
 
 	if r.Form.Get("To") == "" || r.Form.Get("Body") == "" {
+		s.maybeDelayResponse(r.Context(), start)
 		writeError(w, http.StatusBadRequest, 21602, "Missing required parameter")
 		return
 	}
 	if r.Form.Get("MessagingServiceSid") == "" && r.Form.Get("From") == "" {
+		s.maybeDelayResponse(r.Context(), start)
 		writeError(w, http.StatusBadRequest, 21606, "From or MessagingServiceSid is required")
 		return
 	}
@@ -185,12 +193,14 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusGatewayTimeout, 20429, "Request timed out")
 			return
 		}
+		s.maybeDelayResponse(r.Context(), start)
 		writeError(w, httpStatus, errorCode, callErr.Error())
 		return
 	}
 
 	sid := fmtSID(atomic.AddUint64(&s.idx, 1) - 1)
 	resp := sendResponse{Sid: sid, Status: "queued"}
+	s.maybeDelayResponse(r.Context(), start)
 	writeJSON(w, http.StatusCreated, resp)
 
 	cb := r.Form.Get("StatusCallback")
@@ -255,14 +265,53 @@ func (s *server) nextOutcome() string {
 		idx := atomic.AddUint64(&s.idx, 1) - 1
 		return s.cfg.Outcomes[int(idx)%len(s.cfg.Outcomes)]
 	case "weighted":
-		if s.rng.Float64() <= s.cfg.SuccessRate {
+		s.rngMu.Lock()
+		ok := s.rng.Float64() <= s.cfg.SuccessRate
+		r := s.rng.Float64()
+		s.rngMu.Unlock()
+		if ok {
 			return "ok"
 		}
-		return pickWeighted(s.rng.Float64(), s.cfg.FailureWeights)
+		return pickWeighted(r, s.cfg.FailureWeights)
 	case "random":
-		return s.cfg.Outcomes[s.rng.Intn(len(s.cfg.Outcomes))]
+		s.rngMu.Lock()
+		i := s.rng.Intn(len(s.cfg.Outcomes))
+		s.rngMu.Unlock()
+		return s.cfg.Outcomes[i]
 	default:
 		return s.cfg.Outcomes[0]
+	}
+}
+
+func (s *server) maybeDelayResponse(ctx context.Context, start time.Time) {
+	const (
+		min = 100 * time.Millisecond
+		max = 500 * time.Millisecond
+	)
+
+	elapsed := time.Since(start)
+	if elapsed >= min {
+		return
+	}
+
+	// Pick a target total latency in [min, max] and sleep the remaining time.
+	s.rngMu.Lock()
+	target := min + time.Duration(s.rng.Int63n(int64(max-min)+1))
+	s.rngMu.Unlock()
+
+	remain := target - elapsed
+	if remain <= 0 {
+		return
+	}
+
+	t := time.NewTimer(remain)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-t.C:
+		return
 	}
 }
 

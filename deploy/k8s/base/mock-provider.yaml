@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: notif-mock-provider
 spec:
-  replicas: 1
+  replicas: 2
   revisionHistoryLimit: 5
   selector:
     matchLabels:
@@ -14,6 +14,27 @@ spec:
         app: notif-mock-provider
     spec:
       terminationGracePeriodSeconds: 10
+      nodeSelector:
+        workload: mock-provider
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "mock-provider"
+          effect: "NoSchedule"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: notif-mock-provider
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: notif-mock-provider
       containers:
         - name: mock-provider
           image: notif-mock-provider:dev

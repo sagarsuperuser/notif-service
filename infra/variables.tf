@@ -84,10 +84,52 @@ variable "k3s_agent_ondemand_count" {
   default = 2
 }
 
+variable "k3s_worker_spot_count" {
+  type        = number
+  default     = 0
+  description = "How many spot k3s worker nodes to run in an Auto Scaling Group."
+}
+
+variable "k3s_agent_spot_instance_types" {
+  type        = list(string)
+  description = "Spot worker instance types to try (helps with capacity shortages)."
+  default     = ["t3.small", "t3a.small"]
+}
+
+variable "k3s_mock_provider_spot_count" {
+  type        = number
+  default     = 0
+  description = "How many spot k3s agent nodes to dedicate to mock-provider workload (labeled + tainted at join time)."
+}
+
+variable "k3s_mock_provider_spot_instance_types" {
+  type        = list(string)
+  description = "Spot mock-provider instance types to try."
+  default     = ["t3.small", "t3a.small"]
+}
+
+variable "k3s_general_spot_count" {
+  type        = number
+  default     = 0
+  description = "How many spot k3s agent nodes to run with no special taints/labels (general pool for API/webhook/etc.)."
+}
+
+variable "k3s_general_spot_instance_types" {
+  type        = list(string)
+  description = "Spot general pool instance types to try."
+  default     = ["t3.small", "t3a.small"]
+}
+
 variable "k3s_worker_agent_count" {
   type        = number
   default     = 0
   description = "How many on-demand agents to dedicate to worker workload (labeled + tainted at join time). These come after monitoring agents."
+}
+
+variable "k3s_mock_provider_agent_count" {
+  type        = number
+  default     = 0
+  description = "How many on-demand agents to dedicate to mock-provider workload (labeled + tainted at join time). These come after monitoring agents."
 }
 
 variable "k3s_monitoring_agent_count" {

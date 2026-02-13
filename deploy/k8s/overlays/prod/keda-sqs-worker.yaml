@@ -8,7 +8,7 @@ spec:
   pollingInterval: 5
   cooldownPeriod: 90
   minReplicaCount: 2
-  maxReplicaCount: 4
+  maxReplicaCount: 10
   triggers:
     - type: aws-sqs-queue
       authenticationRef:
