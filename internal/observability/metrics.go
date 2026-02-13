@@ -30,7 +30,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "notif_end_to_end_latency_seconds",
 			Help:    "API accepted to provider attempt result",
-			Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600},
+			Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 900, 1200, 1800},
 		},
 	)
 	WorkerProcessed = prometheus.NewCounterVec(
@@ -41,7 +41,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "notif_worker_processing_seconds",
 			Help:    "Worker processing duration",
-			Buckets: []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60},
+			Buckets: []float64{0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180},
 		},
 	)
 	WebhookEvents = prometheus.NewCounterVec(

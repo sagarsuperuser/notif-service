@@ -84,15 +84,10 @@ variable "k3s_agent_ondemand_count" {
   default = 2
 }
 
-variable "k3s_agent_spot_count" {
-  type    = number
-  default = 0
-}
-
-variable "k3s_agent_spot_instance_types" {
-  type        = list(string)
-  description = "Spot worker instance types to try (helps with capacity shortages)."
-  default     = ["t3.small", "t3a.small"]
+variable "k3s_worker_agent_count" {
+  type        = number
+  default     = 0
+  description = "How many on-demand agents to dedicate to worker workload (labeled + tainted at join time). These come after monitoring agents."
 }
 
 variable "k3s_monitoring_agent_count" {

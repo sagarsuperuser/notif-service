@@ -19,6 +19,6 @@ data:
   TWILIO_BASE_URL: "http://notif-mock-provider-svc"
 
   # Twilio throttling knobs (per pod)
-  TWILIO_RPS_PER_POD: "100"
-  TWILIO_BURST: "100"
+  TWILIO_RPS_PER_POD: "500"
+  TWILIO_BURST: "500"
   SQS_GROUP_BUCKETS: "5000"

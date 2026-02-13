@@ -18,6 +18,27 @@ spec:
       labels:
         app: notif-worker
     spec:
+      nodeSelector:
+        workload: worker
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "worker"
+          effect: "NoSchedule"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: notif-worker
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: notif-worker
       terminationGracePeriodSeconds: 20
       containers:
         - name: worker

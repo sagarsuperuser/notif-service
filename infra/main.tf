@@ -557,6 +557,14 @@ locals {
       --token ${random_password.k3s_token.result}
   EOT
 
+  agent_worker_user_data = <<-EOT
+    ${local.k3s_common} agent \
+      --server https://${aws_lb.api.dns_name}:6443 \
+      --token ${random_password.k3s_token.result} \
+      --node-label workload=worker \
+      --node-taint workload=worker:NoSchedule
+  EOT
+
   agent_monitoring_user_data = <<-EOT
     ${local.k3s_common} agent \
       --server https://${aws_lb.api.dns_name}:6443 \
@@ -604,7 +612,7 @@ resource "aws_lb_target_group_attachment" "api_servers" {
 resource "aws_instance" "k3s_agent_ondemand" {
   count = var.k3s_agent_ondemand_count
 
-  ami           = data.aws_ami.ubuntu.id
+  ami = data.aws_ami.ubuntu.id
   # Monitoring workers need more RAM; keep the rest smaller for cost.
   instance_type = count.index < var.k3s_monitoring_agent_count ? var.k3s_agent_monitoring_instance_type : var.k3s_agent_ondemand_instance_type
   # Only 3 private subnets (1 per AZ). Distribute agents evenly across them.
@@ -619,7 +627,11 @@ resource "aws_instance" "k3s_agent_ondemand" {
   }
 
   # Dedicate the first N on-demand agents to monitoring via label+taint at join time.
-  user_data = count.index < var.k3s_monitoring_agent_count ? local.agent_monitoring_user_data : local.agent_user_data
+  user_data = (
+    count.index < var.k3s_monitoring_agent_count ? local.agent_monitoring_user_data :
+    count.index < (var.k3s_monitoring_agent_count + var.k3s_worker_agent_count) ? local.agent_worker_user_data :
+    local.agent_user_data
+  )
 
   tags = {
     Name = "${local.name}-k3s-agent-od-${count.index + 1}"
@@ -627,81 +639,6 @@ resource "aws_instance" "k3s_agent_ondemand" {
   }
 
   depends_on = [aws_lb_listener.api_6443]
-}
-
-resource "aws_launch_template" "k3s_agent_spot" {
-  name_prefix            = "${local.name}-k3s-agent-spot-"
-  image_id               = data.aws_ami.ubuntu.id
-  # Mixed instances policy overrides this; keep a stable default.
-  instance_type          = var.k3s_agent_spot_instance_types[0]
-  key_name               = var.key_name
-  user_data              = base64encode(local.agent_user_data)
-  vpc_security_group_ids = [aws_security_group.nodes.id]
-
-  iam_instance_profile {
-    name = aws_iam_instance_profile.k3s_nodes.name
-  }
-
-  block_device_mappings {
-    device_name = "/dev/sda1"
-
-    ebs {
-      volume_size = var.root_volume_size_worker_gb
-      volume_type = "gp3"
-    }
-  }
-
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name = "${local.name}-k3s-agent-spot"
-      Role = "k3s-agent"
-    }
-  }
-
-  depends_on = [aws_lb_listener.api_6443]
-}
-
-resource "aws_autoscaling_group" "k3s_agent_spot" {
-  name                = "${local.name}-k3s-agent-spot"
-  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
-
-  min_size         = var.k3s_agent_spot_count
-  max_size         = var.k3s_agent_spot_count
-  desired_capacity = var.k3s_agent_spot_count
-
-  mixed_instances_policy {
-    instances_distribution {
-      on_demand_percentage_above_base_capacity = 0
-      spot_allocation_strategy                 = "capacity-optimized"
-    }
-
-    launch_template {
-      launch_template_specification {
-        launch_template_id = aws_launch_template.k3s_agent_spot.id
-        version            = "$Latest"
-      }
-
-      dynamic "override" {
-        for_each = var.k3s_agent_spot_instance_types
-        content {
-          instance_type = override.value
-        }
-      }
-    }
-  }
-
-  tag {
-    key                 = "Name"
-    value               = "${local.name}-k3s-agent-spot"
-    propagate_at_launch = true
-  }
-
-  tag {
-    key                 = "Role"
-    value               = "k3s-agent"
-    propagate_at_launch = true
-  }
 }
 
 # Attach workers to ingress target groups
@@ -717,16 +654,6 @@ resource "aws_lb_target_group_attachment" "ingress_workers_https_ondemand" {
   target_group_arn = aws_lb_target_group.ingress_https.arn
   target_id        = each.value
   port             = var.ingress_https_nodeport
-}
-
-resource "aws_autoscaling_attachment" "ingress_workers_http_spot" {
-  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
-  lb_target_group_arn    = aws_lb_target_group.ingress_http.arn
-}
-
-resource "aws_autoscaling_attachment" "ingress_workers_https_spot" {
-  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
-  lb_target_group_arn    = aws_lb_target_group.ingress_https.arn
 }
 
 # -------------------------

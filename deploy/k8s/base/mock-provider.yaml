@@ -33,7 +33,7 @@ spec:
             - name: MOCK_OUTCOMES
               value: "ok"
             - name: MOCK_SUCCESS_RATE
-              value: "0.99"
+              value: "0.98"
             - name: MOCK_FAILURE_TYPES
               value: "undelivered,failed,rate_limit,bad_request,server_error,timeout"
             - name: MOCK_FAILURE_WEIGHTS
