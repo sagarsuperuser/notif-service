@@ -1,0 +1,21 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: notif-webhook-processor-sqs
+spec:
+  scaleTargetRef:
+    name: notif-webhook-processor
+  pollingInterval: 5
+  cooldownPeriod: 90
+  minReplicaCount: 2
+  maxReplicaCount: 4
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: aws-sqs-auth
+      metadata:
+        queueURL: https://sqs.ap-south-1.amazonaws.com/000000000000/notif-webhook-events
+        queueLength: "200"
+        activationQueueLength: "10"
+        awsRegion: ap-south-1
+

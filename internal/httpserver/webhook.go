@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"notif/internal/observability"
+	sqsqueue "notif/internal/queue/sqs"
 	"notif/internal/store"
 	"notif/internal/util"
 )
@@ -20,11 +21,20 @@ type WebhookStore interface {
 	UpdateMessageByProviderMsgID(ctx context.Context, in store.ProviderMsgUpdate) (bool, error)
 }
 
+type WebhookEnqueuer interface {
+	Enqueue(ctx context.Context, ev sqsqueue.WebhookEvent) error
+}
+
 type Webhook struct {
 	Store           WebhookStore
+	Enqueuer        WebhookEnqueuer
 	VerifySignature func(authToken, fullURL, provided string, form url.Values) bool
 	AuthToken       string
 	PublicURL       string
+
+	// If true, this handler becomes "ingest-only": validate signature and enqueue the event to SQS.
+	// This keeps provider callbacks fast and protects the DB during webhook floods.
+	UseQueue bool
 }
 
 func (w *Webhook) Register(mux *mux.Router) {
@@ -47,10 +57,47 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 
 	observability.WebhookEvents.WithLabelValues(status).Inc()
 
+	newState := ""
+	switch status {
+	case "delivered":
+		newState = "delivered"
+	case "failed", "undelivered":
+		newState = "failed"
+	}
+
+	if w.UseQueue {
+		if w.Enqueuer == nil {
+			http.Error(rw, ErrDependency, http.StatusInternalServerError)
+			return
+		}
+
+		enqueueCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := w.Enqueuer.Enqueue(enqueueCtx, sqsqueue.WebhookEvent{
+			Provider:      "twilio",
+			ProviderMsgID: msgSid,
+			Status:        status,
+			ErrorCode:     errCode,
+			ReceivedAt:    util.NowUTC(),
+			// Payload intentionally omitted in queue mode (keeps messages small and reduces DB write load).
+		}); err != nil {
+			slog.Error("webhook enqueue failed", "err", err, "message_sid", msgSid, "status", status)
+			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
+			return
+		}
+		rw.WriteHeader(http.StatusOK)
+		return
+	}
+
 	// Don't couple DB writes to the client connection. Providers can time out and disconnect while
 	// we still want to persist and apply the event. Bound it with a timeout instead.
 	dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	if w.Store == nil {
+		http.Error(rw, ErrDependency, http.StatusInternalServerError)
+		return
+	}
 
 	if err := w.Store.InsertDeliveryEvent(dbCtx, store.DeliveryEvent{
 		Provider:      "twilio",
@@ -70,13 +117,8 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newState := ""
-	switch status {
-	case "delivered":
-		newState = "delivered"
-	case "failed", "undelivered":
-		newState = "failed"
-	default:
+	// Non-terminal status (queued/sent/etc): store event and return 200.
+	if newState == "" {
 		rw.WriteHeader(http.StatusOK)
 		return
 	}
@@ -106,7 +148,7 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 		sleep := time.Duration(25*(attempt+1)) * time.Millisecond
 		t := time.NewTimer(sleep)
 		select {
-		case <-r.Context().Done():
+		case <-dbCtx.Done():
 			t.Stop()
 			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
 			return

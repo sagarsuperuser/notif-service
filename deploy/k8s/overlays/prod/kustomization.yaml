@@ -5,6 +5,7 @@ resources:
   - ../../base
   - clusterissuer-letsencrypt-prod.yaml
   - keda-sqs-worker.yaml
+  - keda-sqs-webhook-processor.yaml
   - keda-triggerauth-aws.yaml
 
 
@@ -15,6 +16,10 @@ images:
 
   - name: notif-webhook
     newName: ghcr.io/sagarsuperuser/notif-service/notif-webhook
+    newTag: sha-a393b31
+
+  - name: notif-webhook-processor
+    newName: ghcr.io/sagarsuperuser/notif-service/notif-webhook-processor
     newTag: sha-a393b31
 
   - name: notif-worker
@@ -39,5 +44,15 @@ replacements:
       - select:
           kind: ScaledObject
           name: notif-worker-sqs
+        fieldPaths:
+          - spec.triggers.0.metadata.queueURL
+  - source:
+      kind: ConfigMap
+      name: notif-config
+      fieldPath: data.WEBHOOK_EVENTS_QUEUE_URL
+    targets:
+      - select:
+          kind: ScaledObject
+          name: notif-webhook-processor-sqs
         fieldPaths:
           - spec.triggers.0.metadata.queueURL

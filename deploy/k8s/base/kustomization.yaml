@@ -5,6 +5,7 @@ resources:
   - api.yaml
   - hpa.yaml
   - webhook.yaml
+  - webhook-processor.yaml
   - worker.yaml
   - mock-provider.yaml
   - notif-config.yaml

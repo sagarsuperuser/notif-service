@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: notif-webhook
+  name: notif-webhook-processor
 spec:
   replicas: 2
   revisionHistoryLimit: 5
@@ -12,16 +12,16 @@ spec:
       maxUnavailable: 0
   selector:
     matchLabels:
-      app: notif-webhook
+      app: notif-webhook-processor
   template:
     metadata:
       labels:
-        app: notif-webhook
+        app: notif-webhook-processor
     spec:
       terminationGracePeriodSeconds: 20
       containers:
-        - name: webhook
-          image: notif-webhook:dev
+        - name: webhook-processor
+          image: notif-webhook-processor:dev
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -39,11 +39,11 @@ spec:
             - name: DB_POOL_MAX_CONNS
               value: "20"
             - name: DB_POOL_MIN_CONNS
-              value: "2"
+              value: "5"
             - name: DB_POOL_MAX_CONN_LIFETIME
               value: "30m"
             - name: DB_POOL_MAX_CONN_IDLE_TIME
-              value: "10m"
+              value: "5m"
             - name: DB_POOL_HEALTH_CHECK_PERIOD
               value: "30s"
           resources:
@@ -55,7 +55,7 @@ spec:
               memory: "512Mi"
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /healthz
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 5
@@ -79,17 +79,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: notif-webhook-svc
+  name: notif-webhook-processor-svc
   labels:
-    app: notif-webhook
+    app: notif-webhook-processor
 spec:
   type: ClusterIP
   selector:
-    app: notif-webhook
+    app: notif-webhook-processor
   ports:
-    - name: http
-      port: 80
-      targetPort: 8080
     - name: metrics
       port: 9090
       targetPort: 9090

@@ -30,6 +30,8 @@ output "db_password" {
 
 output "sqs_main_url" { value = aws_sqs_queue.main.url }
 output "sqs_dlq_url" { value = aws_sqs_queue.dlq.url }
+output "sqs_webhook_events_url" { value = aws_sqs_queue.webhook_events.url }
+output "sqs_webhook_events_dlq_url" { value = aws_sqs_queue.webhook_events_dlq.url }
 
 output "k3s_token" {
   value     = random_password.k3s_token.result
