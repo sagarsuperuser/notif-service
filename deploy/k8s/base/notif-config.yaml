@@ -15,7 +15,7 @@ data:
   WORKER_CONCURRENCY: "20"
   SQS_WAIT_TIME: "20"
   SQS_MAX_MSGS: "10"
-  SQS_VISIBILITY_TIMEOUT: "180"
+  SQS_VISIBILITY_TIMEOUT: "60"
 
   # Webhook processor / SQS tuning (separate knobs so we can scale/experiment independently)
   WEBHOOK_PROCESSOR_CONCURRENCY: "20"

@@ -52,7 +52,7 @@ spec:
               memory: "256Mi"
             limits:
               cpu: "500m"
-              memory: "512Mi"
+              memory: "800Mi"
           readinessProbe:
             httpGet:
               path: /readyz

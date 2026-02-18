@@ -13,6 +13,21 @@ locals {
   public_subnet_cidrs  = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i)]
   private_subnet_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i + 10)]
   db_master_password   = coalesce(var.db_password, random_password.db_password.result)
+
+  # Pause mode keeps control-plane + monitoring capacity alive, and pauses the rest.
+  effective_k3s_server_count = var.k3s_server_count
+  effective_k3s_agents_on_demand = var.pause_environment ? {
+    monitoring    = var.k3s_agents_on_demand.monitoring
+    mock_provider = 0
+    worker        = 0
+    ingress       = 0
+    general       = 0
+  } : var.k3s_agents_on_demand
+  effective_k3s_agents_spot = var.pause_environment ? {
+    worker        = 0
+    mock_provider = 0
+    general       = 0
+  } : var.k3s_agents_spot
 }
 
 # -------------------------
@@ -117,8 +132,8 @@ resource "aws_security_group" "bastion" {
   dynamic "ingress" {
     for_each = var.bastion_ssh_cidr == null ? [] : [1]
     content {
-      from_port   = 22
-      to_port     = 22
+      from_port   = var.ssh_port
+      to_port     = var.ssh_port
       protocol    = "tcp"
       cidr_blocks = [var.bastion_ssh_cidr]
     }
@@ -154,8 +169,8 @@ resource "aws_security_group_rule" "nodes_ssh_from_bastion" {
   count                    = var.key_name == null ? 0 : 1
   type                     = "ingress"
   security_group_id        = aws_security_group.nodes.id
-  from_port                = 22
-  to_port                  = 22
+  from_port                = var.ssh_port
+  to_port                  = var.ssh_port
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.bastion.id
 }
@@ -164,8 +179,8 @@ resource "aws_security_group_rule" "nodes_ssh_from_bastion" {
 resource "aws_security_group_rule" "nodes_etcd" {
   type              = "ingress"
   security_group_id = aws_security_group.nodes.id
-  from_port         = 2379
-  to_port           = 2380
+  from_port         = var.k3s_etcd_port_start
+  to_port           = var.k3s_etcd_port_end
   protocol          = "tcp"
   self              = true
 }
@@ -173,8 +188,8 @@ resource "aws_security_group_rule" "nodes_etcd" {
 resource "aws_security_group_rule" "nodes_kubelet" {
   type              = "ingress"
   security_group_id = aws_security_group.nodes.id
-  from_port         = 10250
-  to_port           = 10250
+  from_port         = var.k3s_kubelet_port
+  to_port           = var.k3s_kubelet_port
   protocol          = "tcp"
   self              = true
 }
@@ -182,8 +197,8 @@ resource "aws_security_group_rule" "nodes_kubelet" {
 resource "aws_security_group_rule" "nodes_flannel" {
   type              = "ingress"
   security_group_id = aws_security_group.nodes.id
-  from_port         = 8472
-  to_port           = 8472
+  from_port         = var.k3s_flannel_vxlan_port
+  to_port           = var.k3s_flannel_vxlan_port
   protocol          = "udp"
   self              = true
 }
@@ -191,8 +206,8 @@ resource "aws_security_group_rule" "nodes_flannel" {
 resource "aws_security_group_rule" "nodes_nodeports" {
   type              = "ingress"
   security_group_id = aws_security_group.nodes.id
-  from_port         = 30000
-  to_port           = 32767
+  from_port         = var.k3s_nodeport_range_start
+  to_port           = var.k3s_nodeport_range_end
   protocol          = "tcp"
   self              = true
 }
@@ -204,8 +219,8 @@ resource "aws_security_group" "api_nlb" {
   vpc_id      = aws_vpc.this.id
 
   egress {
-    from_port       = 6443
-    to_port         = 6443
+    from_port       = var.k3s_api_port
+    to_port         = var.k3s_api_port
     protocol        = "tcp"
     security_groups = [aws_security_group.nodes.id]
   }
@@ -216,8 +231,8 @@ resource "aws_security_group" "api_nlb" {
 resource "aws_security_group_rule" "api_nlb_6443_from_bastion" {
   type                     = "ingress"
   security_group_id        = aws_security_group.api_nlb.id
-  from_port                = 6443
-  to_port                  = 6443
+  from_port                = var.k3s_api_port
+  to_port                  = var.k3s_api_port
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.bastion.id
 }
@@ -225,8 +240,8 @@ resource "aws_security_group_rule" "api_nlb_6443_from_bastion" {
 resource "aws_security_group_rule" "api_nlb_6443_from_nodes" {
   type                     = "ingress"
   security_group_id        = aws_security_group.api_nlb.id
-  from_port                = 6443
-  to_port                  = 6443
+  from_port                = var.k3s_api_port
+  to_port                  = var.k3s_api_port
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.nodes.id
 }
@@ -234,8 +249,8 @@ resource "aws_security_group_rule" "api_nlb_6443_from_nodes" {
 resource "aws_security_group_rule" "nodes_6443_from_api_nlb" {
   type                     = "ingress"
   security_group_id        = aws_security_group.nodes.id
-  from_port                = 6443
-  to_port                  = 6443
+  from_port                = var.k3s_api_port
+  to_port                  = var.k3s_api_port
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.api_nlb.id
 }
@@ -243,8 +258,8 @@ resource "aws_security_group_rule" "nodes_6443_from_api_nlb" {
 resource "aws_security_group_rule" "nodes_6443_from_nodes" {
   type                     = "ingress"
   security_group_id        = aws_security_group.nodes.id
-  from_port                = 6443
-  to_port                  = 6443
+  from_port                = var.k3s_api_port
+  to_port                  = var.k3s_api_port
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.nodes.id
 }
@@ -268,8 +283,8 @@ resource "aws_security_group" "ingress_nlb" {
 resource "aws_security_group_rule" "ingress_nlb_80_from_world" {
   type              = "ingress"
   security_group_id = aws_security_group.ingress_nlb.id
-  from_port         = 80
-  to_port           = 80
+  from_port         = var.ingress_public_http_port
+  to_port           = var.ingress_public_http_port
   protocol          = "tcp"
   cidr_blocks       = ["0.0.0.0/0"]
 }
@@ -277,8 +292,8 @@ resource "aws_security_group_rule" "ingress_nlb_80_from_world" {
 resource "aws_security_group_rule" "ingress_nlb_443_from_world" {
   type              = "ingress"
   security_group_id = aws_security_group.ingress_nlb.id
-  from_port         = 443
-  to_port           = 443
+  from_port         = var.ingress_public_https_port
+  to_port           = var.ingress_public_https_port
   protocol          = "tcp"
   cidr_blocks       = ["0.0.0.0/0"]
 }
@@ -286,8 +301,8 @@ resource "aws_security_group_rule" "ingress_nlb_443_from_world" {
 resource "aws_security_group_rule" "nodes_nodeports_from_ingress_nlb" {
   type                     = "ingress"
   security_group_id        = aws_security_group.nodes.id
-  from_port                = 30080
-  to_port                  = 30443
+  from_port                = var.ingress_http_nodeport
+  to_port                  = var.ingress_https_nodeport
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.ingress_nlb.id
 }
@@ -311,8 +326,8 @@ resource "aws_security_group" "rds" {
 resource "aws_security_group_rule" "rds_5432_from_nodes" {
   type                     = "ingress"
   security_group_id        = aws_security_group.rds.id
-  from_port                = 5432
-  to_port                  = 5432
+  from_port                = var.postgres_port
+  to_port                  = var.postgres_port
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.nodes.id
 }
@@ -334,7 +349,7 @@ data "aws_ami" "ubuntu" {
 # k3s token
 # -------------------------
 resource "random_password" "k3s_token" {
-  length  = 32
+  length  = var.k3s_token_length
   special = false
 }
 
@@ -358,20 +373,20 @@ resource "aws_lb" "api" {
 
 resource "aws_lb_target_group" "api_6443" {
   name        = "${local.name}-api-6443"
-  port        = 6443
+  port        = var.k3s_api_port
   protocol    = "TCP"
   vpc_id      = aws_vpc.this.id
   target_type = "instance"
 
   health_check {
     protocol = "TCP"
-    port     = "6443"
+    port     = tostring(var.k3s_api_port)
   }
 }
 
 resource "aws_lb_listener" "api_6443" {
   load_balancer_arn = aws_lb.api.arn
-  port              = 6443
+  port              = var.k3s_api_port
   protocol          = "TCP"
 
   default_action {
@@ -418,7 +433,7 @@ resource "aws_lb_target_group" "ingress_https" {
 
 resource "aws_lb_listener" "ingress_80" {
   load_balancer_arn = aws_lb.ingress.arn
-  port              = 80
+  port              = var.ingress_public_http_port
   protocol          = "TCP"
 
   default_action {
@@ -429,7 +444,7 @@ resource "aws_lb_listener" "ingress_80" {
 
 resource "aws_lb_listener" "ingress_443" {
   load_balancer_arn = aws_lb.ingress.arn
-  port              = 443
+  port              = var.ingress_public_https_port
   protocol          = "TCP"
 
   default_action {
@@ -505,16 +520,18 @@ resource "aws_iam_instance_profile" "k3s_nodes" {
 
 # Bastion (public)
 resource "aws_instance" "bastion" {
+  count = 1
+
   ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.bastion_instance_type
-  subnet_id                   = values(aws_subnet.public)[0].id
+  instance_type               = var.instance_types.bastion
+  subnet_id                   = values(aws_subnet.public)[count.index].id
   vpc_security_group_ids      = [aws_security_group.bastion.id]
   associate_public_ip_address = true
   key_name                    = var.key_name
 
   root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
+    volume_size = var.bastion_root_volume_size_gb
+    volume_type = var.root_volume_type
   }
 
   tags = {
@@ -543,7 +560,7 @@ locals {
 
   server_join_user_data = <<-EOT
     ${local.k3s_common} server \
-      --server https://${aws_lb.api.dns_name}:6443 \
+      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --tls-san ${aws_lb.api.dns_name} \
       --write-kubeconfig-mode 644 \
@@ -553,13 +570,13 @@ locals {
 
   agent_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:6443 \
+      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result}
   EOT
 
   agent_worker_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:6443 \
+      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --node-label workload=worker \
       --node-taint workload=worker:NoSchedule
@@ -567,19 +584,51 @@ locals {
 
   agent_mock_provider_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:6443 \
+      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --node-label workload=mock-provider \
       --node-taint workload=mock-provider:NoSchedule
   EOT
 
+  agent_ingress_user_data = <<-EOT
+    ${local.k3s_common} agent \
+      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
+      --token ${random_password.k3s_token.result} \
+      --node-label workload=ingress \
+      --node-taint workload=ingress:NoSchedule
+  EOT
+
   agent_monitoring_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:6443 \
+      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --node-label workload=monitoring \
       --node-taint workload=monitoring:NoSchedule
   EOT
+
+  # On-demand agent role layout (by index):
+  #   [0..monitoring)                  => monitoring
+  #   [monitoring..mock_end)           => mock-provider
+  #   [mock_end..worker_end)           => worker
+  #   [worker_end..ingress_end)        => ingress
+  #   [ingress_end..total)             => general (no special taints/labels)
+  od_monitoring_count = local.effective_k3s_agents_on_demand.monitoring
+  od_mock_count       = local.effective_k3s_agents_on_demand.mock_provider
+  od_worker_count     = local.effective_k3s_agents_on_demand.worker
+  od_ingress_count    = local.effective_k3s_agents_on_demand.ingress
+  od_total = (
+    local.effective_k3s_agents_on_demand.monitoring +
+    local.effective_k3s_agents_on_demand.mock_provider +
+    local.effective_k3s_agents_on_demand.worker +
+    local.effective_k3s_agents_on_demand.ingress +
+    local.effective_k3s_agents_on_demand.general
+  )
+
+  od_mock_end    = local.od_monitoring_count + local.od_mock_count
+  od_worker_end  = local.od_mock_end + local.od_worker_count
+  od_ingress_end = local.od_worker_end + local.od_ingress_count
+
+  od_ingress_start = local.od_worker_end
 }
 
 # Spot workers (ASG)
@@ -588,7 +637,7 @@ resource "aws_launch_template" "k3s_agent_spot" {
   image_id    = data.aws_ami.ubuntu.id
 
   # Mixed instances policy overrides this; keep a stable default.
-  instance_type = var.k3s_agent_spot_instance_types[0]
+  instance_type = var.spot_instance_types.worker[0]
   key_name      = var.key_name
 
   # Join as a worker-dedicated node (label+taint) so it matches worker scheduling.
@@ -603,7 +652,7 @@ resource "aws_launch_template" "k3s_agent_spot" {
     device_name = "/dev/sda1"
     ebs {
       volume_size = var.root_volume_size_worker_gb
-      volume_type = "gp3"
+      volume_type = var.root_volume_type
     }
   }
 
@@ -622,9 +671,9 @@ resource "aws_autoscaling_group" "k3s_agent_spot" {
   name                = "${local.name}-k3s-agent-spot"
   vpc_zone_identifier = [for s in aws_subnet.private : s.id]
 
-  min_size         = var.k3s_worker_spot_count
-  max_size         = var.k3s_worker_spot_count
-  desired_capacity = var.k3s_worker_spot_count
+  min_size         = local.effective_k3s_agents_spot.worker
+  max_size         = local.effective_k3s_agents_spot.worker
+  desired_capacity = local.effective_k3s_agents_spot.worker
 
   # Use mixed instances so AWS can pick from instance types and AZs for capacity.
   mixed_instances_policy {
@@ -640,7 +689,7 @@ resource "aws_autoscaling_group" "k3s_agent_spot" {
       }
 
       dynamic "override" {
-        for_each = var.k3s_agent_spot_instance_types
+        for_each = var.spot_instance_types.worker
         content {
           instance_type = override.value
         }
@@ -666,7 +715,7 @@ resource "aws_launch_template" "k3s_agent_spot_mock_provider" {
   name_prefix = "${local.name}-k3s-agent-spot-mock-provider-"
   image_id    = data.aws_ami.ubuntu.id
 
-  instance_type = var.k3s_mock_provider_spot_instance_types[0]
+  instance_type = var.spot_instance_types.mock_provider[0]
   key_name      = var.key_name
 
   user_data              = base64encode(local.agent_mock_provider_user_data)
@@ -680,7 +729,7 @@ resource "aws_launch_template" "k3s_agent_spot_mock_provider" {
     device_name = "/dev/sda1"
     ebs {
       volume_size = var.root_volume_size_worker_gb
-      volume_type = "gp3"
+      volume_type = var.root_volume_type
     }
   }
 
@@ -699,9 +748,9 @@ resource "aws_autoscaling_group" "k3s_agent_spot_mock_provider" {
   name                = "${local.name}-k3s-agent-spot-mock-provider"
   vpc_zone_identifier = [for s in aws_subnet.private : s.id]
 
-  min_size         = var.k3s_mock_provider_spot_count
-  max_size         = var.k3s_mock_provider_spot_count
-  desired_capacity = var.k3s_mock_provider_spot_count
+  min_size         = local.effective_k3s_agents_spot.mock_provider
+  max_size         = local.effective_k3s_agents_spot.mock_provider
+  desired_capacity = local.effective_k3s_agents_spot.mock_provider
 
   mixed_instances_policy {
     instances_distribution {
@@ -716,7 +765,7 @@ resource "aws_autoscaling_group" "k3s_agent_spot_mock_provider" {
       }
 
       dynamic "override" {
-        for_each = var.k3s_mock_provider_spot_instance_types
+        for_each = var.spot_instance_types.mock_provider
         content {
           instance_type = override.value
         }
@@ -742,7 +791,7 @@ resource "aws_launch_template" "k3s_agent_spot_general" {
   name_prefix = "${local.name}-k3s-agent-spot-general-"
   image_id    = data.aws_ami.ubuntu.id
 
-  instance_type = var.k3s_general_spot_instance_types[0]
+  instance_type = var.spot_instance_types.general[0]
   key_name      = var.key_name
 
   user_data              = base64encode(local.agent_user_data)
@@ -756,7 +805,7 @@ resource "aws_launch_template" "k3s_agent_spot_general" {
     device_name = "/dev/sda1"
     ebs {
       volume_size = var.root_volume_size_worker_gb
-      volume_type = "gp3"
+      volume_type = var.root_volume_type
     }
   }
 
@@ -775,9 +824,9 @@ resource "aws_autoscaling_group" "k3s_agent_spot_general" {
   name                = "${local.name}-k3s-agent-spot-general"
   vpc_zone_identifier = [for s in aws_subnet.private : s.id]
 
-  min_size         = var.k3s_general_spot_count
-  max_size         = var.k3s_general_spot_count
-  desired_capacity = var.k3s_general_spot_count
+  min_size         = local.effective_k3s_agents_spot.general
+  max_size         = local.effective_k3s_agents_spot.general
+  desired_capacity = local.effective_k3s_agents_spot.general
 
   mixed_instances_policy {
     instances_distribution {
@@ -792,7 +841,7 @@ resource "aws_autoscaling_group" "k3s_agent_spot_general" {
       }
 
       dynamic "override" {
-        for_each = var.k3s_general_spot_instance_types
+        for_each = var.spot_instance_types.general
         content {
           instance_type = override.value
         }
@@ -815,10 +864,10 @@ resource "aws_autoscaling_group" "k3s_agent_spot_general" {
 
 # 3 servers (one per AZ)
 resource "aws_instance" "k3s_server" {
-  count = 3
+  count = local.effective_k3s_server_count
 
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.k3s_server_instance_type
+  instance_type          = var.instance_types.k3s_server
   subnet_id              = values(aws_subnet.private)[count.index].id
   vpc_security_group_ids = [aws_security_group.nodes.id]
   key_name               = var.key_name
@@ -826,7 +875,7 @@ resource "aws_instance" "k3s_server" {
 
   root_block_device {
     volume_size = var.root_volume_size_server_gb
-    volume_type = "gp3"
+    volume_type = var.root_volume_type
   }
 
   user_data = count.index == 0 ? local.server1_user_data : local.server_join_user_data
@@ -841,19 +890,19 @@ resource "aws_instance" "k3s_server" {
 
 # Attach servers to API TG
 resource "aws_lb_target_group_attachment" "api_servers" {
-  count            = 3
+  count            = local.effective_k3s_server_count
   target_group_arn = aws_lb_target_group.api_6443.arn
   target_id        = aws_instance.k3s_server[count.index].id
-  port             = 6443
+  port             = var.k3s_api_port
 }
 
 # Workers (spread across AZs)
 resource "aws_instance" "k3s_agent_ondemand" {
-  count = var.k3s_agent_ondemand_count
+  count = local.od_total
 
   ami = data.aws_ami.ubuntu.id
   # Monitoring workers need more RAM; keep the rest smaller for cost.
-  instance_type = count.index < var.k3s_monitoring_agent_count ? var.k3s_agent_monitoring_instance_type : var.k3s_agent_ondemand_instance_type
+  instance_type = count.index < local.od_monitoring_count ? var.instance_types.k3s_agent_monitoring : var.instance_types.k3s_agent_default
   # Only 3 private subnets (1 per AZ). Distribute agents evenly across them.
   subnet_id              = values(aws_subnet.private)[count.index % length(values(aws_subnet.private))].id
   vpc_security_group_ids = [aws_security_group.nodes.id]
@@ -861,15 +910,16 @@ resource "aws_instance" "k3s_agent_ondemand" {
   iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
 
   root_block_device {
-    volume_size = count.index < var.k3s_monitoring_agent_count ? var.root_volume_size_monitoring_worker_gb : var.root_volume_size_worker_gb
-    volume_type = "gp3"
+    volume_size = count.index < local.od_monitoring_count ? var.root_volume_size_monitoring_worker_gb : var.root_volume_size_worker_gb
+    volume_type = var.root_volume_type
   }
 
   # Dedicate the first N on-demand agents to special workloads via label+taint at join time.
   user_data = (
-    count.index < var.k3s_monitoring_agent_count ? local.agent_monitoring_user_data :
-    count.index < (var.k3s_monitoring_agent_count + var.k3s_mock_provider_agent_count) ? local.agent_mock_provider_user_data :
-    count.index < (var.k3s_monitoring_agent_count + var.k3s_mock_provider_agent_count + var.k3s_worker_agent_count) ? local.agent_worker_user_data :
+    count.index < local.od_monitoring_count ? local.agent_monitoring_user_data :
+    count.index < local.od_mock_end ? local.agent_mock_provider_user_data :
+    count.index < local.od_worker_end ? local.agent_worker_user_data :
+    count.index < local.od_ingress_end ? local.agent_ingress_user_data :
     local.agent_user_data
   )
 
@@ -883,44 +933,30 @@ resource "aws_instance" "k3s_agent_ondemand" {
 
 # Attach workers to ingress target groups
 resource "aws_lb_target_group_attachment" "ingress_workers_http_ondemand" {
-  for_each         = { for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id }
+  for_each = {
+    for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id
+    if idx >= local.od_ingress_start && idx < local.od_ingress_end
+  }
   target_group_arn = aws_lb_target_group.ingress_http.arn
   target_id        = each.value
   port             = var.ingress_http_nodeport
 }
 
 resource "aws_lb_target_group_attachment" "ingress_workers_https_ondemand" {
-  for_each         = { for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id }
+  for_each = {
+    for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id
+    if idx >= local.od_ingress_start && idx < local.od_ingress_end
+  }
   target_group_arn = aws_lb_target_group.ingress_https.arn
   target_id        = each.value
   port             = var.ingress_https_nodeport
-}
-
-resource "aws_autoscaling_attachment" "ingress_workers_http_spot" {
-  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
-  lb_target_group_arn    = aws_lb_target_group.ingress_http.arn
-}
-
-resource "aws_autoscaling_attachment" "ingress_workers_https_spot" {
-  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot.name
-  lb_target_group_arn    = aws_lb_target_group.ingress_https.arn
-}
-
-resource "aws_autoscaling_attachment" "ingress_workers_http_spot_general" {
-  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot_general.name
-  lb_target_group_arn    = aws_lb_target_group.ingress_http.arn
-}
-
-resource "aws_autoscaling_attachment" "ingress_workers_https_spot_general" {
-  autoscaling_group_name = aws_autoscaling_group.k3s_agent_spot_general.name
-  lb_target_group_arn    = aws_lb_target_group.ingress_https.arn
 }
 
 # -------------------------
 # RDS Postgres
 # -------------------------
 resource "random_password" "db_password" {
-  length  = 24
+  length  = var.db_password_length
   special = false
 }
 
@@ -932,10 +968,10 @@ resource "aws_db_subnet_group" "db" {
 resource "aws_db_instance" "postgres" {
   identifier        = "${local.name}-postgres"
   engine            = "postgres"
-  engine_version    = "17.6"
+  engine_version    = var.db_engine_version
   instance_class    = var.db_instance_class
-  allocated_storage = 50
-  storage_type      = "gp3"
+  allocated_storage = var.db_allocated_storage_gb
+  storage_type      = var.db_storage_type
   apply_immediately = true
 
   db_name  = var.db_name
@@ -969,7 +1005,7 @@ resource "aws_secretsmanager_secret_version" "db_credentials" {
     password = local.db_master_password
     engine   = "postgres"
     host     = aws_db_instance.postgres.address
-    port     = 5432
+    port     = var.postgres_port
     dbname   = var.db_name
   })
 }
@@ -1016,8 +1052,8 @@ resource "aws_security_group" "rds_proxy" {
   vpc_id      = aws_vpc.this.id
 
   ingress {
-    from_port       = 5432
-    to_port         = 5432
+    from_port       = var.postgres_port
+    to_port         = var.postgres_port
     protocol        = "tcp"
     security_groups = [aws_security_group.nodes.id]
   }
@@ -1035,8 +1071,8 @@ resource "aws_security_group" "rds_proxy" {
 resource "aws_security_group_rule" "rds_5432_from_proxy" {
   type                     = "ingress"
   security_group_id        = aws_security_group.rds.id
-  from_port                = 5432
-  to_port                  = 5432
+  from_port                = var.postgres_port
+  to_port                  = var.postgres_port
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.rds_proxy.id
 }
@@ -1050,7 +1086,7 @@ resource "aws_db_proxy" "postgres" {
   vpc_security_group_ids = [aws_security_group.rds_proxy.id]
 
   require_tls         = true
-  idle_client_timeout = 1800
+  idle_client_timeout = var.rds_proxy_idle_client_timeout_seconds
 
   auth {
     auth_scheme = "SECRETS"
@@ -1068,9 +1104,9 @@ resource "aws_db_proxy_default_target_group" "postgres" {
   db_proxy_name = aws_db_proxy.postgres.name
 
   connection_pool_config {
-    max_connections_percent      = 90
-    max_idle_connections_percent = 50
-    connection_borrow_timeout    = 120
+    max_connections_percent      = var.rds_proxy_max_connections_percent
+    max_idle_connections_percent = var.rds_proxy_max_idle_connections_percent
+    connection_borrow_timeout    = var.rds_proxy_connection_borrow_timeout_seconds
   }
 }
 
@@ -1094,11 +1130,11 @@ resource "aws_sqs_queue" "main" {
   name                        = "${local.name}-send.fifo"
   fifo_queue                  = true
   content_based_deduplication = true
-  visibility_timeout_seconds  = 60
+  visibility_timeout_seconds  = var.sqs_send_visibility_timeout_seconds
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn
-    maxReceiveCount     = 5
+    maxReceiveCount     = var.sqs_send_max_receive_count
   })
 }
 
@@ -1111,10 +1147,10 @@ resource "aws_sqs_queue" "webhook_events_dlq" {
 
 resource "aws_sqs_queue" "webhook_events" {
   name                       = "${local.name}-webhook-events"
-  visibility_timeout_seconds = 60
+  visibility_timeout_seconds = var.sqs_webhook_events_visibility_timeout_seconds
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.webhook_events_dlq.arn
-    maxReceiveCount     = 10
+    maxReceiveCount     = var.sqs_webhook_events_max_receive_count
   })
 }
