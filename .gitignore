@@ -3,6 +3,7 @@
 .terraform/
 *.tfstate
 *.terraform.lock
+*.terraform.lock.hcl
 *.tfstate.backup
 # Terraform plan/output artifacts
 infra/tfplan*
