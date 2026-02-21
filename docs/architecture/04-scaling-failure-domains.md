@@ -40,7 +40,7 @@ flowchart LR
   overload_worker["If send rate > worker throughput, queue lag rises"]:::risk
   overload_db["If DB CPU/connections saturate, timeout/error rates rise"]:::risk
   spot_loss["If spot nodes are evicted, replicas drop and latency spikes"]:::risk
-  controls["Controls: KEDA bounds, taints/affinity, proxy tuning, DLQ, idempotency"]:::ctrl
+  controls["Controls: KEDA bounds, worker/webhook concurrency caps, retries with exponential backoff, circuit breakers, proxy tuning, DLQ, idempotency"]:::ctrl
 
   qsend -.-> overload_worker
   proxy -.-> overload_db
@@ -52,3 +52,4 @@ flowchart LR
 
 Backpressure operating rule:
 - Tune `notif-worker` and `webhook-processor` concurrency and autoscaling bounds based on queue lag and DB headroom, so backlog is absorbed in SQS while `Postgres/RDS Proxy` and downstream dependencies stay within safe CPU, connection, and timeout limits.
+- Keep retries bounded with exponential backoff and use circuit breakers to fail fast during sustained downstream failures, preventing retry storms from exhausting DB and compute resources.

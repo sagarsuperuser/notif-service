@@ -1,34 +1,64 @@
 # 03) Message Lifecycle Sequence
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Inter, Segoe UI, Arial, sans-serif",
+    "fontSize": "18px",
+    "primaryTextColor": "#0b1220",
+    "lineColor": "#1f2937",
+    "actorTextColor": "#0b1220",
+    "actorBorder": "#0b3b8c",
+    "actorBkg": "#e6f0ff",
+    "signalColor": "#1f2937",
+    "signalTextColor": "#0b1220",
+    "labelBoxBkgColor": "#e6f0ff",
+    "labelBoxBorderColor": "#0b3b8c",
+    "noteBkgColor": "#fff4cc",
+    "noteBorderColor": "#8a6d00",
+    "noteTextColor": "#1f1f1f"
+  }
+}}%%
 sequenceDiagram
     autonumber
-    participant C as Client k6
+    participant C as Client
     participant API as notif-api
-    participant DB as Postgres via RDS Proxy
-    participant Q1 as SQS send queue
+    participant DB as Postgres (via RDS Proxy)
+    participant QSend as SQS send
     participant W as notif-worker
     participant P as Provider
     participant WH as notif-webhook ingest
-    participant Q2 as SQS webhook-events
+    participant QWebhook as SQS webhook-events
     participant WHP as webhook-processor
 
-    C->>API: POST messages
-    API->>DB: insert queued message
-    API->>Q1: enqueue send task
-    API-->>C: 2xx accepted
+    rect rgb(214, 230, 255)
+    Note over C,API: API accept path
+    C->>API: POST /messages
+    API->>DB: Insert message (state=queued)
+    API->>QSend: Enqueue send job
+    API-->>C: 202 Accepted + message_id
+    end
 
-    Q1-->>W: receive task
-    W->>P: send SMS request
-    P-->>W: 201 with message SID or error
-    W->>DB: update message state
+    rect rgb(216, 245, 226)
+    Note over QSend,P: Send processing path
+    QSend-->>W: Receive job
+    Note right of W: Per-worker rate limit before provider call
+    W->>P: Send SMS
+    P-->>W: Provider response (SID/error)
+    W->>DB: Update provider details + state
+    Note right of W: Bounded retries + backoff<br/>+ circuit breaker
+    end
 
-    P->>WH: webhook event
-    WH->>Q2: enqueue webhook event
-    WH-->>P: 200
-    Q2-->>WHP: consume event
-    WHP->>DB: update terminal state and insert event
+    rect rgb(255, 228, 214)
+    Note over P,WHP: Webhook processing path
+    P->>WH: Delivery webhook
+    Note over P,WH: Retries only on non-2xx
+    WH->>QWebhook: Enqueue webhook event
+    WH-->>P: 200 OK
+    QWebhook-->>WHP: Receive webhook event
+    WHP->>DB: Apply terminal state and store event
+    end
 
-    Note over P,WH: Provider retries webhook on non 2xx
-    Note over Q1,Q2: SQS delivery is at least once
+    Note over QSend,QWebhook: SQS delivery is at-least-once
 ```
