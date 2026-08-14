@@ -161,14 +161,23 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 
 	assertMessageStateDB(t, db, "msg-3", string(domain.StateQueued))
 
-	if err := dbStore.SetProviderDetails(ctx, store.ProviderDetailsUpdate{
-		ID:            "msg-3",
-		Provider:      "twilio",
-		ProviderMsgID: "SM123",
-		State:         "submitted",
-		Now:           util.NowUTC(),
+	// Advance the message the way the worker does, so this walk covers the real
+	// submit path rather than a shortcut that writes the same row.
+	if err := dbStore.RecordAttempt(ctx, store.AttemptRecord{
+		Attempt: store.ProviderAttempt{
+			MessageID:     "msg-3",
+			Provider:      "twilio",
+			ProviderMsgID: "SM123",
+			HTTPStatus:    201,
+		},
+		Transition: &store.MessageTransition{
+			State:         "submitted",
+			Provider:      "twilio",
+			ProviderMsgID: "SM123",
+			Now:           util.NowUTC(),
+		},
 	}); err != nil {
-		t.Fatalf("set provider details: %v", err)
+		t.Fatalf("record attempt: %v", err)
 	}
 	assertMessageStateDB(t, db, "msg-3", string(domain.StateSubmitted))
 

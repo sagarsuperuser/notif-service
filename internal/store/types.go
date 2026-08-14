@@ -23,14 +23,6 @@ type MessageStateUpdate struct {
 	Now       time.Time
 }
 
-type ProviderDetailsUpdate struct {
-	ID            string
-	Provider      string
-	ProviderMsgID string
-	State         string
-	Now           time.Time
-}
-
 type MessageForWorker struct {
 	TenantID      string
 	To            string
@@ -40,6 +32,35 @@ type MessageForWorker struct {
 	ProviderMsgID string
 	Vars          map[string]string
 	CreatedAt     time.Time
+}
+
+// ClaimedMessage is the result of claiming a message and loading it in one
+// round-trip. Claimed reports whether this caller won the claim; when it is
+// false the message is still returned, so a caller can log or count why it was
+// skipped without a second query.
+type ClaimedMessage struct {
+	MessageForWorker
+	Claimed bool
+}
+
+// MessageTransition is a state change applied to the message row in the same
+// statement as the attempt that caused it. Provider and ProviderMsgID are only
+// written when non-empty, so a failed attempt cannot erase the provider id a
+// previous successful submit recorded.
+type MessageTransition struct {
+	State         string
+	Provider      string
+	ProviderMsgID string
+	LastError     string
+	Now           time.Time
+}
+
+// AttemptRecord is one provider attempt plus, optionally, the message-state
+// change it implies — written together so the pair costs one round-trip and
+// cannot half-apply.
+type AttemptRecord struct {
+	Attempt    ProviderAttempt
+	Transition *MessageTransition
 }
 
 type ProviderAttempt struct {
