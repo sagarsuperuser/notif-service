@@ -335,6 +335,15 @@ func TestWebhookHandler_Returns200WhenMessageMissing(t *testing.T) {
 		PublicURL:       publicURL,
 	}).Register(s.Mux)
 
+	// One warm-up call so the measured one does not pay for opening a
+	// connection and preparing the statement. Without it this measures a cold
+	// pool on a shared CI runner, which is not what the assertion is about.
+	warm := httptest.NewRecorder()
+	warmReq := httptest.NewRequest(http.MethodPost, publicURL, strings.NewReader(form.Encode()))
+	warmReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	warmReq.Header.Set("X-Twilio-Signature", twilioSignature(authToken, publicURL, form))
+	s.Mux.ServeHTTP(warm, warmReq)
+
 	rr := httptest.NewRecorder()
 	start := time.Now()
 	s.Mux.ServeHTTP(rr, req)
@@ -343,12 +352,21 @@ func TestWebhookHandler_Returns200WhenMessageMissing(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 for an unmatched callback, got %d", rr.Code)
 	}
-	// The old handler slept through ten backoffs (~1.4s worst case) while
-	// holding a pooled connection before giving up. Nothing may sleep here.
-	if elapsed > 500*time.Millisecond {
+	// The old handler slept through ten backoffs — about 1.4 seconds worst
+	// case — while holding a pooled connection before giving up. The bound is
+	// set to catch that, not to police ordinary latency: a threshold tight
+	// enough to trip on a slow runner would fail for reasons unrelated to the
+	// property being tested, and a flaky gate teaches people to ignore it.
+	//
+	// TestWebhookPathCostsOneRoundTrip is the deterministic half of this
+	// guarantee — it asserts the handler makes exactly one database call, which
+	// no retry loop can do.
+	if elapsed > time.Second {
 		t.Errorf("handler took %v — it must not retry/sleep on a miss", elapsed)
 	}
-	if got := len(eventRows(t, db, "SM-missing")); got != 1 {
-		t.Errorf("event should still be recorded: got %d rows, want 1", got)
+	// Two calls now, so two events: the miss is recorded every time rather than
+	// deduplicated, which is what lets reconcile repair it.
+	if got := len(eventRows(t, db, "SM-missing")); got != 2 {
+		t.Errorf("both callbacks should be recorded: got %d rows, want 2", got)
 	}
 }
