@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build · vet · unit · integration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: notif
+          POSTGRES_PASSWORD: notif
+          POSTGRES_DB: notif
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U notif"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # The integration suite builds an isolated schema per test against this DSN
+      # and applies deploy/k8s/jobs/sql/001_init.sql itself, so no migration step
+      # is needed here.
+      TEST_DB_DSN: postgres://notif:notif@localhost:5432/notif?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build all commands
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./... -race
+
+      - name: Integration tests (real Postgres)
+        run: |
+          set -o pipefail
+          go test -tags=integration ./tests/integration -race -v 2>&1 | tee integration.log
+
+      # setupTestDB calls t.Skip() when TEST_DB_DSN is unset, and `go test`
+      # reports a skipped test as a pass. So a CI run with a broken DSN would be
+      # GREEN while verifying nothing — the failure mode this whole gate exists
+      # to prevent. Assert the suite actually executed.
+      - name: Assert the integration suite really ran
+        run: |
+          if grep -q '^--- SKIP' integration.log; then
+            echo "::error::integration tests SKIPPED — TEST_DB_DSN is not reaching the suite"
+            grep '^--- SKIP' integration.log
+            exit 1
+          fi
+          ran=$(grep -c '^--- PASS' integration.log || true)
+          echo "integration tests executed: $ran"
+          if [ "$ran" -lt 4 ]; then
+            echo "::error::expected at least 4 integration tests to run, saw $ran"
+            exit 1
+          fi
