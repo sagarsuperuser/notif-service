@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/url"
+	"notif/internal/httpx"
 	"os"
 	"sort"
 	"strconv"
@@ -118,6 +120,7 @@ type server struct {
 	// The two limits Twilio actually enforces. See sender.go.
 	gate    *concurrencyGate
 	senders *senderPool
+	sids    *sidGen
 }
 
 func main() {
@@ -125,15 +128,21 @@ func main() {
 	loggingInit()
 
 	s := &server{
-		cfg:     cfg,
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
-		client:  &http.Client{Timeout: 5 * time.Second},
+		cfg: cfg,
+		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+		// Callbacks run at roughly three times the send rate; the default pool
+		// of two turned 0.19% of them into transport errors and spurious retries.
+		client:  httpx.Client(5*time.Second, 256),
 		gate:    newConcurrencyGate(cfg.MaxConcurrent),
+		sids:    newSIDGen(),
 		senders: newSenderPool(cfg.SenderMPS, cfg.SenderPoolSize, cfg.QueueMaxSeconds, cfg.AccountMPS),
 	}
 
 	router := mux.NewRouter()
 	router.HandleFunc("/2010-04-01/Accounts/{AccountSid}/Messages.json", s.handleSend).Methods(http.MethodPost)
+	// Without this the callback counters exist but cannot be read, which is how
+	// a 0.19% retry rate went unexplained through several runs.
+	router.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet)
 
 	slog.Info("mock provider listening", "port", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, loggingMiddleware(router)); err != nil {
@@ -321,7 +330,7 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sid := fmtSID(atomic.AddUint64(&s.idx, 1) - 1)
+	sid := s.sids.next()
 	resp := sendResponse{Sid: sid, Status: "queued"}
 	s.maybeDelayResponse(r.Context(), start)
 	writeJSON(w, http.StatusCreated, resp)
@@ -402,6 +411,13 @@ func (s *server) postWebhookWithRetry(ctx context.Context, callbackURL, sig stri
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Every attempt is counted, not just the failures that exhaust the
+		// budget. Intermediate retries were previously invisible: the totals
+		// showed 0.19% more callbacks than messages and nothing said why.
+		mockWebhookAttempts.Inc()
+		if attempt > 0 {
+			mockWebhookRetries.Inc()
+		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("X-Twilio-Signature", sig)
@@ -415,6 +431,15 @@ func (s *server) postWebhookWithRetry(ctx context.Context, callbackURL, sig stri
 		if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			_ = resp.Body.Close()
 			return nil
+		}
+
+		// Distinguish "the far end said no" from "we never got an answer". Only
+		// the second is a transport problem, and it is the one that was
+		// mistaken for the first.
+		if err != nil {
+			mockWebhookTransportErrors.Inc()
+		} else if resp != nil {
+			mockWebhookHTTPErrors.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		}
 
 		status := 0
@@ -657,10 +682,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 
-}
-
-func fmtSID(i uint64) string {
-	return "SM" + fmt.Sprintf("%06d", i)
 }
 
 func parseCSV(s string) []string {

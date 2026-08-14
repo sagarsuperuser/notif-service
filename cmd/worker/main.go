@@ -17,6 +17,7 @@ import (
 	"notif/internal/awsutil"
 	"notif/internal/config"
 	"notif/internal/httpserver"
+	"notif/internal/httpx"
 	"notif/internal/logging"
 	"notif/internal/observability"
 	"notif/internal/providers/twilio"
@@ -120,9 +121,12 @@ func main() {
 
 	// Twilio + limiter/breaker + processor
 	sender := &twilio.Client{
-		AccountSID:          cfg.TwilioAccountSID,
-		AuthToken:           cfg.TwilioAuthToken,
-		HTTP:                &http.Client{Timeout: 8 * time.Second},
+		AccountSID: cfg.TwilioAccountSID,
+		AuthToken:  cfg.TwilioAuthToken,
+		// Sized to worker concurrency: every handler may hold a connection to
+		// the provider at once, and the default pool of two would make the rest
+		// pay a TCP and TLS handshake per send.
+		HTTP:                httpx.Client(8*time.Second, cfg.WorkerConcurrency+20),
 		MessagingServiceSID: cfg.TwilioMessagingServiceSID,
 		FromNumber:          cfg.TwilioFromNumber,
 		BaseURL:             cfg.TwilioBaseURL,

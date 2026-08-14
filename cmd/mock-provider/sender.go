@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"math"
-	"math/rand"
+	mrand "math/rand"
 	"net/http"
 	"strconv"
 	"sync"
@@ -277,7 +280,7 @@ func (p *senderPool) snapshot() map[string]int {
 //
 // A stand-in that always answers in exactly the median makes a fixed
 // concurrency look sufficient when in production the tail is what saturates it.
-func apiLatency(rng *rand.Rand, medianMs int, tailSigma float64) time.Duration {
+func apiLatency(rng *mrand.Rand, medianMs int, tailSigma float64) time.Duration {
 	if medianMs <= 0 {
 		return 0
 	}
@@ -300,4 +303,43 @@ func apiLatency(rng *rand.Rand, medianMs int, tailSigma float64) time.Duration {
 // client can see how close it is to the limit before it starts being rejected.
 func writeConcurrencyHeader(w http.ResponseWriter, count int64) {
 	w.Header().Set("Twilio-Concurrent-Requests", strconv.FormatInt(count, 10))
+}
+
+// sidGen produces message ids in Twilio's shape: "SM" followed by 32 hex
+// characters.
+//
+// The previous generator was "SM" plus a six-digit counter starting at zero,
+// which failed in two ways that both corrupt a benchmark.
+//
+// It reset on every restart, so ids collided across runs. During one campaign
+// every single id had been used by an earlier run — a delivery callback for the
+// new SM000042 could match an older message carrying the same id. That run
+// survived only because RecordDeliveryEvent refuses to touch a message already
+// in a terminal state, so the colliding older rows were skipped. Correctness
+// should not depend on a guard that exists for an unrelated reason.
+//
+// It also wrapped after a million ids, so a single campaign of that size would
+// have collided with itself.
+//
+// A random per-process prefix plus a monotonic counter fixes both: unique
+// across restarts without a syscall per message, and 2^64 ids before the
+// counter half can repeat.
+type sidGen struct {
+	prefix  string // 16 hex chars, drawn once per process
+	counter atomic.Uint64
+}
+
+func newSIDGen() *sidGen {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// Only reachable if the OS entropy source fails. Ids must stay unique,
+		// so this is fatal rather than silently falling back to something
+		// predictable.
+		panic("mock-provider: cannot read entropy for message ids: " + err.Error())
+	}
+	return &sidGen{prefix: hex.EncodeToString(b)}
+}
+
+func (g *sidGen) next() string {
+	return fmt.Sprintf("SM%s%016x", g.prefix, g.counter.Add(1))
 }
