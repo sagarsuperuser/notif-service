@@ -39,7 +39,7 @@ spec:
             - name: API_URL
               value: "http://notif-api-svc/v1/sms/messages"
             - name: STAGE_SECONDS
-              value: "180"
+              value: "90"
           volumeMounts:
             - name: scripts
               mountPath: /scripts
