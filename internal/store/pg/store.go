@@ -3,8 +3,10 @@ package pg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"notif/internal/store"
@@ -20,38 +22,6 @@ func (s *Store) MarkMessageState(ctx context.Context, in store.MessageStateUpdat
 	_, err := s.DB.Exec(ctx, `
 		UPDATE messages SET state=$2, last_error=$3, updated_at=$4 WHERE id=$1
 	`, in.ID, in.State, nullIfEmpty(in.LastError), in.Now)
-	return err
-}
-
-func (s *Store) SetProviderDetails(ctx context.Context, in store.ProviderDetailsUpdate) error {
-	_, err := s.DB.Exec(ctx, `
-		UPDATE messages SET provider=$2, provider_msg_id=$3, state=$4, updated_at=$5 WHERE id=$1
-	`, in.ID, in.Provider, in.ProviderMsgID, in.State, in.Now)
-	return err
-}
-
-func (s *Store) GetMessageForWorker(ctx context.Context, msgID string) (store.MessageForWorker, error) {
-	var varsJSON []byte
-	row := s.DB.QueryRow(ctx, `
-		SELECT tenant_id, to_phone, template_id, COALESCE(campaign_id,''), state, COALESCE(provider_msg_id,''), vars_json, created_at
-		FROM messages WHERE id=$1
-	`, msgID)
-	var out store.MessageForWorker
-	err := row.Scan(&out.TenantID, &out.To, &out.TemplateID, &out.CampaignID, &out.State, &out.ProviderMsgID, &varsJSON, &out.CreatedAt)
-	if err != nil {
-		return store.MessageForWorker{}, err
-	}
-	_ = json.Unmarshal(varsJSON, &out.Vars)
-	return out, nil
-}
-
-func (s *Store) InsertAttempt(ctx context.Context, in store.ProviderAttempt) error {
-	reqB, _ := json.Marshal(in.RequestJSON)
-	respB, _ := json.Marshal(in.ResponseJSON)
-	_, err := s.DB.Exec(ctx, `
-		INSERT INTO provider_attempts (message_id, provider, provider_msg_id, http_status, error_code, error_msg, request_json, response_json)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-	`, in.MessageID, in.Provider, nullIfEmpty(in.ProviderMsgID), in.HTTPStatus, nullIfEmpty(in.ErrorCode), nullIfEmpty(in.ErrorMsg), reqB, respB)
 	return err
 }
 
@@ -202,19 +172,87 @@ func (s *Store) GetMessage(ctx context.Context, msgID string) (store.Message, bo
 	return m, true, nil
 }
 
-// ClaimMessage attempts to move a message into processing state.
-// It allows reclaiming if the message is still "processing" but stale.
-func (s *Store) ClaimMessage(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (bool, error) {
+// ClaimAndLoad moves a message into processing state and returns it, in one
+// round-trip, replacing a SELECT followed by a conditional UPDATE.
+//
+// The two CTEs read the same snapshot, so `cur` sees the message as it was
+// before the claim — which is the state a caller wants for logging, since after
+// the update every claimed message reads 'processing'.
+//
+// found=false means no such message. That is deliberately distinct from
+// Claimed=false (the message exists but is terminal, already submitted, or held
+// by another worker whose claim has not gone stale): the first is a job
+// referencing a row that does not exist and should be surfaced, the second is
+// the ordinary duplicate-delivery case and is simply skipped.
+func (s *Store) ClaimAndLoad(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (store.ClaimedMessage, bool, error) {
 	staleBefore := now.Add(-staleAfter)
-	ct, err := s.DB.Exec(ctx, `
-		UPDATE messages
-		SET state=$2, updated_at=$3
-		WHERE id=$1 AND (state='queued' OR (state='processing' AND updated_at < $4))
-	`, msgID, "processing", now, staleBefore)
+	var out store.ClaimedMessage
+	var varsJSON []byte
+	err := s.DB.QueryRow(ctx, `
+		WITH cur AS (
+			SELECT tenant_id, to_phone, template_id, COALESCE(campaign_id,'') AS campaign_id,
+			       state, COALESCE(provider_msg_id,'') AS provider_msg_id, vars_json, created_at
+			  FROM messages WHERE id=$1
+		), claim AS (
+			UPDATE messages
+			   SET state='processing', updated_at=$2
+			 WHERE id=$1
+			   AND (state='queued' OR (state='processing' AND updated_at < $3))
+			RETURNING 1
+		)
+		SELECT cur.tenant_id, cur.to_phone, cur.template_id, cur.campaign_id,
+		       cur.state, cur.provider_msg_id, cur.vars_json, cur.created_at,
+		       EXISTS(SELECT 1 FROM claim) AS claimed
+		  FROM cur
+	`, msgID, now, staleBefore).Scan(
+		&out.TenantID, &out.To, &out.TemplateID, &out.CampaignID,
+		&out.State, &out.ProviderMsgID, &varsJSON, &out.CreatedAt, &out.Claimed)
 	if err != nil {
-		return false, err
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.ClaimedMessage{}, false, nil
+		}
+		return store.ClaimedMessage{}, false, err
 	}
-	return ct.RowsAffected() > 0, nil
+	_ = json.Unmarshal(varsJSON, &out.Vars)
+	return out, true, nil
+}
+
+// RecordAttempt writes one provider attempt and, when the attempt decided the
+// message's fate, the resulting state change — in a single statement, replacing
+// an INSERT followed by an UPDATE.
+//
+// A transient failure that will be retried passes no transition, so only the
+// attempt row is written; $9 gates the UPDATE so the same statement serves both
+// shapes. Provider and provider_msg_id are written only when non-empty, so a
+// later failed attempt cannot erase the id an earlier successful submit
+// recorded.
+func (s *Store) RecordAttempt(ctx context.Context, in store.AttemptRecord) error {
+	reqB, _ := json.Marshal(in.Attempt.RequestJSON)
+	respB, _ := json.Marshal(in.Attempt.ResponseJSON)
+
+	t := in.Transition
+	if t == nil {
+		t = &store.MessageTransition{}
+	}
+	_, err := s.DB.Exec(ctx, `
+		WITH att AS (
+			INSERT INTO provider_attempts
+				(message_id, provider, provider_msg_id, http_status, error_code, error_msg, request_json, response_json)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		)
+		UPDATE messages
+		   SET state = $10,
+		       provider = COALESCE(NULLIF($11,''), provider),
+		       provider_msg_id = COALESCE(NULLIF($12,''), provider_msg_id),
+		       last_error = NULLIF($13,''),
+		       updated_at = $14
+		 WHERE id = $1 AND $9::bool
+	`,
+		in.Attempt.MessageID, in.Attempt.Provider, nullIfEmpty(in.Attempt.ProviderMsgID),
+		in.Attempt.HTTPStatus, nullIfEmpty(in.Attempt.ErrorCode), nullIfEmpty(in.Attempt.ErrorMsg),
+		reqB, respB,
+		in.Transition != nil, t.State, t.Provider, t.ProviderMsgID, t.LastError, t.Now)
+	return err
 }
 
 func nullIfEmpty(s string) any {

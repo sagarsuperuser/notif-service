@@ -17,11 +17,9 @@ import (
 )
 
 type Store interface {
-	GetMessageForWorker(ctx context.Context, msgID string) (store.MessageForWorker, error)
-	InsertAttempt(ctx context.Context, in store.ProviderAttempt) error
-	SetProviderDetails(ctx context.Context, in store.ProviderDetailsUpdate) error
+	ClaimAndLoad(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (store.ClaimedMessage, bool, error)
+	RecordAttempt(ctx context.Context, in store.AttemptRecord) error
 	MarkMessageState(ctx context.Context, in store.MessageStateUpdate) error
-	ClaimMessage(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (bool, error)
 }
 
 type TwilioSender interface {
@@ -49,25 +47,24 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 		}
 	}()
 
-	msg, err := p.Store.GetMessageForWorker(ctx, job.MessageID)
+	// Claiming is what makes this consumer idempotent, and it now also loads the
+	// message, so a duplicate delivery costs one round-trip instead of two. The
+	// claim's own condition — queued, or processing past the stale window — is
+	// the same test the separate state checks used to make before it.
+	msg, found, err := p.Store.ClaimAndLoad(ctx, job.MessageID, util.NowUTC(), p.claimStaleAfter())
 	if err != nil {
 		return err
 	}
-
-	// Idempotent consumer: skip final or already submitted with SID
-	if msg.State == "suppressed" || msg.State == "delivered" || msg.State == "failed" {
-		return nil
+	if !found {
+		// The job names a message that does not exist. Returning an error sends
+		// it back to the queue and eventually to the DLQ, where it is visible,
+		// rather than silently dropping it.
+		observability.WorkerProcessed.WithLabelValues("failure_message_missing").Inc()
+		return errors.New("message not found: " + job.MessageID)
 	}
-	if msg.ProviderMsgID != "" && msg.State == "submitted" {
-		return nil
-	}
-
-	// Claim before sending to avoid duplicate processing.
-	claimed, err := p.Store.ClaimMessage(ctx, job.MessageID, util.NowUTC(), p.claimStaleAfter())
-	if err != nil {
-		return err
-	}
-	if !claimed {
+	if !msg.Claimed {
+		// Terminal, already submitted, or held by another worker. Ordinary
+		// duplicate delivery — acknowledge and move on.
 		return nil
 	}
 	processed = true
@@ -92,7 +89,7 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 	start := util.NowUTC()
 	endToEndRecorded := false
 
-	for attempt := 0; attempt < 3; attempt++ {
+	for attemptNum := 0; attemptNum < 3; attemptNum++ {
 		// 1) Rate limit before calling Twilio (per pod)
 		if p.Limiter != nil {
 			waitCtx, cancelWait := context.WithTimeout(ctx, 2*time.Second)
@@ -133,25 +130,26 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 				endToEndRecorded = true
 			}
 
-			if err := p.Store.InsertAttempt(ctx, store.ProviderAttempt{
-				MessageID:     job.MessageID,
-				Provider:      "twilio",
-				ProviderMsgID: resp.Sid,
-				HTTPStatus:    httpStatus,
-				RequestJSON: map[string]any{
-					"to": msg.To, "templateId": msg.TemplateID, "campaignId": msg.CampaignID, "tenantId": msg.TenantID,
+			// The attempt and the state it produces are written together: one
+			// round-trip, and no window in which an attempt exists for a message
+			// still reading 'processing'.
+			if err := p.Store.RecordAttempt(ctx, store.AttemptRecord{
+				Attempt: store.ProviderAttempt{
+					MessageID:     job.MessageID,
+					Provider:      "twilio",
+					ProviderMsgID: resp.Sid,
+					HTTPStatus:    httpStatus,
+					RequestJSON: map[string]any{
+						"to": msg.To, "templateId": msg.TemplateID, "campaignId": msg.CampaignID, "tenantId": msg.TenantID,
+					},
+					ResponseJSON: jsonRaw(raw),
 				},
-				ResponseJSON: jsonRaw(raw),
-			}); err != nil {
-				return err
-			}
-
-			if err := p.Store.SetProviderDetails(ctx, store.ProviderDetailsUpdate{
-				ID:            job.MessageID,
-				Provider:      "twilio",
-				ProviderMsgID: resp.Sid,
-				State:         "submitted",
-				Now:           util.NowUTC(),
+				Transition: &store.MessageTransition{
+					State:         "submitted",
+					Provider:      "twilio",
+					ProviderMsgID: resp.Sid,
+					Now:           util.NowUTC(),
+				},
 			}); err != nil {
 				return err
 			}
@@ -174,35 +172,41 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 			endToEndRecorded = true
 		}
 
-		if err := p.Store.InsertAttempt(ctx, store.ProviderAttempt{
-			MessageID:  job.MessageID,
-			Provider:   "twilio",
-			HTTPStatus: httpStatus,
-			ErrorMsg:   err.Error(),
-			RequestJSON: map[string]any{
-				"to": msg.To, "templateId": msg.TemplateID, "campaignId": msg.CampaignID, "tenantId": msg.TenantID,
+		attempt := store.AttemptRecord{
+			Attempt: store.ProviderAttempt{
+				MessageID:  job.MessageID,
+				Provider:   "twilio",
+				HTTPStatus: httpStatus,
+				ErrorMsg:   err.Error(),
+				RequestJSON: map[string]any{
+					"to": msg.To, "templateId": msg.TemplateID, "campaignId": msg.CampaignID, "tenantId": msg.TenantID,
+				},
+				ResponseJSON: map[string]any{
+					"raw": string(raw),
+				},
 			},
-			ResponseJSON: map[string]any{
-				"raw": string(raw),
-			},
-		}); err != nil {
-			return err
 		}
 
-		if !twilio.ShouldRetry(err, httpStatus) {
-			result = "failure_non_retryable"
-			if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{
-				ID:        job.MessageID,
+		// A retryable error records the attempt and nothing else — the message
+		// stays in processing for the next pass. A non-retryable one ends the
+		// message, so the attempt and the failure are written together.
+		nonRetryable := !twilio.ShouldRetry(err, httpStatus)
+		if nonRetryable {
+			attempt.Transition = &store.MessageTransition{
 				State:     "failed",
 				LastError: "twilio_non_retryable",
 				Now:       util.NowUTC(),
-			}); err != nil {
-				return err
 			}
+		}
+		if recErr := p.Store.RecordAttempt(ctx, attempt); recErr != nil {
+			return recErr
+		}
+		if nonRetryable {
+			result = "failure_non_retryable"
 			return err
 		}
 
-		time.Sleep(twilio.Backoff(attempt))
+		time.Sleep(twilio.Backoff(attemptNum))
 	}
 
 	if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{

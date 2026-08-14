@@ -70,7 +70,7 @@ jobs:
           fi
           ran=$(grep -c '^--- PASS' integration.log || true)
           echo "integration tests executed: $ran"
-          if [ "$ran" -lt 18 ]; then
-            echo "::error::expected at least 18 integration tests to run, saw $ran"
+          if [ "$ran" -lt 26 ]; then
+            echo "::error::expected at least 26 integration tests to run, saw $ran"
             exit 1
           fi
