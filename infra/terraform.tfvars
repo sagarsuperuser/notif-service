@@ -33,8 +33,16 @@ k3s_agents_spot = {
   mock_provider = 5
 }
 
-# RDS sizing (16 GiB RAM / 4 vCPU)
-db_instance_class = "db.t4g.xlarge"
+# RDS sizing (16 GiB RAM / 4 vCPU).
+#
+# m7g, not t4g. t-family instances are burstable: they accrue CPU credits while
+# idle and are throttled to a baseline once those credits are spent. That is a
+# reasonable default for spiky production traffic and a bad one for a benchmark,
+# because the same test returns different numbers depending on how long the
+# instance sat idle beforehand — the run decays partway through and the result
+# is not reproducible. A sustained-load measurement needs an instance whose
+# performance does not depend on its history.
+db_instance_class = "db.m7g.xlarge"
 
 # Phase-1 infra knobs (kept explicit for easier env tuning)
 root_volume_type                            = "gp3"
@@ -43,7 +51,6 @@ db_storage_type                             = "gp3"
 k3s_token_length                            = 32
 db_password_length                          = 24
 sqs_send_max_receive_count                  = 5
-sqs_webhook_events_max_receive_count        = 10
 rds_proxy_idle_client_timeout_seconds       = 900
 rds_proxy_max_connections_percent           = 70
 rds_proxy_max_idle_connections_percent      = 30

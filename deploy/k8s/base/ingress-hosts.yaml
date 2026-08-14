@@ -10,6 +10,12 @@ metadata:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
 
     # minimal but useful
+    #
+    # limit-rps is keyed on the client address, so behind a load balancer that
+    # does not preserve the real client IP every caller shares one bucket and
+    # the whole ingress is capped at this number. It is left in place because a
+    # public endpoint should have a limiter, but it is a per-deployment value:
+    # a benchmark measuring the service must raise it, or it measures nginx.
     nginx.ingress.kubernetes.io/limit-rps: "20"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
@@ -52,6 +58,12 @@ metadata:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
 
     # minimal but useful
+    #
+    # limit-rps is keyed on the client address, so behind a load balancer that
+    # does not preserve the real client IP every caller shares one bucket and
+    # the whole ingress is capped at this number. It is left in place because a
+    # public endpoint should have a limiter, but it is a per-deployment value:
+    # a benchmark measuring the service must raise it, or it measures nginx.
     nginx.ingress.kubernetes.io/limit-rps: "20"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
