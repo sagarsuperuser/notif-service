@@ -1,4 +1,17 @@
-env               = "prod-test"
+env = "prod-test"
+
+# This AWS account carries a hold on creating load balancers — the API returns
+# OperationNotPermitted on CreateLoadBalancer, and it is an account flag rather
+# than a quota, so only AWS Support can lift it. Until then the control plane is
+# a single server reached on its private IP, and the ingress is reached on its
+# NodePort.
+use_load_balancers = false
+
+# A single control-plane node, which is what having no load balancer forces:
+# there is no stable address for a second server to join through. The control
+# plane schedules pods and does not carry requests, so this costs availability
+# and not throughput.
+k3s_server_count  = 1
 bastion_ssh_cidr  = "116.0.0.0/8"
 key_name          = "apps"
 pause_environment = false
@@ -38,12 +51,29 @@ spot_instance_types = {
 # general pool alongside the API pods — the load generator competing for CPU
 # with the component being measured, which makes the result a measurement of
 # the test harness. The monitoring pool is tainted, so nothing else lands on it.
+#
+# Sized to the account's 22 vCPU limit (an increase to 64 is requested and
+# pending). Three vCPU are already spent on an unrelated instance and the
+# bastion, leaving 19:
+#
+#   1 server      m7i.large   2
+#   1 monitoring  m7i.large   2   <- runs the load generator
+#   2 general     c7i.large   4   <- API pods
+#   2 worker      c7i.large   4   <- worker pods
+#   1 mock        c7i.large   2   <- stands in for the SMS provider
+#   1 ingress     c7i.large   2
+#                            --
+#                             16
+#
+# The measurement this produces is throughput per core on a named instance
+# type, which is the number worth quoting anyway — a large fleet would make the
+# same code look better while saying less about it.
 k3s_agents_on_demand = {
-  monitoring    = 3
-  mock_provider = 2
-  worker        = 3
+  monitoring    = 1
+  mock_provider = 1
+  worker        = 2
   ingress       = 1
-  general       = 3
+  general       = 2
 }
 
 # No spot. A spot interruption part-way through a run silently removes capacity

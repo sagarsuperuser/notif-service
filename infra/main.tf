@@ -359,6 +359,8 @@ resource "random_password" "k3s_token" {
 
 # API NLB (internal)
 resource "aws_lb" "api" {
+  count = var.use_load_balancers ? 1 : 0
+
   name               = "${local.name}-api"
   internal           = true
   load_balancer_type = "network"
@@ -372,6 +374,8 @@ resource "aws_lb" "api" {
 }
 
 resource "aws_lb_target_group" "api_6443" {
+  count = var.use_load_balancers ? 1 : 0
+
   name        = "${local.name}-api-6443"
   port        = var.k3s_api_port
   protocol    = "TCP"
@@ -385,18 +389,22 @@ resource "aws_lb_target_group" "api_6443" {
 }
 
 resource "aws_lb_listener" "api_6443" {
-  load_balancer_arn = aws_lb.api.arn
+  count = var.use_load_balancers ? 1 : 0
+
+  load_balancer_arn = aws_lb.api[0].arn
   port              = var.k3s_api_port
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.api_6443.arn
+    target_group_arn = one(aws_lb_target_group.api_6443[*].arn)
   }
 }
 
 # Ingress NLB (internet-facing)
 resource "aws_lb" "ingress" {
+  count = var.use_load_balancers ? 1 : 0
+
   name               = "${local.name}-ingress"
   internal           = false
   load_balancer_type = "network"
@@ -406,6 +414,8 @@ resource "aws_lb" "ingress" {
 }
 
 resource "aws_lb_target_group" "ingress_http" {
+  count = var.use_load_balancers ? 1 : 0
+
   name        = "${local.name}-ing-http"
   port        = var.ingress_http_nodeport
   protocol    = "TCP"
@@ -419,6 +429,8 @@ resource "aws_lb_target_group" "ingress_http" {
 }
 
 resource "aws_lb_target_group" "ingress_https" {
+  count = var.use_load_balancers ? 1 : 0
+
   name        = "${local.name}-ing-https"
   port        = var.ingress_https_nodeport
   protocol    = "TCP"
@@ -432,24 +444,28 @@ resource "aws_lb_target_group" "ingress_https" {
 }
 
 resource "aws_lb_listener" "ingress_80" {
-  load_balancer_arn = aws_lb.ingress.arn
+  count = var.use_load_balancers ? 1 : 0
+
+  load_balancer_arn = aws_lb.ingress[0].arn
   port              = var.ingress_public_http_port
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.ingress_http.arn
+    target_group_arn = aws_lb_target_group.ingress_http[0].arn
   }
 }
 
 resource "aws_lb_listener" "ingress_443" {
-  load_balancer_arn = aws_lb.ingress.arn
+  count = var.use_load_balancers ? 1 : 0
+
+  load_balancer_arn = aws_lb.ingress[0].arn
   port              = var.ingress_public_https_port
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.ingress_https.arn
+    target_group_arn = aws_lb_target_group.ingress_https[0].arn
   }
 }
 
@@ -542,6 +558,24 @@ resource "aws_instance" "bastion" {
 
 # k3s server user_data templates
 locals {
+  # The address agents use to reach the control plane.
+  #
+  # With a load balancer this is the NLB, which is what makes a multi-server
+  # control plane possible: servers two and three join through the same stable
+  # address. Without one, a single server's private IP is the endpoint, so the
+  # control plane cannot be HA — which is why use_load_balancers=false also
+  # forces k3s_server_count to 1 (see the validation on that variable).
+  #
+  # The control plane is not in the data path: it schedules pods, it does not
+  # carry requests. A single server is a real availability limitation for
+  # production and no limitation at all for a throughput measurement.
+  k3s_api_endpoint = var.use_load_balancers ? aws_lb.api[0].dns_name : aws_instance.k3s_server[0].private_ip
+
+  # Only meaningful when a load balancer exists; the placeholder keeps the
+  # template a string when one does not, since a second control-plane node
+  # cannot be created in that mode anyway.
+  k3s_join_address = coalesce(one(aws_lb.api[*].dns_name), "load-balancer-disabled")
+
   k3s_common = <<-EOT
     #!/bin/bash
     set -euo pipefail
@@ -552,17 +586,21 @@ locals {
     ${local.k3s_common} server \
       --cluster-init \
       --token ${random_password.k3s_token.result} \
-      --tls-san ${aws_lb.api.dns_name} \
+      ${var.use_load_balancers ? "--tls-san ${aws_lb.api[0].dns_name}" : ""} \
       --write-kubeconfig-mode 644 \
       --node-taint node-role.kubernetes.io/control-plane=true:NoSchedule \
       --disable traefik
   EOT
 
+  # Additional control-plane nodes exist only when a load balancer does (a
+  # single server has no stable address for others to join through), so this
+  # names the NLB directly. Routing it via k3s_api_endpoint would make the
+  # server depend on its own address and turn the graph into a cycle.
   server_join_user_data = <<-EOT
     ${local.k3s_common} server \
-      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
+      --server https://${local.k3s_join_address}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
-      --tls-san ${aws_lb.api.dns_name} \
+      --tls-san ${local.k3s_join_address} \
       --write-kubeconfig-mode 644 \
       --node-taint node-role.kubernetes.io/control-plane=true:NoSchedule \
       --disable traefik
@@ -570,13 +608,13 @@ locals {
 
   agent_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
+      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result}
   EOT
 
   agent_worker_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
+      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --node-label workload=worker \
       --node-taint workload=worker:NoSchedule
@@ -584,7 +622,7 @@ locals {
 
   agent_mock_provider_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
+      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --node-label workload=mock-provider \
       --node-taint workload=mock-provider:NoSchedule
@@ -592,7 +630,7 @@ locals {
 
   agent_ingress_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
+      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --node-label workload=ingress \
       --node-taint workload=ingress:NoSchedule
@@ -600,7 +638,7 @@ locals {
 
   agent_monitoring_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${aws_lb.api.dns_name}:${var.k3s_api_port} \
+      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result} \
       --node-label workload=monitoring \
       --node-taint workload=monitoring:NoSchedule
@@ -890,8 +928,8 @@ resource "aws_instance" "k3s_server" {
 
 # Attach servers to API TG
 resource "aws_lb_target_group_attachment" "api_servers" {
-  count            = local.effective_k3s_server_count
-  target_group_arn = aws_lb_target_group.api_6443.arn
+  count            = var.use_load_balancers ? local.effective_k3s_server_count : 0
+  target_group_arn = one(aws_lb_target_group.api_6443[*].arn)
   target_id        = aws_instance.k3s_server[count.index].id
   port             = var.k3s_api_port
 }
@@ -933,21 +971,21 @@ resource "aws_instance" "k3s_agent_ondemand" {
 
 # Attach workers to ingress target groups
 resource "aws_lb_target_group_attachment" "ingress_workers_http_ondemand" {
-  for_each = {
+  for_each = var.use_load_balancers ? {
     for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id
     if idx >= local.od_ingress_start && idx < local.od_ingress_end
-  }
-  target_group_arn = aws_lb_target_group.ingress_http.arn
+  } : {}
+  target_group_arn = one(aws_lb_target_group.ingress_http[*].arn)
   target_id        = each.value
   port             = var.ingress_http_nodeport
 }
 
 resource "aws_lb_target_group_attachment" "ingress_workers_https_ondemand" {
-  for_each = {
+  for_each = var.use_load_balancers ? {
     for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id
     if idx >= local.od_ingress_start && idx < local.od_ingress_end
-  }
-  target_group_arn = aws_lb_target_group.ingress_https.arn
+  } : {}
+  target_group_arn = one(aws_lb_target_group.ingress_https[*].arn)
   target_id        = each.value
   port             = var.ingress_https_nodeport
 }

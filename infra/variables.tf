@@ -26,6 +26,11 @@ variable "k3s_server_count" {
   type        = number
   default     = 3
   description = "Number of k3s server (control-plane/etcd) nodes."
+
+  validation {
+    condition     = var.k3s_server_count >= 1
+    error_message = "k3s_server_count must be at least 1."
+  }
 }
 
 variable "pause_environment" {
@@ -339,4 +344,21 @@ variable "rds_proxy_connection_borrow_timeout_seconds" {
   type        = number
   default     = 120
   description = "RDS Proxy connection borrow timeout in seconds."
+}
+
+variable "use_load_balancers" {
+  type        = bool
+  default     = true
+  description = <<-DESC
+    Whether to put network load balancers in front of the k3s API and the
+    ingress controller.
+
+    Set false when the AWS account cannot create load balancers — newer
+    accounts carry a hold that only AWS Support can lift, and it surfaces as
+    OperationNotPermitted on CreateLoadBalancer rather than as a quota.
+
+    With it false, agents join the control plane on a single server's private
+    IP and the ingress is reached on its NodePort. That removes control-plane
+    HA, so k3s_server_count must be 1.
+  DESC
 }
