@@ -21,7 +21,7 @@ var (
 			Name: "notif_db_roundtrips_total",
 			Help: "Queries sent to Postgres, by service and outcome",
 		},
-		[]string{"service", "outcome"},
+		[]string{"component", "outcome"},
 	)
 
 	// DBQuerySeconds is time spent inside a query. Compare it against
@@ -45,7 +45,7 @@ var (
 			Name: "notif_db_pool_connections",
 			Help: "pgx pool connection counts by state",
 		},
-		[]string{"service", "state"},
+		[]string{"component", "state"},
 	)
 
 	// DBPoolAcquireSeconds is cumulative time callers spent acquiring a
@@ -58,7 +58,7 @@ var (
 			Name: "notif_db_pool_acquire_seconds_total",
 			Help: "Cumulative time spent acquiring a pooled connection",
 		},
-		[]string{"service"},
+		[]string{"component"},
 	)
 
 	DBPoolEmptyAcquires = prometheus.NewGaugeVec(
@@ -66,10 +66,16 @@ var (
 			Name: "notif_db_pool_empty_acquires_total",
 			Help: "Acquires that found the pool empty and had to wait for a connection",
 		},
-		[]string{"service"},
+		[]string{"component"},
 	)
 )
 
+// Labels are "component", not "service": Prometheus Operator reserves `service`
+// for the name of the target Kubernetes Service and relabels a colliding
+// application label to `exported_service`. The data survives, but every query
+// then needs a prefix nobody expects, which is how a correct counter ends up
+// behind an empty panel.
+//
 // QueryTracer counts and times every query a pool issues. It is a pgx
 // QueryTracer, so it sees Exec, Query, QueryRow and the implicit BEGIN/COMMIT
 // of an explicit transaction — which is the point: a transaction's round-trips
