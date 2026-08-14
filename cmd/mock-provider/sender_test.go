@@ -91,7 +91,7 @@ func TestSenderQueue_OverflowsLikeTwilio(t *testing.T) {
 // other untouched. Put both through one sender and the urgent message inherits
 // the bulk queue's depth no matter how the sending side is tuned.
 func TestSenderPool_QueuesAreIndependent(t *testing.T) {
-	pool := newSenderPool(10, 3600)
+	pool := newSenderPool(10, 1, 3600, 0)
 	now := time.Now()
 
 	// Fill one sender with a hundred messages.
@@ -164,5 +164,99 @@ func TestAPILatency_HasATail(t *testing.T) {
 	// Sigma 0 is the documented escape hatch for a deterministic run.
 	if d := apiLatency(rng, median, 0); d != median*time.Millisecond {
 		t.Errorf("sigma 0 produced %v, want exactly the median", d)
+	}
+}
+
+// TestSenderPool_SenderClassIsTheRealLever encodes what actually makes a
+// campaign faster.
+//
+// The intuitive lever — more numbers — is "snowshoeing", which Twilio
+// discourages and which does not multiply US throughput at all, because A2P
+// 10DLC allocates the rate per campaign rather than per number. The lever that
+// works is a better sender class: toll-free at 3 MPS upgradable to 25+, or a
+// short code at 100.
+//
+// The pool multiplier still exists for the cases where it is legitimate
+// (non-US long codes, genuinely separate campaigns), but it is not the default
+// and it is not the answer for US traffic.
+func TestSenderPool_SenderClassIsTheRealLever(t *testing.T) {
+	longCode := newSenderPool(1, 1, 86400, 0)    // US 10DLC: 1 MPS
+	tollFree := newSenderPool(25, 1, 86400, 0)   // upgraded toll-free: 25 MPS
+	shortCode := newSenderPool(100, 1, 86400, 0) // short code: 100 MPS
+
+	if longCode.effectiveMPS() != 1 || tollFree.effectiveMPS() != 25 || shortCode.effectiveMPS() != 100 {
+		t.Fatalf("sender classes wrong: %v %v %v",
+			longCode.effectiveMPS(), tollFree.effectiveMPS(), shortCode.effectiveMPS())
+	}
+
+	// The same campaign, three sender classes. This is the comparison that
+	// should drive the decision.
+	now := time.Now()
+	drain := func(p *senderPool, n int) time.Duration {
+		var last time.Duration
+		for i := 0; i < n; i++ {
+			w, ok := p.admit("MG1", now)
+			if !ok {
+				t.Fatalf("rejected at %d", i)
+			}
+			last = w
+		}
+		return last
+	}
+	const campaign = 1000
+	lc, tf, sc := drain(longCode, campaign), drain(tollFree, campaign), drain(shortCode, campaign)
+	t.Logf("%d messages: long code %v, toll-free(25) %v, short code(100) %v", campaign, lc, tf, sc)
+
+	if lc < 999*time.Second {
+		t.Errorf("1000 on a 1 MPS long code waits %v, want ~999s", lc)
+	}
+	if tf > 41*time.Second || tf < 39*time.Second {
+		t.Errorf("1000 at 25 MPS waits %v, want ~40s", tf)
+	}
+	if sc > 11*time.Second || sc < 9*time.Second {
+		t.Errorf("1000 at 100 MPS waits %v, want ~10s", sc)
+	}
+}
+
+// TestSenderPool_PoolMultipliesOnlyWhereLegitimate keeps the multiplier honest:
+// it exists, it is off by default, and it is documented as inapplicable to US
+// long codes.
+func TestSenderPool_PoolMultipliesOnlyWhereLegitimate(t *testing.T) {
+	single := newSenderPool(10, 1, 86400, 0)  // one non-US long code: 10 MPS
+	pooled := newSenderPool(10, 20, 86400, 0) // twenty of them
+
+	if single.effectiveMPS() != 10 {
+		t.Errorf("one number at 10 MPS = %v, want 10", single.effectiveMPS())
+	}
+	if pooled.effectiveMPS() != 200 {
+		t.Errorf("twenty numbers at 10 MPS = %v, want 200", pooled.effectiveMPS())
+	}
+	// Default is one number: the multiplier must be opted into, not inherited.
+	if def := newSenderPool(10, 0, 86400, 0); def.poolSize != 1 {
+		t.Errorf("default pool size is %d, want 1 — snowshoeing must not be the default", def.poolSize)
+	}
+}
+
+// TestSenderPool_AccountCeilingCapsTheLever is the limit on that lever. Buying
+// numbers stops helping once the account ceiling binds, and an operator who
+// does not model this concludes a campaign can be made arbitrarily fast.
+func TestSenderPool_AccountCeilingCapsTheLever(t *testing.T) {
+	// 200 numbers would give 200/sec, but the account is capped at 50/sec.
+	capped := newSenderPool(1, 200, 86400, 50)
+	now := time.Now()
+
+	var last time.Duration
+	const n = 500
+	for i := 0; i < n; i++ {
+		w, ok := capped.admit("MG1", now)
+		if !ok {
+			t.Fatalf("message %d rejected", i)
+		}
+		last = w
+	}
+	// At the account ceiling of 50/sec, 500 messages take ~10s, not the ~2.5s
+	// the number pool alone would suggest.
+	if last < 9*time.Second {
+		t.Errorf("last of %d waits %v; the account ceiling of 50/sec should dominate the 200-number pool", n, last)
 	}
 }

@@ -143,21 +143,94 @@ func (q *senderQueue) currentDepth() int {
 	return q.depth
 }
 
+// accountPacer is the ceiling that sits above every sender.
+//
+// Providers cap total account throughput as well as per-sender throughput, so
+// adding senders stops helping at some point. Without this the model would
+// suggest a campaign can be made arbitrarily fast by buying more numbers, which
+// is the one conclusion an operator must not draw.
+type accountPacer struct {
+	mps        float64
+	mu         sync.Mutex
+	nextSlotAt time.Time
+}
+
+func newAccountPacer(mps float64) *accountPacer { return &accountPacer{mps: mps} }
+
+// reserve returns the additional wait imposed by the account ceiling.
+func (a *accountPacer) reserve(now time.Time) time.Duration {
+	if a == nil || a.mps <= 0 {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	interval := time.Duration(float64(time.Second) / a.mps)
+	if a.nextSlotAt.Before(now) {
+		a.nextSlotAt = now
+	}
+	wait := a.nextSlotAt.Sub(now)
+	a.nextSlotAt = a.nextSlotAt.Add(interval)
+	return wait
+}
+
 // senderPool keeps one queue per sender, because MPS is per sender. Two
 // Messaging Services with their own numbers drain independently — which is the
 // only reason separating time-sensitive traffic from bulk actually works. Put
 // both through one sender and the bulk fills the queue that the urgent traffic
 // has to wait in, no matter how the sending side is tuned.
 type senderPool struct {
-	mps        float64
+	mps        float64 // per NUMBER, not per sender
+	poolSize   int     // numbers behind each sender
 	maxSeconds int
+	account    *accountPacer
 	mu         sync.Mutex
 	queues     map[string]*senderQueue
 }
 
-func newSenderPool(mps float64, maxSeconds int) *senderPool {
-	return &senderPool{mps: mps, maxSeconds: maxSeconds, queues: map[string]*senderQueue{}}
+// newSenderPool models a sender running at mps, optionally spread across
+// poolSize numbers.
+//
+// IMPORTANT, and the opposite of the intuitive answer: for US and Canadian
+// traffic, poolSize does NOT multiply throughput, and modelling it that way
+// would teach the wrong lesson.
+//
+// Twilio's documentation is explicit: "We caution against adding more long
+// code phone numbers to your Messaging Service's Sender Pool to distribute the
+// load, a practice known as 'snowshoeing'", and "Using multiple long code or
+// Toll-Free numbers to increase your message throughput to the US or Canada is
+// strongly discouraged." Under A2P 10DLC the rate is allocated per CAMPAIGN
+// rather than per number, so numbers added to one campaign share a single
+// allowance rather than each bringing their own. Carriers also filter traffic
+// that looks snowshoed.
+//
+// So poolSize defaults to 1 and multiplies only when explicitly configured,
+// which is defensible for non-US long codes (10 MPS each) and for genuinely
+// separate campaigns. The lever that works for US traffic is upgrading the
+// sender class — toll-free from 3 MPS to 25+, or a short code at 100 — and
+// that goes through the provider's sales and registration process, not through
+// provisioning more numbers.
+//
+// The useful conclusion for a campaign is therefore uncomfortable: the fastest
+// path is bounded by a commercial and registration lead time, not by anything
+// that can be built.
+//
+// accountMPS caps the total across all senders, because sender upgrades stop
+// helping once the account ceiling is reached.
+func newSenderPool(mps float64, poolSize, maxSeconds int, accountMPS float64) *senderPool {
+	if poolSize < 1 {
+		poolSize = 1
+	}
+	return &senderPool{
+		mps:        mps,
+		poolSize:   poolSize,
+		maxSeconds: maxSeconds,
+		account:    newAccountPacer(accountMPS),
+		queues:     map[string]*senderQueue{},
+	}
 }
+
+// effectiveMPS is what one sender delivers with its whole number pool working.
+func (p *senderPool) effectiveMPS() float64 { return p.mps * float64(p.poolSize) }
 
 func (p *senderPool) get(sender string) *senderQueue {
 	if sender == "" {
@@ -167,10 +240,24 @@ func (p *senderPool) get(sender string) *senderQueue {
 	defer p.mu.Unlock()
 	q, ok := p.queues[sender]
 	if !ok {
-		q = newSenderQueue(p.mps, p.maxSeconds)
+		q = newSenderQueue(p.effectiveMPS(), p.maxSeconds)
 		p.queues[sender] = q
 	}
 	return q
+}
+
+// admit places a message on its sender's queue and applies the account
+// ceiling on top, returning whichever wait is longer. A sender with spare
+// capacity still waits when the account as a whole is saturated.
+func (p *senderPool) admit(sender string, now time.Time) (time.Duration, bool) {
+	wait, ok := p.get(sender).admit(now)
+	if !ok {
+		return 0, false
+	}
+	if acct := p.account.reserve(now); acct > wait {
+		wait = acct
+	}
+	return wait, true
 }
 
 func (p *senderPool) snapshot() map[string]int {
