@@ -8,6 +8,8 @@ on:
 permissions:
   contents: write
   packages: write
+  # the tag bump is delivered as a PR, not a push to main
+  pull-requests: write
 
 env:
   REGISTRY: ghcr.io
@@ -101,13 +103,32 @@ jobs:
           git status --porcelain
           git --no-pager diff -- deploy/k8s/overlays/prod/kustomization.yaml || true
 
-      - name: Commit and push
+      # main requires a passing CI run, and this bot's commits carried
+      # [skip ci] — so a direct push could never satisfy the check and was
+      # rejected outright. Opening a PR is the right shape anyway: the tag bump
+      # gets the same build/vet/test gate as any other change to main, and a
+      # bot committing straight to a protected branch stops being a hole in it.
+      - name: Open a PR with the new tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          if ! git status --porcelain | grep -q .; then
+            echo "image tags already current; nothing to do"
+            exit 0
+          fi
+
+          short_sha="${GITHUB_SHA:0:7}"
+          branch="chore/image-tags-${short_sha}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git status --porcelain | grep -q .; then
-            git add deploy/k8s/overlays/prod/kustomization.yaml
-            git commit -m "chore: update prod image tags [skip ci]"
-            git push
-          fi
+          git checkout -b "$branch"
+          git add deploy/k8s/overlays/prod/kustomization.yaml
+          git commit -m "chore: point prod at image tag sha-${short_sha}"
+          git push -u origin "$branch"
+
+          gh pr create \
+            --title "chore: point prod at image tag sha-${short_sha}" \
+            --body "Built from ${GITHUB_SHA}. Opened automatically after the images for this commit were pushed to GHCR." \
+            --head "$branch"
