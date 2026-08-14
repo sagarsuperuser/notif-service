@@ -43,12 +43,18 @@ func (s *Store) MarkMessageState(ctx context.Context, in store.MessageStateUpdat
 //	decision — collapses the gates and the cap outcome into the final state, so
 //	           the message is inserted with the state it ends in rather than
 //	           inserted as 'queued' and then UPDATEd to 'suppressed'.
-//	ins      — ON CONFLICT DO NOTHING; a concurrent duplicate resolves to the
-//	           existing row instead of erroring on the unique constraint, which
-//	           is what the previous plain INSERT did.
+//	ins      — ON CONFLICT DO UPDATE with a no-op assignment. The update is
+//	           what makes this correct under concurrency: DO NOTHING neither
+//	           returns a row nor waits, so a caller that lost the race got an
+//	           empty result AND could not read the winner's row, because its
+//	           statement snapshot predates that commit. Both branches came back
+//	           empty and the caller saw "no rows in result set" for a request
+//	           that had in fact succeeded. DO UPDATE takes the row lock, waits
+//	           for the other transaction, and returns the row either way.
 //
-// The trailing UNION returns the pre-existing row when the insert conflicted,
-// so one statement answers both the fresh and the idempotent-retry case.
+// xmax distinguishes the two cases: it is 0 on a row this statement inserted
+// and non-zero on one it locked, which is how a fresh accept is told apart from
+// an idempotent retry without a second query.
 func (s *Store) CreateMessage(ctx context.Context, in store.CreateMessageInput) (store.CreateMessageResult, error) {
 	b, _ := json.Marshal(in.Vars)
 	day := in.Day.UTC().Truncate(24 * time.Hour)
@@ -86,13 +92,11 @@ func (s *Store) CreateMessage(ctx context.Context, in store.CreateMessageInput) 
 				(id, tenant_id, idempotency_key, to_phone, template_id, vars_json, campaign_id,
 				 state, last_error, created_at, updated_at)
 			SELECT $1,$2,$3,$4,$5,$6,$7, d.state, NULLIF(d.last_error,''), $10,$10 FROM decision d
-			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
-			RETURNING id, state, COALESCE(last_error,'') AS last_error
+			ON CONFLICT (tenant_id, idempotency_key) DO UPDATE
+				SET updated_at = messages.updated_at
+			RETURNING id, state, COALESCE(last_error,'') AS last_error, (xmax = 0) AS inserted
 		)
-		SELECT id, state, last_error, true FROM ins
-		UNION ALL
-		SELECT id, state, COALESCE(last_error,''), false FROM messages
-		 WHERE tenant_id=$2 AND idempotency_key=$3 AND NOT EXISTS (SELECT 1 FROM ins)
+		SELECT id, state, last_error, inserted FROM ins
 	`, in.ID, in.TenantID, in.IdemKey, in.To, in.TemplateID, b, nullIfEmpty(in.CampaignID),
 		day, in.MaxPerDay, in.Now)
 
