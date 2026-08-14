@@ -11,20 +11,20 @@ resources:
 images:
   - name: notif-api
     newName: ghcr.io/sagarsuperuser/notif-service/notif-api
-    newTag: sha-bf33b14
+    newTag: sha-b234007
 
   - name: notif-webhook
     newName: ghcr.io/sagarsuperuser/notif-service/notif-webhook
-    newTag: sha-bf33b14
+    newTag: sha-b234007
 
 
   - name: notif-worker
     newName: ghcr.io/sagarsuperuser/notif-service/notif-worker
-    newTag: sha-bf33b14
+    newTag: sha-b234007
 
   - name: notif-mock-provider
     newName: ghcr.io/sagarsuperuser/notif-service/notif-mock-provider
-    newTag: sha-bf33b14
+    newTag: sha-b234007
   
 
 
