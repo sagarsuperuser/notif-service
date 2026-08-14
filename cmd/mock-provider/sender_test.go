@@ -91,7 +91,7 @@ func TestSenderQueue_OverflowsLikeTwilio(t *testing.T) {
 // other untouched. Put both through one sender and the urgent message inherits
 // the bulk queue's depth no matter how the sending side is tuned.
 func TestSenderPool_QueuesAreIndependent(t *testing.T) {
-	pool := newSenderPool(10, 3600)
+	pool := newSenderPool(10, 1, 3600, 0)
 	now := time.Now()
 
 	// Fill one sender with a hundred messages.
@@ -164,5 +164,64 @@ func TestAPILatency_HasATail(t *testing.T) {
 	// Sigma 0 is the documented escape hatch for a deterministic run.
 	if d := apiLatency(rng, median, 0); d != median*time.Millisecond {
 		t.Errorf("sigma 0 produced %v, want exactly the median", d)
+	}
+}
+
+// TestSenderPool_NumberPoolMultipliesThroughput is the campaign lever. A
+// Messaging Service load-balances across its numbers, so effective throughput
+// is the pool size times the per-number rate — which is why "how fast can this
+// campaign go out" is answered by provisioning before it is answered by code.
+func TestSenderPool_NumberPoolMultipliesThroughput(t *testing.T) {
+	single := newSenderPool(1, 1, 86400, 0)   // one US long code: 1/sec
+	pooled := newSenderPool(1, 200, 86400, 0) // two hundred of them
+
+	if single.effectiveMPS() != 1 {
+		t.Errorf("one number at 1 MPS = %v, want 1", single.effectiveMPS())
+	}
+	if pooled.effectiveMPS() != 200 {
+		t.Errorf("two hundred numbers at 1 MPS = %v, want 200", pooled.effectiveMPS())
+	}
+
+	// The same campaign drains 200x faster, which is the whole point.
+	now := time.Now()
+	const campaign = 1000
+	var lastSingle, lastPooled time.Duration
+	for i := 0; i < campaign; i++ {
+		w1, ok1 := single.admit("MG1", now)
+		w2, ok2 := pooled.admit("MG1", now)
+		if !ok1 || !ok2 {
+			t.Fatalf("message %d rejected", i)
+		}
+		lastSingle, lastPooled = w1, w2
+	}
+	if lastSingle < 999*time.Second {
+		t.Errorf("last of %d on one number waits %v, want ~999s", campaign, lastSingle)
+	}
+	if lastPooled > 6*time.Second {
+		t.Errorf("last of %d across 200 numbers waits %v, want ~5s", campaign, lastPooled)
+	}
+}
+
+// TestSenderPool_AccountCeilingCapsTheLever is the limit on that lever. Buying
+// numbers stops helping once the account ceiling binds, and an operator who
+// does not model this concludes a campaign can be made arbitrarily fast.
+func TestSenderPool_AccountCeilingCapsTheLever(t *testing.T) {
+	// 200 numbers would give 200/sec, but the account is capped at 50/sec.
+	capped := newSenderPool(1, 200, 86400, 50)
+	now := time.Now()
+
+	var last time.Duration
+	const n = 500
+	for i := 0; i < n; i++ {
+		w, ok := capped.admit("MG1", now)
+		if !ok {
+			t.Fatalf("message %d rejected", i)
+		}
+		last = w
+	}
+	// At the account ceiling of 50/sec, 500 messages take ~10s, not the ~2.5s
+	// the number pool alone would suggest.
+	if last < 9*time.Second {
+		t.Errorf("last of %d waits %v; the account ceiling of 50/sec should dominate the 200-number pool", n, last)
 	}
 }

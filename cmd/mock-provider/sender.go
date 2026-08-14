@@ -143,21 +143,78 @@ func (q *senderQueue) currentDepth() int {
 	return q.depth
 }
 
+// accountPacer is the ceiling that sits above every sender.
+//
+// Providers cap total account throughput as well as per-sender throughput, so
+// adding senders stops helping at some point. Without this the model would
+// suggest a campaign can be made arbitrarily fast by buying more numbers, which
+// is the one conclusion an operator must not draw.
+type accountPacer struct {
+	mps        float64
+	mu         sync.Mutex
+	nextSlotAt time.Time
+}
+
+func newAccountPacer(mps float64) *accountPacer { return &accountPacer{mps: mps} }
+
+// reserve returns the additional wait imposed by the account ceiling.
+func (a *accountPacer) reserve(now time.Time) time.Duration {
+	if a == nil || a.mps <= 0 {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	interval := time.Duration(float64(time.Second) / a.mps)
+	if a.nextSlotAt.Before(now) {
+		a.nextSlotAt = now
+	}
+	wait := a.nextSlotAt.Sub(now)
+	a.nextSlotAt = a.nextSlotAt.Add(interval)
+	return wait
+}
+
 // senderPool keeps one queue per sender, because MPS is per sender. Two
 // Messaging Services with their own numbers drain independently — which is the
 // only reason separating time-sensitive traffic from bulk actually works. Put
 // both through one sender and the bulk fills the queue that the urgent traffic
 // has to wait in, no matter how the sending side is tuned.
 type senderPool struct {
-	mps        float64
+	mps        float64 // per NUMBER, not per sender
+	poolSize   int     // numbers behind each sender
 	maxSeconds int
+	account    *accountPacer
 	mu         sync.Mutex
 	queues     map[string]*senderQueue
 }
 
-func newSenderPool(mps float64, maxSeconds int) *senderPool {
-	return &senderPool{mps: mps, maxSeconds: maxSeconds, queues: map[string]*senderQueue{}}
+// newSenderPool models a sender as a Messaging Service holding poolSize
+// numbers, each running at mps.
+//
+// This is the lever a campaign actually pulls. A single US long code does one
+// message per second, so a hundred thousand messages take over a day; the same
+// hundred thousand across a pool of two hundred numbers takes about eight
+// minutes. Provider documentation describes exactly this — load-balancing a
+// Messaging Service across a number pool — and it is why "how fast can we send
+// this campaign" is a sender-provisioning question before it is an engineering
+// one.
+//
+// accountMPS caps the total across all senders, because buying numbers stops
+// helping once the account ceiling is reached.
+func newSenderPool(mps float64, poolSize, maxSeconds int, accountMPS float64) *senderPool {
+	if poolSize < 1 {
+		poolSize = 1
+	}
+	return &senderPool{
+		mps:        mps,
+		poolSize:   poolSize,
+		maxSeconds: maxSeconds,
+		account:    newAccountPacer(accountMPS),
+		queues:     map[string]*senderQueue{},
+	}
 }
+
+// effectiveMPS is what one sender delivers with its whole number pool working.
+func (p *senderPool) effectiveMPS() float64 { return p.mps * float64(p.poolSize) }
 
 func (p *senderPool) get(sender string) *senderQueue {
 	if sender == "" {
@@ -167,10 +224,24 @@ func (p *senderPool) get(sender string) *senderQueue {
 	defer p.mu.Unlock()
 	q, ok := p.queues[sender]
 	if !ok {
-		q = newSenderQueue(p.mps, p.maxSeconds)
+		q = newSenderQueue(p.effectiveMPS(), p.maxSeconds)
 		p.queues[sender] = q
 	}
 	return q
+}
+
+// admit places a message on its sender's queue and applies the account
+// ceiling on top, returning whichever wait is longer. A sender with spare
+// capacity still waits when the account as a whole is saturated.
+func (p *senderPool) admit(sender string, now time.Time) (time.Duration, bool) {
+	wait, ok := p.get(sender).admit(now)
+	if !ok {
+		return 0, false
+	}
+	if acct := p.account.reserve(now); acct > wait {
+		wait = acct
+	}
+	return wait, true
 }
 
 func (p *senderPool) snapshot() map[string]int {

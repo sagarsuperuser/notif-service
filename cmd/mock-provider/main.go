@@ -45,6 +45,13 @@ type config struct {
 	// draining at this rate: 1 for a US long code, 100+ for a short code.
 	// 0 disables pacing.
 	SenderMPS float64 `envconfig:"MOCK_SENDER_MPS" default:"0"`
+	// Numbers behind each sender. A Messaging Service load-balances across a
+	// pool, so a sender's throughput is this many times MOCK_SENDER_MPS. This is
+	// the lever a campaign pulls to finish sooner.
+	SenderPoolSize int `envconfig:"MOCK_SENDER_POOL_SIZE" default:"1"`
+	// Account-wide ceiling across all senders. Buying more numbers stops helping
+	// here. 0 disables it.
+	AccountMPS float64 `envconfig:"MOCK_ACCOUNT_MPS" default:"0"`
 	// How many seconds of traffic a sender may hold before 30001 queue overflow.
 	QueueMaxSeconds     int    `envconfig:"MOCK_QUEUE_MAX_SECONDS" default:"14400"`
 	TimeoutDelayMs      int    `envconfig:"MOCK_TIMEOUT_DELAY_MS" default:"12000"`
@@ -120,7 +127,7 @@ func main() {
 		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		client:  &http.Client{Timeout: 5 * time.Second},
 		gate:    newConcurrencyGate(cfg.MaxConcurrent),
-		senders: newSenderPool(cfg.SenderMPS, cfg.QueueMaxSeconds),
+		senders: newSenderPool(cfg.SenderMPS, cfg.SenderPoolSize, cfg.QueueMaxSeconds, cfg.AccountMPS),
 	}
 
 	router := mux.NewRouter()
@@ -291,7 +298,7 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if sender == "" {
 		sender = r.Form.Get("From")
 	}
-	queueWait, admitted := s.senders.get(sender).admit(time.Now())
+	queueWait, admitted := s.senders.admit(sender, time.Now())
 	if !admitted {
 		writeError(w, http.StatusTooManyRequests, 30001,
 			"Queue overflow: this sender has more than the maximum queued messages")
