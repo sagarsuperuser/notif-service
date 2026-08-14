@@ -3,13 +3,22 @@ package observability
 import "github.com/prometheus/client_golang/prometheus"
 
 var (
+	// "path", not "endpoint". Prometheus Operator reserves `endpoint` for the
+	// name of the Service PORT it scraped, and overwrites whatever the
+	// application put there. A counter labelled endpoint="/v1/sms/messages"
+	// arrives in Prometheus as endpoint="metrics", so every query written
+	// against the path silently returns nothing — the data is present and
+	// correct, and the dashboard is empty.
+	//
+	// Found when a webhook panel came back blank while a direct scrape of the
+	// same pod showed 601,385 requests.
 	APIRequests = prometheus.NewCounterVec(
 		prometheus.CounterOpts{Name: "notif_api_requests_total", Help: "API requests"},
-		[]string{"endpoint", "status"},
+		[]string{"path", "status"},
 	)
 	WebhookRequests = prometheus.NewCounterVec(
 		prometheus.CounterOpts{Name: "notif_webhook_requests_total", Help: "Webhook requests"},
-		[]string{"endpoint", "status"},
+		[]string{"path", "status"},
 	)
 	Enqueues = prometheus.NewCounterVec(
 		prometheus.CounterOpts{Name: "notif_enqueue_total", Help: "SQS enqueue results"},

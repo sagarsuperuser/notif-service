@@ -54,3 +54,28 @@ spec:
     - port: metrics
       path: /metrics
       interval: 30s
+---
+# The provider simulator. Its callback counters — attempts, retries, transport
+# failures — are what distinguish a lost response from a rejected one, and that
+# distinction took several runs to establish because nothing was scraping them.
+#
+# Scraped on the http port rather than a metrics port: the simulator serves
+# /metrics from the same router as the Twilio API it emulates.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: notif-mock-provider
+  namespace: monitoring
+  labels:
+    release: kps
+spec:
+  namespaceSelector:
+    matchNames:
+      - default
+  selector:
+    matchLabels:
+      app: notif-mock-provider
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
