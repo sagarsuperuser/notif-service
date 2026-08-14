@@ -349,3 +349,84 @@ func TestCreateMessage_ConcurrentDuplicateKeys(t *testing.T) {
 		t.Errorf("expected exactly 1 message row, got %d", rows)
 	}
 }
+
+// TestCreateMessage_ConcurrentDuplicatesUnderHeavyContention is a wider version
+// of the duplicate-key test, written after CI caught a failure the 16-goroutine
+// version misses:
+//
+//	create_message_test.go:329: concurrent duplicate: no rows in result set
+//
+// The mechanism is snapshot isolation around ON CONFLICT DO NOTHING. DO NOTHING
+// neither returns a row nor waits for the conflicting transaction, so a caller
+// that loses the race gets nothing from the insert AND nothing from a
+// subsequent read of the same key, because its statement snapshot predates the
+// winner's commit. Both branches come back empty and the caller sees an error
+// for a request that succeeded.
+//
+// It is timing-dependent and rare — it did not reproduce in 40 local runs of
+// the narrower test — so this widens the window rather than claiming to close
+// it: more contenders, several keys at once, repeated rounds.
+func TestCreateMessage_ConcurrentDuplicatesUnderHeavyContention(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	s := pg.New(db)
+	now := util.NowUTC()
+
+	insertTenant(t, db, "hc")
+	const keys = 8
+	const perKey = 24
+	for k := 0; k < keys; k++ {
+		phone := fmt.Sprintf("+1555990%04d", k)
+		if _, err := db.Exec(context.Background(),
+			`INSERT INTO consents (tenant_id, phone, channel, status) VALUES ('hc',$1,'sms','opted_in')`,
+			phone); err != nil {
+			t.Fatalf("consent: %v", err)
+		}
+	}
+
+	for round := 0; round < 5; round++ {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		errs := []error{}
+		ids := map[string]map[string]bool{}
+
+		start := make(chan struct{})
+		for k := 0; k < keys; k++ {
+			idem := fmt.Sprintf("hc-%d-%d", round, k)
+			phone := fmt.Sprintf("+1555990%04d", k)
+			ids[idem] = map[string]bool{}
+			for c := 0; c < perKey; c++ {
+				wg.Add(1)
+				go func(idem, phone string, c int) {
+					defer wg.Done()
+					<-start
+					res, err := s.CreateMessage(context.Background(), store.CreateMessageInput{
+						ID:       fmt.Sprintf("%s-%d", idem, c),
+						TenantID: "hc", IdemKey: idem, To: phone, TemplateID: "tpl",
+						Vars: map[string]string{"n": "1"}, Day: now, MaxPerDay: 100000, Now: now,
+					})
+					mu.Lock()
+					defer mu.Unlock()
+					if err != nil {
+						errs = append(errs, err)
+						return
+					}
+					ids[idem][res.MessageID] = true
+				}(idem, phone, c)
+			}
+		}
+		close(start)
+		wg.Wait()
+
+		if len(errs) > 0 {
+			t.Fatalf("round %d: %d of %d concurrent creates errored; first: %v — "+
+				"a duplicate key must resolve to the existing row, never to an error",
+				round, len(errs), keys*perKey, errs[0])
+		}
+		for idem, set := range ids {
+			if len(set) != 1 {
+				t.Errorf("round %d key %s resolved to %d distinct message ids, want 1", round, idem, len(set))
+			}
+		}
+	}
+}
