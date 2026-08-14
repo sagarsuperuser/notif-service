@@ -3,34 +3,56 @@ bastion_ssh_cidr  = "116.0.0.0/8"
 key_name          = "apps"
 pause_environment = false
 
-# Instance types (override defaults if you want)
+# Instance types.
+#
+# Everything that carries load is non-burstable. t-family instances accrue CPU
+# credits while idle and are throttled to a baseline once those are spent, so a
+# sustained run decays partway through and the same test returns a different
+# number depending on how long the box sat idle first. That is fine for spiky
+# production traffic and useless for a measurement.
+#
+# x86 rather than Graviton because the node AMI is amd64-only; the container
+# images are multi-arch, but the instances would not boot. Not worth the risk
+# for the ~10% price difference.
+#
+# The bastion stays burstable on purpose: it is an SSH entry point, never in
+# the data path, and paying for sustained performance there buys nothing.
 instance_types = {
   bastion              = "t3.small"
-  k3s_server           = "t3.medium"
-  k3s_agent_default    = "t3.small"
-  k3s_agent_monitoring = "t3.medium"
+  k3s_server           = "m7i.large"
+  k3s_agent_default    = "c7i.large"
+  k3s_agent_monitoring = "m7i.large"
 }
 
+# Unused: the spot fleets are zeroed below. Kept so the variable stays declared.
 spot_instance_types = {
-  worker        = ["t3.small", "t3a.small"]
-  general       = ["t3.small", "t3a.small"]
-  mock_provider = ["t3.small", "t3a.small"]
+  worker        = ["c7i.large"]
+  general       = ["c7i.large"]
+  mock_provider = ["c7i.large"]
 }
 
-# k3s agents (on-demand)
+# k3s agents (on-demand).
+#
+# monitoring is sized for three because the load generator runs there. k6 has
+# no node constraints of its own, so it would otherwise schedule onto the
+# general pool alongside the API pods — the load generator competing for CPU
+# with the component being measured, which makes the result a measurement of
+# the test harness. The monitoring pool is tainted, so nothing else lands on it.
 k3s_agents_on_demand = {
-  monitoring    = 1
+  monitoring    = 3
   mock_provider = 2
-  worker        = 2
+  worker        = 3
   ingress       = 1
-  general       = 2
+  general       = 3
 }
 
-# k3s agents (spot ASGs)
+# No spot. A spot interruption part-way through a run silently removes capacity
+# and the throughput number quietly becomes a number about that interruption.
+# Reproducibility is worth more here than the discount.
 k3s_agents_spot = {
-  worker        = 4
-  general       = 7
-  mock_provider = 5
+  worker        = 0
+  general       = 0
+  mock_provider = 0
 }
 
 # RDS sizing (16 GiB RAM / 4 vCPU).
