@@ -45,9 +45,11 @@ type config struct {
 	// draining at this rate: 1 for a US long code, 100+ for a short code.
 	// 0 disables pacing.
 	SenderMPS float64 `envconfig:"MOCK_SENDER_MPS" default:"0"`
-	// Numbers behind each sender. A Messaging Service load-balances across a
-	// pool, so a sender's throughput is this many times MOCK_SENDER_MPS. This is
-	// the lever a campaign pulls to finish sooner.
+	// Numbers behind each sender. Defaults to 1 deliberately: adding numbers to
+	// raise US throughput is "snowshoeing", which providers discourage and which
+	// does not multiply 10DLC throughput because the rate is allocated per
+	// campaign. Raise this only for cases where it is legitimate, such as
+	// non-US long codes.
 	SenderPoolSize int `envconfig:"MOCK_SENDER_POOL_SIZE" default:"1"`
 	// Account-wide ceiling across all senders. Buying more numbers stops helping
 	// here. 0 disables it.

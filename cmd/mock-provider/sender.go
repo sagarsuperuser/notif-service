@@ -187,18 +187,34 @@ type senderPool struct {
 	queues     map[string]*senderQueue
 }
 
-// newSenderPool models a sender as a Messaging Service holding poolSize
-// numbers, each running at mps.
+// newSenderPool models a sender running at mps, optionally spread across
+// poolSize numbers.
 //
-// This is the lever a campaign actually pulls. A single US long code does one
-// message per second, so a hundred thousand messages take over a day; the same
-// hundred thousand across a pool of two hundred numbers takes about eight
-// minutes. Provider documentation describes exactly this — load-balancing a
-// Messaging Service across a number pool — and it is why "how fast can we send
-// this campaign" is a sender-provisioning question before it is an engineering
-// one.
+// IMPORTANT, and the opposite of the intuitive answer: for US and Canadian
+// traffic, poolSize does NOT multiply throughput, and modelling it that way
+// would teach the wrong lesson.
 //
-// accountMPS caps the total across all senders, because buying numbers stops
+// Twilio's documentation is explicit: "We caution against adding more long
+// code phone numbers to your Messaging Service's Sender Pool to distribute the
+// load, a practice known as 'snowshoeing'", and "Using multiple long code or
+// Toll-Free numbers to increase your message throughput to the US or Canada is
+// strongly discouraged." Under A2P 10DLC the rate is allocated per CAMPAIGN
+// rather than per number, so numbers added to one campaign share a single
+// allowance rather than each bringing their own. Carriers also filter traffic
+// that looks snowshoed.
+//
+// So poolSize defaults to 1 and multiplies only when explicitly configured,
+// which is defensible for non-US long codes (10 MPS each) and for genuinely
+// separate campaigns. The lever that works for US traffic is upgrading the
+// sender class — toll-free from 3 MPS to 25+, or a short code at 100 — and
+// that goes through the provider's sales and registration process, not through
+// provisioning more numbers.
+//
+// The useful conclusion for a campaign is therefore uncomfortable: the fastest
+// path is bounded by a commercial and registration lead time, not by anything
+// that can be built.
+//
+// accountMPS caps the total across all senders, because sender upgrades stop
 // helping once the account ceiling is reached.
 func newSenderPool(mps float64, poolSize, maxSeconds int, accountMPS float64) *senderPool {
 	if poolSize < 1 {
