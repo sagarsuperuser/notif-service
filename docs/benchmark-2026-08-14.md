@@ -29,7 +29,14 @@ Every instance carrying load is non-burstable. t-family instances throttle once
 their CPU credits are spent, which makes a sustained run decay partway through
 and stop being reproducible.
 
-## Sustained: 2,000 rps
+## What "2,000 rps" is and is not
+
+It is **accepts** per second, not sends. An accept is one Postgres write plus a
+durable SQS enqueue, answered with 202. It is not a delivered SMS.
+
+Sends are a separate and much smaller number, below.
+
+## Sustained accepts: 2,000 rps
 
 Three minutes at a constant arrival rate.
 
@@ -64,13 +71,45 @@ the whole ladder is 1.52s, dominated by the top two steps.
 At 1,000 rps the run needed ~16 concurrent connections to hold the rate, which
 puts per-request latency around 16ms — the API tier was at 12% CPU.
 
+## Sends: ~142/s, and that is the real ceiling
+
+The number that matters for anything time-sensitive is how fast messages LEAVE
+the queue, and it is far below the accept rate.
+
+Over the ramp, 1,479,081 messages were accepted and 1,374,558 were still
+queued at the end, so roughly 104,500 were sent in about 735 seconds:
+
+```
+send throughput     ~142/s
+```
+
+That is exactly two worker pods times TWILIO_RPS_PER_POD=70 — the configured
+per-pod provider rate limit, not a property of the code. The receiving end was
+the mock provider, not a real one.
+
+So this run demonstrates an accept path that sustains 2,000/s and a send path
+that sustained ~142/s against a synthetic provider. Quoting the first number
+without the second describes a system that accepts work far faster than it can
+do it.
+
 ## Correctness
 
 Throughput means nothing on its own. A number this size is easy to reach by
 dropping, double-sending, or double-charging a recipient's daily cap, and none
 of those shows up in a latency histogram.
 
-Checked against the database over all 1,479,081 accepted messages:
+The repository defines eight invariants (internal/verify/invariants.go). The
+table below reports six of them, checked with direct SQL over all 1,479,081
+accepted messages.
+
+**cmd/verify-run was not run, and would have failed this run.** Its
+"no message was left queued" check treats a queued message as a silent drop and
+is meant to run after the queue has drained; 1,374,558 were still queued, so it
+would report that many violations and exit non-zero. The two daily-cap checks
+are also absent here because the cap was configured at 1,000,000 and nothing
+could approach it.
+
+Read the table as "these six held", not as "the suite passed":
 
 | invariant | result |
 |---|---|
@@ -79,7 +118,12 @@ Checked against the database over all 1,479,081 accepted messages:
 | idempotency keys unique per tenant | **0 violations** |
 | suppressed messages never sent | **0 violations** |
 | nothing stuck mid-flight | **0 violations** |
-| messages in DLQ | **0** |
+| messages in DLQ | **0** — see caveat |
+
+The DLQ result is a null result rather than a pass. Redrive fires after five
+receives (sqs_send_max_receive_count = 5) and about 93% of the corpus had never
+been received even once when this was measured, so an empty DLQ was
+arithmetically guaranteed regardless of whether the system is correct.
 
 The count is worth its own line: k6 reported 1,479,077 requests accepted, and
 the database holds 1,479,081 rows — those requests plus four from the earlier
@@ -102,6 +146,13 @@ delivered.
   per-deployment decision and was out of scope here.
 - **A tuned ceiling.** 5,000 rps is where the ladder stopped, not where the
   service stopped. Nothing was dropped there.
+- **Any before/after attribution.** There is no before column. The earlier run
+  in docs/500rps-10m-rps/ was taken on a burstable db.t4g.xlarge with spot
+  workers, and this one on a non-burstable db.m7g.xlarge, so the difference
+  between them cannot be attributed to the code changes.
+- **A real provider.** Every send here went to the in-cluster mock. At the time
+  of this run the mock did not model Twilio's concurrency limit or its
+  per-sender MPS pacing, so it cannot stand in for provider-side behaviour.
 - **Control-plane HA.** A single k3s server, because this AWS account cannot
   currently create load balancers and agents join on the server's private IP.
   The control plane schedules pods and does not carry requests.
