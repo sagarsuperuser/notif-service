@@ -16,3 +16,38 @@ resource "aws_iam_role_policy_attachment" "k3s_nodes_ssm" {
   role       = aws_iam_role.k3s_nodes.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
+
+# SQS access for the pods.
+#
+# Without this the application needs a static access key in a Kubernetes
+# secret — a long-lived credential in the cluster, rotated by hand, and one
+# that grants whatever the IAM user behind it happens to hold. The instance
+# role gives the same access with no secret to leak or rotate, scoped to the
+# two queues this service actually uses.
+resource "aws_iam_role_policy" "k3s_nodes_sqs" {
+  name = "${local.name}-k3s-nodes-sqs"
+  role = aws_iam_role.k3s_nodes.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage",
+          "sqs:SendMessageBatch",
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:DeleteMessageBatch",
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+          "sqs:ChangeMessageVisibility",
+        ]
+        Resource = [
+          aws_sqs_queue.main.arn,
+          aws_sqs_queue.dlq.arn,
+        ]
+      },
+    ]
+  })
+}
