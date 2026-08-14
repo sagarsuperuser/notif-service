@@ -1,0 +1,138 @@
+# Step ramp: find the rate at which the accept path stops keeping up.
+#
+# A single fixed-rate run only tells you whether that rate works. It cannot
+# tell you where the limit is, and a run at a rate well under the limit looks
+# identical to a run at half that rate. This holds a series of increasing rates
+# long enough for queues to reach steady state at each one, so the knee shows
+# up as the step where latency departs from flat.
+#
+# The load generator is pinned to the monitoring pool. k6 has no scheduling
+# constraints by default, so it would otherwise land on the general pool
+# alongside the API pods — the generator competing for CPU with the thing being
+# measured, which turns the result into a statement about the harness.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-notif-api-stepramp
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        workload: monitoring
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: "monitoring"
+          effect: NoSchedule
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args: ["run", "--summary-trend-stats", "avg,min,med,p(95),p(99),max", "/scripts/stepramp.js"]
+          resources:
+            requests:
+              cpu: "1500m"
+              memory: "1Gi"
+          env:
+            - name: API_URL
+              value: "http://notif-api-svc/v1/sms/messages"
+            - name: STAGE_SECONDS
+              value: "180"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-notif-api-stepramp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-notif-api-stepramp
+data:
+  stepramp.js: |
+    import http from 'k6/http';
+    import { check } from 'k6';
+    import exec from 'k6/execution';
+    import { Trend, Rate } from 'k6/metrics';
+
+    const STAGE = __ENV.STAGE_SECONDS || '180';
+
+    // Held rates, in requests per second. Each is sustained long enough for the
+    // SQS backlog and the worker pool to settle, so what is measured at each
+    // step is steady state rather than the transient from the step before.
+    const RATES = [200, 500, 1000, 2000, 3000, 4000, 5000];
+
+    export const options = {
+      discardResponseBodies: true,
+      scenarios: {
+        step: {
+          executor: 'ramping-arrival-rate',
+          startRate: 100,
+          timeUnit: '1s',
+          preAllocatedVUs: 500,
+          maxVUs: 4000,
+          stages: RATES.flatMap((r) => ([
+            // A short ramp into each step, then the held measurement window.
+            { target: r, duration: '15s' },
+            { target: r, duration: `${STAGE}s` },
+          ])),
+        },
+      },
+      // The run fails if the service stops doing its job. Without thresholds a
+      // step ramp always "passes" and the knee becomes a judgement call made
+      // while reading a graph.
+      thresholds: {
+        'http_req_failed': ['rate<0.001'],
+        'accepted': ['rate>0.999'],
+        // 202 is an accept, not a delivery: this bounds how long the caller
+        // waits to be told the send is durably queued.
+        'http_req_duration{expected_response:true}': ['p(99)<500'],
+      },
+    };
+
+    const acceptRate = new Rate('accepted');
+    const acceptLatency = new Trend('accept_latency', true);
+
+    const API_URL = __ENV.API_URL || 'http://notif-api-svc/v1/sms/messages';
+    const PHONE_POOL_SIZE = 100000;   // matches the opted-in range in seed.sql
+    const PHONE_PREFIX = '+199900';
+
+    export default function () {
+      const it = exec.scenario.iterationInTest;
+      // Unique per iteration, so every request is a genuinely new send rather
+      // than an idempotent replay of one already in the database. A replay
+      // takes a different and cheaper path, and a benchmark built on them
+      // measures the retry branch.
+      const key = `sr-${exec.instance.iterationsCompleted}-${__VU}-${it}`;
+      const to = `${PHONE_PREFIX}${String(it % PHONE_POOL_SIZE).padStart(5, '0')}`;
+
+      const res = http.post(API_URL, JSON.stringify({
+        tenantId: 'foodapp',
+        idempotencyKey: key,
+        to,
+        templateId: 'txn_confirm_v1',
+        vars: { name: 'Bench', ref: key },
+      }), {
+        headers: { 'Content-Type': 'application/json', 'X-Test-Run': 'stepramp' },
+        tags: { name: 'accept' },
+      });
+
+      const ok = res.status === 202;
+      acceptRate.add(ok);
+      acceptLatency.add(res.timings.duration);
+      check(res, { 'accepted (202)': () => ok });
+    }
+
+    export function handleSummary(data) {
+      // Printed so the held rates are recorded alongside the numbers rather
+      // than living only in this file.
+      const line = `stages held (rps): ${RATES.join(', ')} @ ${STAGE}s each\n`;
+      return {
+        stdout: line + JSON.stringify(data.metrics, null, 2) + '\n',
+        '/dev/stdout': line,
+      };
+    }
