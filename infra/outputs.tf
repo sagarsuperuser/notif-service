@@ -1,11 +1,11 @@
 output "vpc_id" { value = aws_vpc.this.id }
 
 output "api_nlb_dns" {
-  value = aws_lb.api.dns_name
+  value = one(aws_lb.api[*].dns_name)
 }
 
 output "ingress_nlb_dns" {
-  value = aws_lb.ingress.dns_name
+  value = one(aws_lb.ingress[*].dns_name)
 }
 
 output "bastion_public_ip" {
@@ -34,4 +34,14 @@ output "sqs_dlq_url" { value = aws_sqs_queue.dlq.url }
 output "k3s_token" {
   value     = random_password.k3s_token.result
   sensitive = true
+}
+
+output "k3s_server_private_ips" {
+  description = "Control-plane addresses. Without a load balancer this is how agents and kubectl reach the API."
+  value       = aws_instance.k3s_server[*].private_ip
+}
+
+output "k3s_api_endpoint" {
+  description = "The address agents join through — the NLB when there is one, the single server's private IP otherwise."
+  value       = local.k3s_api_endpoint
 }
