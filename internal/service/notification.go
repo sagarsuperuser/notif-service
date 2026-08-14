@@ -11,13 +11,9 @@ import (
 )
 
 type Store interface {
-	FindMessageByIdempotency(ctx context.Context, tenantID, idemKey string) (store.IdempotencyResult, error)
-	InsertMessage(ctx context.Context, in store.MessageInsert) error
+	CreateMessage(ctx context.Context, in store.CreateMessageInput) (store.CreateMessageResult, error)
 	MarkMessageState(ctx context.Context, in store.MessageStateUpdate) error
 	GetMessage(ctx context.Context, msgID string) (store.Message, bool, error)
-	IsSuppressed(ctx context.Context, tenantID, phone string) (bool, error)
-	IsOptedIn(ctx context.Context, tenantID, phone string) (bool, error)
-	IncrementDailyCap(ctx context.Context, tenantID, phone string, day time.Time, maxPerDay int) (allowed bool, newCount int, err error)
 }
 
 type Queue interface {
@@ -33,15 +29,9 @@ type NotificationService struct {
 func (s *NotificationService) CreateAndEnqueueSMS(ctx context.Context, req domain.SendSMSRequest, messageID string, now time.Time) (domain.CreateResponse, error) {
 	req.To = util.NormalizePhone(req.To)
 
-	// 1) idempotency
-	if res, err := s.Store.FindMessageByIdempotency(ctx, req.TenantID, req.IdempotencyKey); err != nil {
-		return domain.CreateResponse{}, err
-	} else if res.Found {
-		return domain.CreateResponse{MessageID: res.MessageID, State: res.State}, nil
-	}
-
-	// 2) create message row
-	if err := s.Store.InsertMessage(ctx, store.MessageInsert{
+	// 1) One round-trip decides everything the database owns: idempotency,
+	// suppression, consent, the daily cap, and the message row itself.
+	res, err := s.Store.CreateMessage(ctx, store.CreateMessageInput{
 		ID:         messageID,
 		TenantID:   req.TenantID,
 		IdemKey:    req.IdempotencyKey,
@@ -49,59 +39,24 @@ func (s *NotificationService) CreateAndEnqueueSMS(ctx context.Context, req domai
 		TemplateID: req.TemplateID,
 		Vars:       req.Vars,
 		CampaignID: req.CampaignID,
-		State:      string(domain.StateQueued),
+		Day:        now,
+		MaxPerDay:  s.MaxPerDay,
 		Now:        now,
-	}); err != nil {
-		return domain.CreateResponse{}, err
-	}
-
-	// 3) suppression
-	isSup, err := s.Store.IsSuppressed(ctx, req.TenantID, req.To)
-	if err != nil {
-		return domain.CreateResponse{}, err
-	} else if isSup {
-		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
-			ID:        messageID,
-			State:     string(domain.StateSuppressed),
-			LastError: "suppressed",
-			Now:       now,
-		}); err != nil {
-			return domain.CreateResponse{}, err
-		}
-		return domain.CreateResponse{MessageID: messageID, State: string(domain.StateSuppressed)}, nil
-	}
-
-	// 4) consent
-	if ok, err := s.Store.IsOptedIn(ctx, req.TenantID, req.To); err != nil {
-		return domain.CreateResponse{}, err
-	} else if !ok {
-		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
-			ID:        messageID,
-			State:     string(domain.StateSuppressed),
-			LastError: "not_opted_in",
-			Now:       now,
-		}); err != nil {
-		}
-		return domain.CreateResponse{MessageID: messageID, State: string(domain.StateSuppressed)}, nil
-	}
-
-	// 5) caps
-	allowed, _, err := s.Store.IncrementDailyCap(ctx, req.TenantID, req.To, now, s.MaxPerDay)
+	})
 	if err != nil {
 		return domain.CreateResponse{}, err
 	}
-	if !allowed {
-		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
-			ID:        messageID,
-			State:     string(domain.StateSuppressed),
-			LastError: "cap_exceeded",
-			Now:       now,
-		}); err != nil {
-		}
-		return domain.CreateResponse{MessageID: messageID, State: string(domain.StateSuppressed)}, nil
+
+	// An idempotent retry returns whatever the first request decided — including
+	// re-enqueueing nothing, since the original already did.
+	if res.Existing {
+		return domain.CreateResponse{MessageID: res.MessageID, State: res.State}, nil
+	}
+	if res.State != string(domain.StateQueued) {
+		return domain.CreateResponse{MessageID: res.MessageID, State: res.State}, nil
 	}
 
-	// 6) enqueue
+	// 2) enqueue
 	if err := s.Queue.EnqueueSMS(ctx, req.TenantID, messageID, req.IdempotencyKey, req.To, req.TemplateID, req.Vars, req.CampaignID); err != nil {
 		observability.Enqueues.WithLabelValues("error").Inc()
 		if err := s.Store.MarkMessageState(ctx, store.MessageStateUpdate{
