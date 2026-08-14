@@ -25,7 +25,21 @@ import (
 // budget.
 func newHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: 15 * time.Second,
+		// Deliberately no client-level Timeout.
+		//
+		// http.Client.Timeout covers the whole request including the time spent
+		// reading the response, so it is a ceiling on how long ANY call may take.
+		// ReceiveMessage with long polling deliberately holds the connection open
+		// for up to WaitTimeSeconds — 20 by default — waiting for a message to
+		// arrive. A 15-second client timeout therefore killed every empty poll
+		// before it could return, and the worker could not consume at all while
+		// the API, whose SendMessage returns immediately, looked perfectly
+		// healthy.
+		//
+		// Per-request deadlines are the right place for this: the SDK sets its
+		// own, callers pass contexts, and the dial and TLS timeouts below still
+		// bound connection setup. A single number here cannot be correct for both
+		// a 10ms send and a 20s long poll.
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
