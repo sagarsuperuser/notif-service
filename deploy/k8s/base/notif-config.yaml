@@ -6,8 +6,6 @@ data:
   # Common
   AWS_REGION: "ap-south-1"
   SQS_QUEUE_URL: "https://sqs.ap-south-1.amazonaws.com/139831607173/notif-prod-test-send.fifo"
-  # Webhook ingest-only queue (optional; used when WEBHOOK_USE_QUEUE=true on notif-webhook)
-  WEBHOOK_EVENTS_QUEUE_URL: "https://sqs.ap-south-1.amazonaws.com/139831607173/notif-prod-test-webhook-events"
   MAX_SMS_PER_DAY: "1000000"
   PUBLIC_WEBHOOK_URL: "http://notif-webhook-svc/v1/webhooks/twilio/status"
 
@@ -32,4 +30,3 @@ data:
   SQS_GROUP_BUCKETS: "5000"
 
   # Webhook behavior knobs
-  WEBHOOK_USE_QUEUE: "true"

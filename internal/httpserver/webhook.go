@@ -2,7 +2,6 @@ package httpserver
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -11,36 +10,45 @@ import (
 	"github.com/gorilla/mux"
 
 	"notif/internal/observability"
-	sqsqueue "notif/internal/queue/sqs"
 	"notif/internal/store"
 	"notif/internal/util"
 )
 
 type WebhookStore interface {
-	InsertDeliveryEvent(ctx context.Context, in store.DeliveryEvent) error
-	UpdateMessageByProviderMsgID(ctx context.Context, in store.ProviderMsgUpdate) (bool, error)
-}
-
-type WebhookEnqueuer interface {
-	Enqueue(ctx context.Context, ev sqsqueue.WebhookEvent) error
+	RecordDeliveryEvent(ctx context.Context, in store.DeliveryEventRecord) (bool, error)
 }
 
 type Webhook struct {
 	Store           WebhookStore
-	Enqueuer        WebhookEnqueuer
 	VerifySignature func(authToken, fullURL, provided string, form url.Values) bool
 	AuthToken       string
 	PublicURL       string
-
-	// If true, this handler becomes "ingest-only": validate signature and enqueue the event to SQS.
-	// This keeps provider callbacks fast and protects the DB during webhook floods.
-	UseQueue bool
 }
 
 func (w *Webhook) Register(mux *mux.Router) {
 	mux.HandleFunc("/v1/webhooks/twilio/status", w.handleTwilioStatus).Methods(http.MethodPost)
 }
 
+// handleTwilioStatus ingests one provider callback with exactly one database
+// round-trip and answers 200 for every outcome the provider can act on.
+//
+// Two deliberate departures from the previous implementation, both of which
+// were the cause of database timeouts under load rather than a symptom:
+//
+//   - No retry loop. The previous version retried the message UPDATE up to ten
+//     times with backoff sleeps totalling ~1.4s while HOLDING a pooled
+//     connection. At webhook rates a few times the send rate, that exhausts a
+//     20-connection pool almost immediately; requests then queue waiting for a
+//     connection and time out. The database itself is barely involved.
+//   - No 503 when the message row is missing. A callback legitimately races the
+//     worker's provider_msg_id write, and answering 503 made the provider
+//     redeliver the whole event — so the failure generated more load, which
+//     caused more failures. The event is recorded regardless and the reconcile
+//     job repairs the message, so a miss costs one reconcile interval instead
+//     of a redelivery storm.
+//
+// 5xx is now reserved for a genuine store failure, where a provider retry is
+// the correct response.
 func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(rw, ErrBadForm, http.StatusBadRequest)
@@ -48,6 +56,10 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 	}
 	if w.VerifySignature == nil || !w.VerifySignature(w.AuthToken, w.PublicURL, r.Header.Get("X-Twilio-Signature"), r.PostForm) {
 		http.Error(rw, ErrInvalidSignature, http.StatusUnauthorized)
+		return
+	}
+	if w.Store == nil {
+		http.Error(rw, ErrDependency, http.StatusInternalServerError)
 		return
 	}
 
@@ -65,114 +77,37 @@ func (w *Webhook) handleTwilioStatus(rw http.ResponseWriter, r *http.Request) {
 		newState = "failed"
 	}
 
-	if w.UseQueue {
-		if w.Enqueuer == nil {
-			http.Error(rw, ErrDependency, http.StatusInternalServerError)
-			return
-		}
-
-		enqueueCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := w.Enqueuer.Enqueue(enqueueCtx, sqsqueue.WebhookEvent{
-			Provider:      "twilio",
-			ProviderMsgID: msgSid,
-			Status:        status,
-			ErrorCode:     errCode,
-			ReceivedAt:    util.NowUTC(),
-			// Payload intentionally omitted in queue mode (keeps messages small and reduces DB write load).
-		}); err != nil {
-			slog.Error("webhook enqueue failed", "err", err, "message_sid", msgSid, "status", status)
-			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
-			return
-		}
-		rw.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Don't couple DB writes to the client connection. Providers can time out and disconnect while
-	// we still want to persist and apply the event. Bound it with a timeout instead.
+	// Not bound to the client connection: the provider can time out and hang up
+	// while we still want the event persisted.
 	dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if w.Store == nil {
-		http.Error(rw, ErrDependency, http.StatusInternalServerError)
-		return
-	}
-
-	if err := w.Store.InsertDeliveryEvent(dbCtx, store.DeliveryEvent{
+	matched, err := w.Store.RecordDeliveryEvent(dbCtx, store.DeliveryEventRecord{
 		Provider:      "twilio",
 		ProviderMsgID: msgSid,
 		VendorStatus:  status,
 		ErrorCode:     errCode,
 		Payload:       r.PostForm,
 		OccurredAt:    nil,
-	}); err != nil {
-		slog.Error("webhook insert delivery event failed", "err", err, "message_sid", msgSid, "status", status)
-		// Treat DB timeouts as transient: ask provider to retry.
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
-			return
-		}
-		http.Error(rw, ErrDependency, http.StatusInternalServerError)
+		NewState:      newState,
+		Now:           util.NowUTC(),
+	})
+	if err != nil {
+		slog.Error("webhook record delivery event failed",
+			"err", err, "message_sid", msgSid, "status", status)
+		http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
 		return
 	}
 
-	// Non-terminal status (queued/sent/etc): store event and return 200.
-	if newState == "" {
-		rw.WriteHeader(http.StatusOK)
-		return
+	// A terminal event that matched no message row: the callback beat the
+	// worker's write, or the message predates this provider id. The event is
+	// already stored, so reconcile-submitted will apply it. Counted so the rate
+	// is visible rather than inferred.
+	if newState != "" && !matched {
+		observability.WebhookMessageUpdateNotFound.WithLabelValues(status).Inc()
+		slog.Warn("webhook event stored but no message matched; reconcile will apply it",
+			"provider", "twilio", "message_sid", msgSid, "status", status, "new_state", newState)
 	}
 
-	// Webhooks can arrive before the worker has persisted provider_msg_id into messages.
-	// If we update once and drop the result, messages can get stuck in "submitted" forever.
-	// Retry briefly; if still not found, return non-2xx so the provider can retry delivery.
-	var updated bool
-	var lastUpdateErr error
-	for attempt := 0; attempt < 10; attempt++ {
-		updated, lastUpdateErr = w.Store.UpdateMessageByProviderMsgID(dbCtx, store.ProviderMsgUpdate{
-			Provider:      "twilio",
-			ProviderMsgID: msgSid,
-			NewState:      newState,
-			LastError:     errCode,
-			Now:           util.NowUTC(),
-		})
-		if lastUpdateErr != nil {
-			break
-		}
-		if updated {
-			rw.WriteHeader(http.StatusOK)
-			return
-		}
-
-		// Backoff: 25ms, 50ms, 75ms, ... up to 250ms. Total worst-case ~1.4s.
-		sleep := time.Duration(25*(attempt+1)) * time.Millisecond
-		t := time.NewTimer(sleep)
-		select {
-		case <-dbCtx.Done():
-			t.Stop()
-			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
-			return
-		case <-t.C:
-		}
-	}
-
-	if lastUpdateErr != nil {
-		slog.Error("webhook update message failed", "err", lastUpdateErr, "message_sid", msgSid, "status", status, "new_state", newState)
-		if errors.Is(lastUpdateErr, context.DeadlineExceeded) || errors.Is(lastUpdateErr, context.Canceled) {
-			http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
-			return
-		}
-		http.Error(rw, ErrDependency, http.StatusInternalServerError)
-		return
-	}
-
-	// Not updated after retries: ask the provider to retry (prevents stuck "submitted").
-	observability.WebhookMessageUpdateNotFound.WithLabelValues(status).Inc()
-	slog.Warn("webhook message not found for provider msg id (retry later)",
-		"provider", "twilio",
-		"message_sid", msgSid,
-		"status", status,
-		"new_state", newState,
-	)
-	http.Error(rw, ErrDependency, http.StatusServiceUnavailable)
+	rw.WriteHeader(http.StatusOK)
 }

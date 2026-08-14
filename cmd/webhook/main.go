@@ -9,17 +9,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"notif/internal/awsutil"
 	"notif/internal/config"
 	"notif/internal/httpserver"
 	"notif/internal/logging"
 	"notif/internal/observability"
 	"notif/internal/providers/twilio"
-	sqsqueue "notif/internal/queue/sqs"
 	"notif/internal/store/pg"
 )
 
@@ -30,37 +27,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var db *pgxpool.Pool
-	var dbStore *pg.Store
-	if !cfg.WebhookUseQueue {
-		var err error
-		db, err = pg.NewPool(ctx, cfg.DBDSN, pg.PoolOptions{
-			MaxConns:          cfg.DBPoolMaxConns,
-			MinConns:          cfg.DBPoolMinConns,
-			MaxConnLifetime:   cfg.DBPoolMaxConnLifetime,
-			MaxConnIdleTime:   cfg.DBPoolMaxConnIdleTime,
-			HealthCheckPeriod: cfg.DBPoolHealthCheckPeriod,
-		})
-		if err != nil {
-			slog.Error("webhook db connect failed", "err", err)
-			os.Exit(1)
-		}
-		dbStore = pg.New(db)
+	db, err := pg.NewPool(ctx, cfg.DBDSN, pg.PoolOptions{
+		MaxConns:          cfg.DBPoolMaxConns,
+		MinConns:          cfg.DBPoolMinConns,
+		MaxConnLifetime:   cfg.DBPoolMaxConnLifetime,
+		MaxConnIdleTime:   cfg.DBPoolMaxConnIdleTime,
+		HealthCheckPeriod: cfg.DBPoolHealthCheckPeriod,
+	})
+	if err != nil {
+		slog.Error("webhook db connect failed", "err", err)
+		os.Exit(1)
 	}
-
-	var enq httpserver.WebhookEnqueuer
-	if cfg.WebhookUseQueue {
-		if cfg.WebhookEventsQueueURL == "" {
-			slog.Error("webhook queue mode enabled but WEBHOOK_EVENTS_QUEUE_URL is empty")
-			os.Exit(1)
-		}
-		sqsClient, err := awsutil.NewSQSClient(ctx, cfg.AWSRegion, cfg.LocalstackEndpoint)
-		if err != nil {
-			slog.Error("webhook sqs client init failed", "err", err)
-			os.Exit(1)
-		}
-		enq = &sqsqueue.WebhookProducer{SQS: sqsClient, QueueURL: cfg.WebhookEventsQueueURL}
-	}
+	dbStore := pg.New(db)
 
 	reg := prometheus.DefaultRegisterer
 	observability.RegisterWebhook(reg)
@@ -70,21 +48,15 @@ func main() {
 	s.Mux.Use(httpserver.Logging)
 
 	s.Mux.HandleFunc("/healthz", httpserver.Healthz()).Methods(http.MethodGet)
-	if db != nil {
-		s.Mux.HandleFunc("/readyz", httpserver.Readyz(2*time.Second, func(ctx context.Context) error {
-			return db.Ping(ctx)
-		})).Methods(http.MethodGet)
-	} else {
-		s.Mux.HandleFunc("/readyz", httpserver.Healthz()).Methods(http.MethodGet)
-	}
+	s.Mux.HandleFunc("/readyz", httpserver.Readyz(2*time.Second, func(ctx context.Context) error {
+		return db.Ping(ctx)
+	})).Methods(http.MethodGet)
 
 	webhook := &httpserver.Webhook{
 		Store:           dbStore,
-		Enqueuer:        enq,
 		VerifySignature: twilio.VerifySignature,
 		AuthToken:       cfg.TwilioAuthToken,
 		PublicURL:       cfg.PublicWebhookURL,
-		UseQueue:        cfg.WebhookUseQueue,
 	}
 	webhook.Register(s.Mux)
 
@@ -133,7 +105,5 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if db != nil {
-		db.Close()
-	}
+	db.Close()
 }

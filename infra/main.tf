@@ -1141,16 +1141,4 @@ resource "aws_sqs_queue" "main" {
 # -------------------------
 # Webhook events queue (standard) + DLQ
 # -------------------------
-resource "aws_sqs_queue" "webhook_events_dlq" {
-  name = "${local.name}-webhook-events-dlq"
-}
 
-resource "aws_sqs_queue" "webhook_events" {
-  name                       = "${local.name}-webhook-events"
-  visibility_timeout_seconds = var.sqs_webhook_events_visibility_timeout_seconds
-
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.webhook_events_dlq.arn
-    maxReceiveCount     = var.sqs_webhook_events_max_receive_count
-  })
-}
