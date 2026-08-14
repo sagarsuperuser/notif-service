@@ -29,11 +29,29 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: sqs
+          AWS_DEFAULT_REGION: ap-south-1
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
     env:
       # The integration suite builds an isolated schema per test against this DSN
       # and applies deploy/k8s/jobs/sql/001_init.sql itself, so no migration step
       # is needed here.
       TEST_DB_DSN: postgres://notif:notif@localhost:5432/notif?sslmode=disable
+      # The queue suite creates a throwaway standard queue per test here.
+      TEST_SQS_ENDPOINT: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: ap-south-1
 
     steps:
       - uses: actions/checkout@v4
@@ -64,13 +82,13 @@ jobs:
       - name: Assert the integration suite really ran
         run: |
           if grep -q '^--- SKIP' integration.log; then
-            echo "::error::integration tests SKIPPED — TEST_DB_DSN is not reaching the suite"
+            echo "::error::integration tests SKIPPED — TEST_DB_DSN or TEST_SQS_ENDPOINT is not reaching the suite"
             grep '^--- SKIP' integration.log
             exit 1
           fi
           ran=$(grep -c '^--- PASS' integration.log || true)
           echo "integration tests executed: $ran"
-          if [ "$ran" -lt 26 ]; then
-            echo "::error::expected at least 26 integration tests to run, saw $ran"
+          if [ "$ran" -lt 29 ]; then
+            echo "::error::expected at least 29 integration tests to run, saw $ran"
             exit 1
           fi

@@ -1118,19 +1118,28 @@ resource "aws_db_proxy_target" "postgres" {
 }
 
 # -------------------------
-# SQS FIFO + DLQ
+# SQS send queue (standard) + DLQ
 # -------------------------
+#
+# Standard, not FIFO. A FIFO queue outside high-throughput mode is capped at 300
+# transactions per second per API action, and 3,000 messages per second even
+# with batching — a ceiling below what this service is built to sustain, bought
+# in exchange for an ordering guarantee nothing here needs. Two SMS to different
+# recipients are unrelated; two to the same recipient are ordered by when the
+# customer sent them, not by the queue.
+#
+# FIFO's deduplication is likewise not load-bearing. The message row's
+# (tenant_id, idempotency_key) unique constraint decides whether a send exists,
+# and the worker's claim decides who may send it. Both outlive SQS's 5-minute
+# deduplication window, which would additionally have swallowed a legitimate
+# resend of the same key on minute four.
 resource "aws_sqs_queue" "dlq" {
-  name                        = "${local.name}-send-dlq.fifo"
-  fifo_queue                  = true
-  content_based_deduplication = true
+  name = "${local.name}-send-dlq"
 }
 
 resource "aws_sqs_queue" "main" {
-  name                        = "${local.name}-send.fifo"
-  fifo_queue                  = true
-  content_based_deduplication = true
-  visibility_timeout_seconds  = var.sqs_send_visibility_timeout_seconds
+  name                       = "${local.name}-send"
+  visibility_timeout_seconds = var.sqs_send_visibility_timeout_seconds
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn

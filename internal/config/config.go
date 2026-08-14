@@ -20,7 +20,12 @@ type APIConfig struct {
 	AWSRegion          string `envconfig:"AWS_REGION" required:"true"`
 	SQSQueueURL        string `envconfig:"SQS_QUEUE_URL" required:"true"`
 	LocalstackEndpoint string `envconfig:"LOCALSTACK_ENDPOINT"`
-	SQSGroupBuckets    int    `envconfig:"SQS_GROUP_BUCKETS" default:"2000"`
+
+	// Enqueues are coalesced into SendMessageBatch calls. A caller still blocks
+	// until its own message is acknowledged, so the linger is added latency on
+	// the accept path and nothing more — keep it small.
+	SQSSendBatchSize  int    `envconfig:"SQS_SEND_BATCH_SIZE" default:"10"`
+	SQSSendBatchDelay string `envconfig:"SQS_SEND_BATCH_DELAY" default:"5ms"`
 }
 
 type WorkerConfig struct {
@@ -41,6 +46,12 @@ type WorkerConfig struct {
 	SQSWaitTime        int32  `envconfig:"SQS_WAIT_TIME" default:"20"`
 	SQSMaxMsgs         int32  `envconfig:"SQS_MAX_MSGS" default:"10"`
 	SQSVizTimeout      int32  `envconfig:"SQS_VISIBILITY_TIMEOUT" default:"60"`
+
+	// Concurrent ReceiveMessage calls. Zero means one per ten handler slots.
+	// One receiver fetches at most SQS_MAX_MSGS per round-trip, so a single
+	// receiver starves any pool larger than a few dozen handlers.
+	SQSReceivers       int    `envconfig:"SQS_RECEIVERS" default:"0"`
+	SQSDeleteBatchWait string `envconfig:"SQS_DELETE_BATCH_WAIT" default:"20ms"`
 
 	WorkerConcurrency int `envconfig:"WORKER_CONCURRENCY" default:"20"`
 
