@@ -42,6 +42,7 @@ func main() {
 		MaxConnLifetime:   cfg.DBPoolMaxConnLifetime,
 		MaxConnIdleTime:   cfg.DBPoolMaxConnIdleTime,
 		HealthCheckPeriod: cfg.DBPoolHealthCheckPeriod,
+		Tracer:            &observability.QueryTracer{Service: "worker"},
 	})
 	if err != nil {
 		slog.Error("worker db connect failed", "err", err)
@@ -58,6 +59,10 @@ func main() {
 
 	reg := prometheus.DefaultRegisterer
 	observability.RegisterWorker(reg)
+	observability.RegisterDB(reg)
+	// Pool statistics are how pool exhaustion is told apart from a slow
+	// database; without them the two look identical from the outside.
+	go observability.SamplePool(ctx, "worker", db, 5*time.Second)
 
 	deleteWait, err := time.ParseDuration(cfg.SQSDeleteBatchWait)
 	if err != nil {

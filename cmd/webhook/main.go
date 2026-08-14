@@ -33,6 +33,7 @@ func main() {
 		MaxConnLifetime:   cfg.DBPoolMaxConnLifetime,
 		MaxConnIdleTime:   cfg.DBPoolMaxConnIdleTime,
 		HealthCheckPeriod: cfg.DBPoolHealthCheckPeriod,
+		Tracer:            &observability.QueryTracer{Service: "webhook"},
 	})
 	if err != nil {
 		slog.Error("webhook db connect failed", "err", err)
@@ -42,6 +43,10 @@ func main() {
 
 	reg := prometheus.DefaultRegisterer
 	observability.RegisterWebhook(reg)
+	observability.RegisterDB(reg)
+	// Pool statistics are how pool exhaustion is told apart from a slow
+	// database; without them the two look identical from the outside.
+	go observability.SamplePool(ctx, "webhook", db, 5*time.Second)
 
 	s := httpserver.New()
 	s.Mux.Use(httpserver.Metrics(observability.WebhookRequests))
