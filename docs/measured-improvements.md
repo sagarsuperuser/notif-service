@@ -134,3 +134,34 @@ service), and Prometheus. All three agree.
 - Message segmentation is not modelled, and provider rates are counted in
   segments.
 - The 300 TPS FIFO ceiling was never measured, only cited.
+
+## Final evidence, all campaign runs
+
+Captured from Postgres before the environment was destroyed.
+
+```
+run     messages   started              ended
+clean    100,000   2026-08-14 19:13:14  19:18:01
+final    100,000   2026-08-14 20:14:35  20:19:18
+prom     100,000   2026-08-14 20:41:18  20:46:01
+arm       80,000   2026-08-14 21:39:25  21:46:18   (A/B, 40k per arm)
+                  --------
+                   380,000
+
+final state: delivered 380,000   (no other state)
+
+invariants           violations
+sent twice                    0
+sent w/o provider id          0
+duplicate idem keys           0
+left queued                   0
+stuck processing              0
+suppressed but sent           0
+```
+
+Lifetime totals on the instance: 2,358,675 messages, 2,126,179 provider
+attempts, 6,384,450 delivery events.
+
+CloudWatch retains the SQS series for fifteen months and is independent of this
+service's own instrumentation; the Postgres figures above are the durable record
+of message state and were captured before teardown.
