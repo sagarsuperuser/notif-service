@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -14,6 +15,10 @@ type PoolOptions struct {
 	MaxConnLifetime   string
 	MaxConnIdleTime   string
 	HealthCheckPeriod string
+
+	// Tracer, when set, is attached to every connection so each query is
+	// counted and timed. Optional so tests can build a plain pool.
+	Tracer pgx.QueryTracer
 }
 
 func NewPool(ctx context.Context, dsn string, opts PoolOptions) (*pgxpool.Pool, error) {
@@ -49,6 +54,10 @@ func NewPool(ctx context.Context, dsn string, opts PoolOptions) (*pgxpool.Pool, 
 			return nil, fmt.Errorf("invalid DB_POOL_HEALTH_CHECK_PERIOD: %w", err)
 		}
 		cfg.HealthCheckPeriod = d
+	}
+
+	if opts.Tracer != nil {
+		cfg.ConnConfig.Tracer = opts.Tracer
 	}
 
 	return pgxpool.NewWithConfig(ctx, cfg)

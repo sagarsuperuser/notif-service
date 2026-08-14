@@ -36,6 +36,7 @@ func main() {
 		MaxConnLifetime:   cfg.DBPoolMaxConnLifetime,
 		MaxConnIdleTime:   cfg.DBPoolMaxConnIdleTime,
 		HealthCheckPeriod: cfg.DBPoolHealthCheckPeriod,
+		Tracer:            &observability.QueryTracer{Service: "api"},
 	})
 	if err != nil {
 		slog.Error("api db connect failed", "err", err)
@@ -49,6 +50,10 @@ func main() {
 	}
 
 	observability.RegisterAPI(prometheus.DefaultRegisterer)
+	observability.RegisterDB(prometheus.DefaultRegisterer)
+	// Pool statistics are how pool exhaustion is told apart from a slow
+	// database; without them the two look identical from the outside.
+	go observability.SamplePool(ctx, "api", db, 5*time.Second)
 
 	store := pg.New(db)
 	sendDelay, err := time.ParseDuration(cfg.SQSSendBatchDelay)
