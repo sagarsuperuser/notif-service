@@ -36,6 +36,11 @@ func main() {
 	// Use a root ctx we can cancel
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Handlers run under this one so that stopping the receivers does not abort
+	// a send that is already in flight. Cancelled only after the drain, below.
+	drainCtx, drainCancel := context.WithCancel(context.Background())
+	defer drainCancel()
+
 	db, err := pg.NewPool(ctx, cfg.DBDSN, pg.PoolOptions{
 		MaxConns:          cfg.DBPoolMaxConns,
 		MinConns:          cfg.DBPoolMinConns,
@@ -164,12 +169,22 @@ func main() {
 					)
 				}
 			}()
-			err = processor.Process(ctx, job)
+			// drainCtx, not ctx: cancelling ctx stops the RECEIVERS pulling new
+			// work, and a message already being sent must be allowed to finish.
+			// Handing the receive context to the handler meant SIGTERM aborted
+			// every in-flight provider call, so the handler returned an error,
+			// the message was never deleted, and SQS redelivered it. Five
+			// deploys during one campaign was enough to push a message past
+			// maxReceiveCount and into the dead-letter queue.
+			err = processor.Process(drainCtx, job)
 			return err
 		})
 	}()
 
 	// shutdown wiring
+	//
+	// Two contexts, because "stop taking new work" and "abandon work in
+	// progress" are different instructions and shutdown needs the first one.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -193,6 +208,9 @@ func main() {
 		slog.Info("worker shutdown", "signal", sig.String())
 	}
 
+	// Stop receiving. In-flight handlers keep drainCtx and run to completion;
+	// the consumer then closes its job channel, waits for them, and flushes the
+	// pending delete batch before returning.
 	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -200,9 +218,16 @@ func main() {
 	_ = healthSrv.Shutdown(shutdownCtx)
 	_ = metricsSrv.Shutdown(shutdownCtx)
 
+	// Long enough for a provider call (6s timeout) plus its retries and the
+	// delete-batch linger. Must stay under terminationGracePeriodSeconds or the
+	// kubelet sends SIGKILL mid-drain and the whole exercise is pointless.
+	drainDeadline := 45 * time.Second
 	select {
 	case <-pollErrCh:
-	case <-time.After(10 * time.Second):
+		slog.Info("worker drained in-flight messages before exit")
+	case <-time.After(drainDeadline):
+		slog.Warn("worker drain deadline hit; some in-flight messages will be redelivered",
+			"deadline", drainDeadline)
 		slog.Info("worker shutdown timeout waiting for poll loop")
 	}
 }

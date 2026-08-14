@@ -246,3 +246,76 @@ func TestConsumer_FailedHandlerLeavesMessage(t *testing.T) {
 		t.Errorf("deleted %d messages, want 50 — only the successful half may be removed", got)
 	}
 }
+
+// TestConsumer_DrainsInFlightOnShutdown is the guarantee a rolling deploy
+// depends on.
+//
+// A message being handled when shutdown begins must still be deleted. If it is
+// abandoned, SQS redelivers it after the visibility timeout, and a message
+// unlucky enough to be in flight across five deploys reaches maxReceiveCount
+// and lands in the dead-letter queue. That is not hypothetical: a benchmark run
+// here put 198,264 messages in the DLQ, and every one of them was in flight
+// during one of six worker restarts.
+//
+// The consumer's contract is that cancelling the context stops the RECEIVERS.
+// Handlers already running keep going, the job channel closes behind them, and
+// the pending delete batch is flushed before PollConcurrent returns.
+func TestConsumer_DrainsInFlightOnShutdown(t *testing.T) {
+	f := &fakeSQS{latency: time.Millisecond, remaining: 40}
+	c := &Consumer{
+		SQS: f, QueueURL: "q",
+		MaxMessages: 10, VisibilityTimeout: 30,
+		Receivers: 1, DeleteBatchDelay: 5 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var started, finished atomic.Int64
+	release := make(chan struct{})
+	returned := make(chan struct{})
+
+	go func() {
+		_ = c.PollConcurrent(ctx, 4, func(hctx context.Context, job SMSJob) error {
+			started.Add(1)
+			// Hold here so shutdown is guaranteed to begin mid-handler.
+			<-release
+			finished.Add(1)
+			return nil
+		})
+		close(returned)
+	}()
+
+	// Wait until handlers are genuinely in flight.
+	deadline := time.Now().Add(5 * time.Second)
+	for started.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if started.Load() < 4 {
+		t.Fatalf("only %d handlers started; the test never reached the state it checks", started.Load())
+	}
+
+	// Shutdown begins while those handlers are still running.
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("PollConcurrent did not return after shutdown")
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	done := finished.Load()
+	deleted := f.deleted.Load()
+	t.Logf("handlers finished after shutdown: %d, messages deleted: %d", done, deleted)
+
+	if done < 4 {
+		t.Errorf("%d handlers completed, want at least the 4 that were in flight — "+
+			"shutdown must not abandon work in progress", done)
+	}
+	if deleted < done {
+		t.Errorf("%d handlers succeeded but only %d messages were deleted; the rest will be "+
+			"redelivered and eventually dead-lettered", done, deleted)
+	}
+}

@@ -39,7 +39,9 @@ spec:
           labelSelector:
             matchLabels:
               app: notif-worker
-      terminationGracePeriodSeconds: 20
+      # Above the worker's 45s drain deadline, or the kubelet SIGKILLs mid-drain
+      # and in-flight messages are redelivered anyway.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: worker
           image: notif-worker:dev
