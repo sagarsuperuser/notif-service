@@ -57,8 +57,11 @@ behind it. Measured against a fake with 25ms injected receive latency:
 
 | receivers | 400 messages drained in |
 |---|---|
-| 1 | 1.047s |
-| 8 | 0.133s |
+| 1 | ~1.04s |
+| 8 | ~0.13s |
+
+Timings vary by a few milliseconds between runs; the ratio (roughly 8x, the
+receiver count) is the stable part and is what the test asserts.
 
 Batching, same suite: 500 enqueues become 50 SendMessageBatch calls, and 200
 deletions become 20 DeleteMessageBatch calls.
@@ -126,6 +129,20 @@ messages left queued               0
 Reconciled across three independent records: Postgres (rows and states),
 CloudWatch (SQS sent, deleted, depth, age — recorded by AWS, not by this
 service), and Prometheus. All three agree.
+
+## How to re-derive every figure here
+
+The test-measured numbers are reproducible on any machine with Postgres:
+
+```
+TEST_DB_DSN=... go test -tags=integration ./tests/integration -run RoundTrip -v
+go test ./internal/queue/sqs -run 'ReceivesConcurrently|CoalescesIntoBatches|BatchesDeletes' -v
+go test ./cmd/mock-provider -run SenderClass -v
+```
+
+The A/B and campaign numbers came from counters on a live cluster and are
+recorded above rather than reproducible without rebuilding it. The Postgres
+figures were captured before teardown; the CloudWatch series remain in AWS.
 
 ## What is not shown
 
