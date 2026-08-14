@@ -16,30 +16,6 @@ type Store struct {
 
 func New(db *pgxpool.Pool) *Store { return &Store{DB: db} }
 
-func (s *Store) FindMessageByIdempotency(ctx context.Context, tenantID, idemKey string) (store.IdempotencyResult, error) {
-	row := s.DB.QueryRow(ctx, `
-		SELECT id, state FROM messages WHERE tenant_id=$1 AND idempotency_key=$2
-	`, tenantID, idemKey)
-	var msgID, state string
-	err := row.Scan(&msgID, &state)
-	if err != nil {
-		if err.Error() == "no rows in result set" {
-			return store.IdempotencyResult{Found: false}, nil
-		}
-		return store.IdempotencyResult{}, err
-	}
-	return store.IdempotencyResult{MessageID: msgID, State: state, Found: true}, nil
-}
-
-func (s *Store) InsertMessage(ctx context.Context, in store.MessageInsert) error {
-	b, _ := json.Marshal(in.Vars)
-	_, err := s.DB.Exec(ctx, `
-		INSERT INTO messages (id, tenant_id, idempotency_key, to_phone, template_id, vars_json, campaign_id, state, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
-	`, in.ID, in.TenantID, in.IdemKey, in.To, in.TemplateID, b, nullIfEmpty(in.CampaignID), in.State, in.Now)
-	return err
-}
-
 func (s *Store) MarkMessageState(ctx context.Context, in store.MessageStateUpdate) error {
 	_, err := s.DB.Exec(ctx, `
 		UPDATE messages SET state=$2, last_error=$3, updated_at=$4 WHERE id=$1
@@ -79,78 +55,82 @@ func (s *Store) InsertAttempt(ctx context.Context, in store.ProviderAttempt) err
 	return err
 }
 
-func (s *Store) IsSuppressed(ctx context.Context, tenantID, phone string) (bool, error) {
-	row := s.DB.QueryRow(ctx, `SELECT 1 FROM suppression_list WHERE tenant_id=$1 AND phone=$2`, tenantID, phone)
-	var one int
-	err := row.Scan(&one)
-	if err != nil {
-		if err.Error() == "no rows in result set" {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
+// CreateMessage accepts (or rejects) one send request in a SINGLE round-trip,
+// replacing a 7-statement sequence — idempotency SELECT, message INSERT,
+// suppression SELECT, consent SELECT, then BEGIN + cap upsert + COMMIT — that
+// grew to 9 on the cap-exceeded path, because it incremented the counter first
+// and then wrote a compensating decrement plus a state UPDATE.
+//
+// Structure, and why each piece is where it is:
+//
+//	gate     — suppression and consent, read once.
+//	cap      — increments only when the gates pass AND this idempotency key is
+//	           not already known, so an idempotent retry cannot consume a second
+//	           unit of the recipient's daily allowance. The increment is
+//	           CONDITIONAL (DO UPDATE ... WHERE count < max), so it never
+//	           overshoots and never needs the compensating decrement the old
+//	           transaction relied on. No row returned means the cap is spent.
+//	decision — collapses the gates and the cap outcome into the final state, so
+//	           the message is inserted with the state it ends in rather than
+//	           inserted as 'queued' and then UPDATEd to 'suppressed'.
+//	ins      — ON CONFLICT DO NOTHING; a concurrent duplicate resolves to the
+//	           existing row instead of erroring on the unique constraint, which
+//	           is what the previous plain INSERT did.
+//
+// The trailing UNION returns the pre-existing row when the insert conflicted,
+// so one statement answers both the fresh and the idempotent-retry case.
+func (s *Store) CreateMessage(ctx context.Context, in store.CreateMessageInput) (store.CreateMessageResult, error) {
+	b, _ := json.Marshal(in.Vars)
+	day := in.Day.UTC().Truncate(24 * time.Hour)
 
-func (s *Store) IsOptedIn(ctx context.Context, tenantID, phone string) (bool, error) {
+	var out store.CreateMessageResult
+	var inserted bool
 	row := s.DB.QueryRow(ctx, `
-		SELECT status FROM consents WHERE tenant_id=$1 AND phone=$2 AND channel='sms'
-	`, tenantID, phone)
-	var st string
-	err := row.Scan(&st)
-	if err != nil {
-		if err.Error() == "no rows in result set" {
-			return false, nil
-		}
-		return false, err
-	}
-	return st == "opted_in", nil
-}
+		WITH gate AS (
+			SELECT
+				EXISTS(SELECT 1 FROM suppression_list WHERE tenant_id=$2 AND phone=$4) AS suppressed,
+				EXISTS(SELECT 1 FROM consents
+				        WHERE tenant_id=$2 AND phone=$4 AND channel='sms' AND status='opted_in') AS opted_in
+		), cap AS (
+			INSERT INTO send_caps_daily AS s (tenant_id, phone, day, count, updated_at)
+			SELECT $2,$4,$8,1,$10 FROM gate
+			 WHERE NOT gate.suppressed AND gate.opted_in AND $9::int >= 1
+			   AND NOT EXISTS (SELECT 1 FROM messages WHERE tenant_id=$2 AND idempotency_key=$3)
+			ON CONFLICT (tenant_id, phone, day) DO UPDATE
+				SET count = s.count + 1, updated_at = $10
+				WHERE s.count < $9::int
+			RETURNING count
+		), decision AS (
+			SELECT CASE
+				WHEN (SELECT suppressed FROM gate)     THEN 'suppressed'
+				WHEN NOT (SELECT opted_in FROM gate)   THEN 'suppressed'
+				WHEN NOT EXISTS (SELECT 1 FROM cap)    THEN 'suppressed'
+				ELSE 'queued' END AS state,
+			CASE
+				WHEN (SELECT suppressed FROM gate)     THEN 'suppressed'
+				WHEN NOT (SELECT opted_in FROM gate)   THEN 'not_opted_in'
+				WHEN NOT EXISTS (SELECT 1 FROM cap)    THEN 'cap_exceeded'
+				ELSE '' END AS last_error
+		), ins AS (
+			INSERT INTO messages
+				(id, tenant_id, idempotency_key, to_phone, template_id, vars_json, campaign_id,
+				 state, last_error, created_at, updated_at)
+			SELECT $1,$2,$3,$4,$5,$6,$7, d.state, NULLIF(d.last_error,''), $10,$10 FROM decision d
+			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+			RETURNING id, state, COALESCE(last_error,'') AS last_error
+		)
+		SELECT id, state, last_error, true FROM ins
+		UNION ALL
+		SELECT id, state, COALESCE(last_error,''), false FROM messages
+		 WHERE tenant_id=$2 AND idempotency_key=$3 AND NOT EXISTS (SELECT 1 FROM ins)
+	`, in.ID, in.TenantID, in.IdemKey, in.To, in.TemplateID, b, nullIfEmpty(in.CampaignID),
+		day, in.MaxPerDay, in.Now)
 
-func (s *Store) IncrementDailyCap(ctx context.Context, tenantID, phone string, day time.Time, maxPerDay int) (allowed bool, newCount int, err error) {
-	d := day.UTC().Truncate(24 * time.Hour)
-	tx, err := s.DB.Begin(ctx)
-	if err != nil {
-		return false, 0, err
+	if err := row.Scan(&out.MessageID, &out.State, &out.LastError, &inserted); err != nil {
+		return store.CreateMessageResult{}, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	row := tx.QueryRow(ctx, `
-		INSERT INTO send_caps_daily (tenant_id, phone, day, count, updated_at)
-		VALUES ($1,$2,$3,1,now())
-		ON CONFLICT (tenant_id, phone, day)
-		DO UPDATE SET count = send_caps_daily.count + 1, updated_at=now()
-		RETURNING count
-	`, tenantID, phone, d)
-	if err := row.Scan(&newCount); err != nil {
-		return false, 0, err
-	}
-
-	allowed = newCount <= maxPerDay
-	if !allowed {
-		_, _ = tx.Exec(ctx, `
-			UPDATE send_caps_daily SET count = count - 1, updated_at=now()
-			WHERE tenant_id=$1 AND phone=$2 AND day=$3
-		`, tenantID, phone, d)
-		if err := tx.Commit(ctx); err != nil {
-			return false, 0, err
-		}
-		return false, newCount - 1, nil
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return false, 0, err
-	}
-	return true, newCount, nil
-}
-
-func (s *Store) InsertDeliveryEvent(ctx context.Context, in store.DeliveryEvent) error {
-	b, _ := json.Marshal(in.Payload)
-	_, err := s.DB.Exec(ctx, `
-		INSERT INTO delivery_events (provider, provider_msg_id, vendor_status, error_code, payload_json, occurred_at)
-		VALUES ($1,$2,$3,$4,$5,$6)
-	`, in.Provider, in.ProviderMsgID, in.VendorStatus, nullIfEmpty(in.ErrorCode), b, in.OccurredAt)
-	return err
+	out.Existing = !inserted
+	return out, nil
 }
 
 // RecordDeliveryEvent applies one provider callback in a SINGLE round-trip:
@@ -199,18 +179,6 @@ func (s *Store) RecordDeliveryEvent(ctx context.Context, in store.DeliveryEventR
 		return false, err
 	}
 	return updated > 0, nil
-}
-
-func (s *Store) UpdateMessageByProviderMsgID(ctx context.Context, in store.ProviderMsgUpdate) (bool, error) {
-	ct, err := s.DB.Exec(ctx, `
-		UPDATE messages
-		SET state=$3, last_error=$4, updated_at=$5
-		WHERE provider=$1 AND provider_msg_id=$2
-	`, in.Provider, in.ProviderMsgID, in.NewState, nullIfEmpty(in.LastError), in.Now)
-	if err != nil {
-		return false, err
-	}
-	return ct.RowsAffected() > 0, nil
 }
 
 func (s *Store) GetMessage(ctx context.Context, msgID string) (store.Message, bool, error) {

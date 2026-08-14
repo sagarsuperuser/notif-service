@@ -16,24 +16,6 @@ type Message struct {
 	UpdatedAt     time.Time
 }
 
-type IdempotencyResult struct {
-	MessageID string
-	State     string
-	Found     bool
-}
-
-type MessageInsert struct {
-	ID         string
-	TenantID   string
-	IdemKey    string
-	To         string
-	TemplateID string
-	Vars       map[string]string
-	CampaignID string
-	State      string
-	Now        time.Time
-}
-
 type MessageStateUpdate struct {
 	ID        string
 	State     string
@@ -71,21 +53,30 @@ type ProviderAttempt struct {
 	ResponseJSON  any
 }
 
-type DeliveryEvent struct {
-	Provider      string
-	ProviderMsgID string
-	VendorStatus  string
-	ErrorCode     string
-	Payload       any
-	OccurredAt    *time.Time
+// CreateMessageInput is one accept-a-message decision: the suppression and
+// consent gates, the daily-cap increment, the idempotency check and the message
+// insert, resolved in a single round-trip.
+type CreateMessageInput struct {
+	ID         string
+	TenantID   string
+	IdemKey    string
+	To         string
+	TemplateID string
+	Vars       map[string]string
+	CampaignID string
+	Day        time.Time
+	MaxPerDay  int
+	Now        time.Time
 }
 
-type ProviderMsgUpdate struct {
-	Provider      string
-	ProviderMsgID string
-	NewState      string
-	LastError     string
-	Now           time.Time
+// CreateMessageResult reports the row that now represents this request —
+// either the one just created, or the pre-existing one an idempotent retry
+// resolved to (Existing=true).
+type CreateMessageResult struct {
+	MessageID string
+	State     string
+	LastError string
+	Existing  bool
 }
 
 // DeliveryEventRecord is one provider callback, applied in a single round-trip:
