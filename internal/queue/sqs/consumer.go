@@ -166,13 +166,13 @@ func (c *Consumer) handleOne(ctx context.Context, m types.Message, handler Handl
 	// A message that cannot be parsed will never parse. Deleting it stops an
 	// endless redrive; leaving it would occupy a receive slot forever.
 	if m.Body == nil {
-		c.queueDelete(ctx, deletes, receipt)
+		c.queueDelete(deletes, receipt)
 		return
 	}
 	var job SMSJob
 	if err := json.Unmarshal([]byte(*m.Body), &job); err != nil {
 		slog.Error("sqs message body is not a job; dropping", "err", err)
-		c.queueDelete(ctx, deletes, receipt)
+		c.queueDelete(deletes, receipt)
 		return
 	}
 
@@ -181,17 +181,25 @@ func (c *Consumer) handleOne(ctx context.Context, m types.Message, handler Handl
 		slog.Error("sqs handler error", "err", err, "message_id", job.MessageID)
 		return
 	}
-	c.queueDelete(ctx, deletes, receipt)
+	c.queueDelete(deletes, receipt)
 }
 
-func (c *Consumer) queueDelete(ctx context.Context, deletes chan<- string, receipt string) {
+// queueDelete hands a completed message to the delete batcher.
+//
+// Deliberately not cancellable. An earlier version selected on ctx.Done() here,
+// which meant a handler that SUCCEEDED during shutdown had its delete silently
+// discarded — the send had gone out, but the message stayed on the queue and
+// came back after the visibility timeout, so the recipient got a second SMS and
+// the message crept toward the dead-letter queue.
+//
+// The send cannot block forever and cannot race a closed channel: PollConcurrent
+// closes `deletes` only after handlers.Wait() returns, so the batcher is alive
+// for as long as any handler can still call this.
+func (c *Consumer) queueDelete(deletes chan<- string, receipt string) {
 	if receipt == "" {
 		return
 	}
-	select {
-	case deletes <- receipt:
-	case <-ctx.Done():
-	}
+	deletes <- receipt
 }
 
 // deleteLoop coalesces receipt handles into DeleteMessageBatch calls of ten. It
