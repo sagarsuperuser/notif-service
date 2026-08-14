@@ -153,6 +153,54 @@ func (s *Store) InsertDeliveryEvent(ctx context.Context, in store.DeliveryEvent)
 	return err
 }
 
+// RecordDeliveryEvent applies one provider callback in a SINGLE round-trip:
+// the delivery event is inserted, and the message is advanced in the same
+// statement when the event is terminal. Returns whether a message row matched.
+//
+// Three properties this shape buys, each of which was a defect in the previous
+// insert-then-retry-loop version:
+//
+//   - The event is persisted UNCONDITIONALLY, even when no message matches yet
+//     (the callback can beat the worker's provider_msg_id write). The reconcile
+//     job reads delivery_events, so an event it never sees is an event it can
+//     never repair — persisting first is what keeps the compensator able to
+//     compensate.
+//   - The UPDATE carries a state guard, so a duplicate or out-of-order terminal
+//     callback cannot overwrite a message that already reached a terminal state.
+//     First terminal wins here; reconcile re-asserts latest-wins for anything
+//     still sitting in 'submitted'.
+//   - One round-trip, holding a pooled connection for the length of one
+//     statement. The previous version retried the UPDATE up to 10 times with
+//     backoff sleeps — up to ~1.4s — while holding its connection, which
+//     exhausted the pool under load and surfaced as database timeouts.
+func (s *Store) RecordDeliveryEvent(ctx context.Context, in store.DeliveryEventRecord) (matched bool, err error) {
+	b, _ := json.Marshal(in.Payload)
+	var updated int
+	row := s.DB.QueryRow(ctx, `
+		WITH ev AS (
+			INSERT INTO delivery_events
+				(provider, provider_msg_id, vendor_status, error_code, payload_json, occurred_at)
+			VALUES ($1,$2,$3,$4,$5,$6)
+			RETURNING provider, provider_msg_id
+		), upd AS (
+			UPDATE messages m
+			   SET state = $7, last_error = $4, updated_at = $8
+			  FROM ev
+			 WHERE $7::text <> ''
+			   AND m.provider = ev.provider
+			   AND m.provider_msg_id = ev.provider_msg_id
+			   AND m.state NOT IN ('delivered','failed')
+			RETURNING 1
+		)
+		SELECT count(*)::int FROM upd
+	`, in.Provider, in.ProviderMsgID, in.VendorStatus, nullIfEmpty(in.ErrorCode), b, in.OccurredAt,
+		in.NewState, in.Now)
+	if err := row.Scan(&updated); err != nil {
+		return false, err
+	}
+	return updated > 0, nil
+}
+
 func (s *Store) UpdateMessageByProviderMsgID(ctx context.Context, in store.ProviderMsgUpdate) (bool, error) {
 	ct, err := s.DB.Exec(ctx, `
 		UPDATE messages

@@ -71,34 +71,8 @@ type WebhookConfig struct {
 
 	// Optional: webhook ingest-only mode (enqueue to SQS, process async).
 	// Keeping this off by default makes local dev simpler.
-	WebhookUseQueue           bool   `envconfig:"WEBHOOK_USE_QUEUE" default:"false"`
-	WebhookEventsQueueURL     string `envconfig:"WEBHOOK_EVENTS_QUEUE_URL"`
-	AWSRegion                 string `envconfig:"AWS_REGION" default:"ap-south-1"`
-	LocalstackEndpoint        string `envconfig:"LOCALSTACK_ENDPOINT"`
-}
-
-type WebhookProcessorConfig struct {
-	DBDSN                   string `envconfig:"DB_DSN" required:"true"`
-	DBPoolMaxConns          int32  `envconfig:"DB_POOL_MAX_CONNS" default:"20"`
-	DBPoolMinConns          int32  `envconfig:"DB_POOL_MIN_CONNS" default:"5"`
-	DBPoolMaxConnLifetime   string `envconfig:"DB_POOL_MAX_CONN_LIFETIME" default:"30m"`
-	DBPoolMaxConnIdleTime   string `envconfig:"DB_POOL_MAX_CONN_IDLE_TIME" default:"5m"`
-	DBPoolHealthCheckPeriod string `envconfig:"DB_POOL_HEALTH_CHECK_PERIOD" default:"30s"`
-	Port                    string `envconfig:"PORT" default:"8080"`
-	MetricsPort             string `envconfig:"METRICS_PORT" default:"9090"`
-	LogFormat               string `envconfig:"LOG_FORMAT" default:"json"`
-
-	// AWS / SQS
-	AWSRegion             string `envconfig:"AWS_REGION" default:"ap-south-1"`
-	WebhookEventsQueueURL string `envconfig:"WEBHOOK_EVENTS_QUEUE_URL" required:"true"`
-	LocalstackEndpoint    string `envconfig:"LOCALSTACK_ENDPOINT"`
-
-	// SQS polling knobs (separate from worker knobs)
-	SQSWaitTime   int32 `envconfig:"WEBHOOK_SQS_WAIT_TIME" default:"20"`
-	SQSMaxMsgs    int32 `envconfig:"WEBHOOK_SQS_MAX_MSGS" default:"10"`
-	SQSVizTimeout int32 `envconfig:"WEBHOOK_SQS_VISIBILITY_TIMEOUT" default:"60"`
-
-	ProcessorConcurrency      int  `envconfig:"WEBHOOK_PROCESSOR_CONCURRENCY" default:"20"`
+	AWSRegion          string `envconfig:"AWS_REGION" default:"ap-south-1"`
+	LocalstackEndpoint string `envconfig:"LOCALSTACK_ENDPOINT"`
 }
 
 func LoadAPI() APIConfig {
@@ -119,14 +93,6 @@ func LoadWorker() WorkerConfig {
 
 func LoadWebhook() WebhookConfig {
 	var cfg WebhookConfig
-	if err := envconfig.Process("", &cfg); err != nil {
-		panic(err)
-	}
-	return cfg
-}
-
-func LoadWebhookProcessor() WebhookProcessorConfig {
-	var cfg WebhookProcessorConfig
 	if err := envconfig.Process("", &cfg); err != nil {
 		panic(err)
 	}

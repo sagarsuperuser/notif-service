@@ -270,11 +270,6 @@ variable "sqs_send_visibility_timeout_seconds" {
   description = "Visibility timeout for the send queue (seconds)."
 }
 
-variable "sqs_webhook_events_visibility_timeout_seconds" {
-  type        = number
-  default     = 60
-  description = "Visibility timeout for the webhook events queue (seconds)."
-}
 
 variable "sqs_send_max_receive_count" {
   type        = number
@@ -282,11 +277,6 @@ variable "sqs_send_max_receive_count" {
   description = "How many times an item can be received from send queue before DLQ."
 }
 
-variable "sqs_webhook_events_max_receive_count" {
-  type        = number
-  default     = 10
-  description = "How many times an item can be received from webhook events queue before DLQ."
-}
 
 # RDS
 variable "db_name" {

@@ -87,3 +87,20 @@ type ProviderMsgUpdate struct {
 	LastError     string
 	Now           time.Time
 }
+
+// DeliveryEventRecord is one provider callback, applied in a single round-trip:
+// the event is always persisted, and the message row is advanced only when the
+// event is terminal (NewState != "").
+type DeliveryEventRecord struct {
+	Provider      string
+	ProviderMsgID string
+	VendorStatus  string
+	ErrorCode     string
+	Payload       any
+	OccurredAt    *time.Time
+	// NewState is the message state this event implies: "delivered", "failed",
+	// or "" for a non-terminal status (queued/sent), which records the event
+	// without touching the message.
+	NewState string
+	Now      time.Time
+}

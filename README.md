@@ -8,7 +8,6 @@ It accepts message requests, enqueues send jobs to SQS, processes sends asynchro
 - `cmd/api`: HTTP API (`POST /v1/sms/messages`, `GET /v1/messages/{id}`)
 - `cmd/worker`: SQS consumer that sends messages to provider
 - `cmd/webhook`: webhook ingest endpoint
-- `cmd/webhook-processor`: async webhook event processor
 - `internal/`: domain, service, queue, store, provider, observability code
 - `deploy/k8s`: Kubernetes manifests and overlays
 - `infra`: Terraform infrastructure (AWS network, SQS, RDS, etc.)
@@ -43,7 +42,6 @@ make init
 make run-api
 make run-worker
 make run-webhook
-go run ./cmd/webhook-processor
 ```
 
 4. Send a test request:
