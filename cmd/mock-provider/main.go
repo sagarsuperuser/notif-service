@@ -25,21 +25,34 @@ import (
 )
 
 type config struct {
-	AccountSID          string  `envconfig:"TWILIO_ACCOUNT_SID" default:"mock_sid"`
-	AuthToken           string  `envconfig:"TWILIO_AUTH_TOKEN" default:"mock_token"`
-	Port                string  `envconfig:"PORT" default:"8080"`
-	OutcomeMode         string  `envconfig:"MOCK_OUTCOME_MODE" default:"fixed"`
-	OutcomesRaw         string  `envconfig:"MOCK_OUTCOMES" default:"ok"`
-	SuccessRate         float64 `envconfig:"MOCK_SUCCESS_RATE" default:"0.95"`
-	FailureTypesRaw     string  `envconfig:"MOCK_FAILURE_TYPES" default:"failed"`
-	FailureWeightsRaw   string  `envconfig:"MOCK_FAILURE_WEIGHTS" default:""`
-	DelayMs             int     `envconfig:"MOCK_DELAY_MS" default:"0"`
-	TimeoutDelayMs      int     `envconfig:"MOCK_TIMEOUT_DELAY_MS" default:"12000"`
-	DefaultWebhookURL   string  `envconfig:"MOCK_WEBHOOK_URL" default:""`
-	WebhookDelayMs      int     `envconfig:"MOCK_WEBHOOK_DELAY_MS" default:"500"`
-	WebhookSentDelayMs  int     `envconfig:"MOCK_WEBHOOK_SENT_DELAY_MS" default:"300"`
-	WebhookQueueDelayMs int     `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS" default:"0"`
-	IncludeQueuedFirst  bool    `envconfig:"MOCK_WEBHOOK_INCLUDE_QUEUED" default:"true"`
+	AccountSID        string  `envconfig:"TWILIO_ACCOUNT_SID" default:"mock_sid"`
+	AuthToken         string  `envconfig:"TWILIO_AUTH_TOKEN" default:"mock_token"`
+	Port              string  `envconfig:"PORT" default:"8080"`
+	OutcomeMode       string  `envconfig:"MOCK_OUTCOME_MODE" default:"fixed"`
+	OutcomesRaw       string  `envconfig:"MOCK_OUTCOMES" default:"ok"`
+	SuccessRate       float64 `envconfig:"MOCK_SUCCESS_RATE" default:"0.95"`
+	FailureTypesRaw   string  `envconfig:"MOCK_FAILURE_TYPES" default:"failed"`
+	FailureWeightsRaw string  `envconfig:"MOCK_FAILURE_WEIGHTS" default:""`
+	DelayMs           int     `envconfig:"MOCK_DELAY_MS" default:"120"`
+	// Spread of the API latency distribution (log-normal sigma). 0 makes every
+	// call take exactly the median, which understates the tail that actually
+	// occupies a caller's concurrency slots.
+	DelaySigma float64 `envconfig:"MOCK_DELAY_SIGMA" default:"0.5"`
+	// REST API concurrency limit. Exceeding it returns 429/20429, as Twilio
+	// does. 0 disables the limit.
+	MaxConcurrent int `envconfig:"MOCK_MAX_CONCURRENT" default:"100"`
+	// Messages per second per sender. Twilio accepts beyond this and queues,
+	// draining at this rate: 1 for a US long code, 100+ for a short code.
+	// 0 disables pacing.
+	SenderMPS float64 `envconfig:"MOCK_SENDER_MPS" default:"0"`
+	// How many seconds of traffic a sender may hold before 30001 queue overflow.
+	QueueMaxSeconds     int    `envconfig:"MOCK_QUEUE_MAX_SECONDS" default:"14400"`
+	TimeoutDelayMs      int    `envconfig:"MOCK_TIMEOUT_DELAY_MS" default:"12000"`
+	DefaultWebhookURL   string `envconfig:"MOCK_WEBHOOK_URL" default:""`
+	WebhookDelayMs      int    `envconfig:"MOCK_WEBHOOK_DELAY_MS" default:"500"`
+	WebhookSentDelayMs  int    `envconfig:"MOCK_WEBHOOK_SENT_DELAY_MS" default:"300"`
+	WebhookQueueDelayMs int    `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS" default:"0"`
+	IncludeQueuedFirst  bool   `envconfig:"MOCK_WEBHOOK_INCLUDE_QUEUED" default:"true"`
 	// Delay ranges (ms). If both min/max are >= 0, they take precedence over the fixed delay above.
 	WebhookDelayMinMs      int `envconfig:"MOCK_WEBHOOK_DELAY_MS_MIN" default:"-1"`
 	WebhookDelayMaxMs      int `envconfig:"MOCK_WEBHOOK_DELAY_MS_MAX" default:"-1"`
@@ -49,10 +62,10 @@ type config struct {
 	WebhookQueueDelayMaxMs int `envconfig:"MOCK_WEBHOOK_QUEUE_DELAY_MS_MAX" default:"-1"`
 
 	// Webhook retry knobs. Retries happen on non-2xx responses and on retryable errors.
-	WebhookMaxRetries      int `envconfig:"MOCK_WEBHOOK_MAX_RETRIES" default:"8"`
-	WebhookRetryBaseMs     int `envconfig:"MOCK_WEBHOOK_RETRY_BASE_MS" default:"250"`
-	WebhookRetryMaxMs      int `envconfig:"MOCK_WEBHOOK_RETRY_MAX_MS" default:"10000"`
-	WebhookRetryJitterPct  int `envconfig:"MOCK_WEBHOOK_RETRY_JITTER_PCT" default:"20"`
+	WebhookMaxRetries     int `envconfig:"MOCK_WEBHOOK_MAX_RETRIES" default:"8"`
+	WebhookRetryBaseMs    int `envconfig:"MOCK_WEBHOOK_RETRY_BASE_MS" default:"250"`
+	WebhookRetryMaxMs     int `envconfig:"MOCK_WEBHOOK_RETRY_MAX_MS" default:"10000"`
+	WebhookRetryJitterPct int `envconfig:"MOCK_WEBHOOK_RETRY_JITTER_PCT" default:"20"`
 
 	Outcomes          []string
 	FailureTypes      []string
@@ -70,8 +83,8 @@ type config struct {
 	WebhookQueueDelayMin time.Duration
 	WebhookQueueDelayMax time.Duration
 
-	WebhookRetryBase    time.Duration
-	WebhookRetryMax     time.Duration
+	WebhookRetryBase time.Duration
+	WebhookRetryMax  time.Duration
 }
 
 type sendResponse struct {
@@ -92,6 +105,10 @@ type server struct {
 	rng    *rand.Rand
 	rngMu  sync.Mutex
 	client *http.Client
+
+	// The two limits Twilio actually enforces. See sender.go.
+	gate    *concurrencyGate
+	senders *senderPool
 }
 
 func main() {
@@ -99,9 +116,11 @@ func main() {
 	loggingInit()
 
 	s := &server{
-		cfg:    cfg,
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
-		client: &http.Client{Timeout: 5 * time.Second},
+		cfg:     cfg,
+		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		client:  &http.Client{Timeout: 5 * time.Second},
+		gate:    newConcurrencyGate(cfg.MaxConcurrent),
+		senders: newSenderPool(cfg.SenderMPS, cfg.QueueMaxSeconds),
 	}
 
 	router := mux.NewRouter()
@@ -216,6 +235,18 @@ func sanitizeRange(min, max time.Duration) (time.Duration, time.Duration) {
 func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// Limit 1: REST API concurrency. Rejected requests are never processed and
+	// are always safe to retry, so this returns before doing any work. The
+	// header is reported on every response, including the rejections.
+	allowed, inflight := s.gate.enter()
+	writeConcurrencyHeader(w, inflight)
+	if !allowed {
+		writeError(w, http.StatusTooManyRequests, 20429,
+			"Too many requests: concurrency limit reached")
+		return
+	}
+	defer s.gate.leave()
+
 	if !s.checkBasicAuth(r) {
 		s.maybeDelayResponse(r.Context(), start)
 		writeError(w, http.StatusUnauthorized, 20003, "Authentication Error")
@@ -238,12 +269,33 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.cfg.Delay > 0 {
+	// API latency, drawn with a right tail rather than fixed: the slow calls are
+	// what occupy a caller's concurrency slots, and a constant delay hides that.
+	s.rngMu.Lock()
+	apiDelay := apiLatency(s.rng, s.cfg.DelayMs, s.cfg.DelaySigma)
+	s.rngMu.Unlock()
+	if apiDelay > 0 {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-time.After(s.cfg.Delay):
+		case <-time.After(apiDelay):
 		}
+	}
+
+	// Limit 2: the sender's own queue. Twilio does not reject a send above the
+	// sender's MPS — it accepts, answers "queued", and drains at that rate. The
+	// wait returned here is how long this message will sit in Twilio's queue
+	// before it is actually sent, and the delivery webhooks are scheduled
+	// against it. Overfilling the queue is error 30001.
+	sender := r.Form.Get("MessagingServiceSid")
+	if sender == "" {
+		sender = r.Form.Get("From")
+	}
+	queueWait, admitted := s.senders.get(sender).admit(time.Now())
+	if !admitted {
+		writeError(w, http.StatusTooManyRequests, 30001,
+			"Queue overflow: this sender has more than the maximum queued messages")
+		return
 	}
 
 	outcome := s.nextOutcome()
@@ -269,14 +321,22 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if cb == "" {
 		cb = s.cfg.DefaultWebhookURL
 	}
-	s.maybeWebhookSequence(cb, sid, finalStatus, errorCode, sendQueued, sendSent)
+	// The delivery sequence starts only when this message's turn in the sender's
+	// queue arrives. This is what makes "accepted instantly, delivered twenty
+	// minutes later" reproducible: the API answers in milliseconds while
+	// delivery latency tracks queue depth divided by MPS.
+	s.maybeWebhookSequence(cb, sid, finalStatus, errorCode, sendQueued, sendSent, queueWait)
 }
 
-func (s *server) maybeWebhookSequence(callbackURL, msgSid, finalStatus string, errorCode int, sendQueued, sendSent bool) {
+func (s *server) maybeWebhookSequence(callbackURL, msgSid, finalStatus string, errorCode int, sendQueued, sendSent bool, queueWait time.Duration) {
 	if callbackURL == "" {
 		return
 	}
 	go func() {
+		// Wait for this message's slot before reporting anything past "queued".
+		if queueWait > 0 {
+			time.Sleep(queueWait)
+		}
 		post := func(status string, code int) {
 			form := url.Values{}
 			form.Set("MessageSid", msgSid)
