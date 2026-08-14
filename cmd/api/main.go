@@ -51,7 +51,18 @@ func main() {
 	observability.RegisterAPI(prometheus.DefaultRegisterer)
 
 	store := pg.New(db)
-	producer := &sqsqueue.Producer{SQS: sqsClient, QueueURL: cfg.SQSQueueURL, GroupBuckets: cfg.SQSGroupBuckets}
+	sendDelay, err := time.ParseDuration(cfg.SQSSendBatchDelay)
+	if err != nil {
+		slog.Error("invalid SQS_SEND_BATCH_DELAY", "err", err, "value", cfg.SQSSendBatchDelay)
+		os.Exit(1)
+	}
+	producer := &sqsqueue.Producer{
+		SQS:      sqsClient,
+		QueueURL: cfg.SQSQueueURL,
+		MaxBatch: cfg.SQSSendBatchSize,
+		MaxDelay: sendDelay,
+	}
+	defer producer.Close()
 
 	svc := &service.NotificationService{
 		Store:     store,

@@ -2,6 +2,9 @@ package awsutil
 
 import (
 	"context"
+	"net"
+	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	configv2 "github.com/aws/aws-sdk-go-v2/config"
@@ -9,13 +12,44 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
+// newHTTPClient returns a transport sized for a service that keeps hundreds of
+// SQS calls in flight against a single host.
+//
+// Go's default transport allows two idle connections per host. Every call
+// beyond that opens a fresh connection and pays a TCP handshake plus a TLS
+// handshake — one to two round-trips to the SQS endpoint — before it sends a
+// byte, and then throws the connection away. Under load that turns a queue
+// call from ~10ms into ~40ms and burns local ports. Raising the idle pool to
+// match the concurrency lets connections be reused, which is the difference
+// between the queue being a rounding error in the latency budget and being the
+// budget.
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   3 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          512,
+			MaxIdleConnsPerHost:   512,
+			MaxConnsPerHost:       0,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+}
+
 func NewSQSClient(ctx context.Context, region, endpoint string) (*sqs.Client, error) {
-	// Always load config normally
 	opts := []func(*configv2.LoadOptions) error{
 		configv2.WithRegion(region),
+		configv2.WithHTTPClient(newHTTPClient()),
 	}
 
-	// If LocalStack endpoint is set, use static dummy creds (LocalStack accepts these)
+	// LocalStack accepts these dummy credentials.
 	if endpoint != "" {
 		opts = append(opts, configv2.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider("test", "test", ""),
@@ -27,13 +61,10 @@ func NewSQSClient(ctx context.Context, region, endpoint string) (*sqs.Client, er
 		return nil, err
 	}
 
-	// For LocalStack: set service client BaseEndpoint (v2-style)
 	if endpoint != "" {
 		return sqs.NewFromConfig(cfg, func(o *sqs.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
 		}), nil
 	}
-
-	// Real AWS
 	return sqs.NewFromConfig(cfg), nil
 }

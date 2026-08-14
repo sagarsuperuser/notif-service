@@ -59,12 +59,19 @@ func main() {
 	reg := prometheus.DefaultRegisterer
 	observability.RegisterWorker(reg)
 
+	deleteWait, err := time.ParseDuration(cfg.SQSDeleteBatchWait)
+	if err != nil {
+		slog.Error("invalid SQS_DELETE_BATCH_WAIT", "err", err, "value", cfg.SQSDeleteBatchWait)
+		os.Exit(1)
+	}
 	consumer := &sqsqueue.Consumer{
 		SQS:               sqsClient,
 		QueueURL:          cfg.SQSQueueURL,
 		WaitTimeSeconds:   cfg.SQSWaitTime,
 		MaxMessages:       cfg.SQSMaxMsgs,
 		VisibilityTimeout: cfg.SQSVizTimeout,
+		Receivers:         cfg.SQSReceivers,
+		DeleteBatchDelay:  deleteWait,
 	}
 
 	// health server (dependency checks)

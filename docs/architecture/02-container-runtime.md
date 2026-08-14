@@ -20,7 +20,7 @@ flowchart TB
       grafana[Grafana]
     end
 
-    qsend[(SQS send.fifo)]
+    qsend[(SQS send (standard))]
     qwebhook[(SQS webhook-events)]
     dbproxy[(RDS Proxy)]
     db[(Postgres RDS)]
