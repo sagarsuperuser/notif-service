@@ -77,8 +77,36 @@ func (c *Client) SendSMS(ctx context.Context, req SendRequest) (SendResponse, in
 	return out, resp.StatusCode, b, nil
 }
 
-// Retry decision for transient errors
+// ShouldRetry classifies a failed send as transient or permanent.
+//
+// The status is checked FIRST, and this ordering is the whole point. SendSMS
+// returns a non-nil error alongside every non-2xx response, so an earlier
+// version that tested `err != nil` first returned false for every provider
+// response and the status branches below were unreachable. A 429 — which the
+// provider documents as "not processed and safe to retry after backing off" —
+// was classified permanent, and the worker wrote the message terminally failed
+// on its first attempt. Because a terminal row cannot be re-claimed, the
+// redelivered queue message was then acknowledged and deleted, so the send was
+// abandoned without ever reaching the dead-letter queue.
+//
+// A status of zero means the request never got a response at all (SendSMS
+// returns 0 on transport failure), which is the only case where the error value
+// carries the information.
 func ShouldRetry(err error, httpStatus int) bool {
+	if httpStatus > 0 {
+		// The provider answered. Its status decides, whatever error accompanies it.
+		switch {
+		case httpStatus == 429, httpStatus == 408:
+			return true // throttled or request timeout: back off and retry
+		case httpStatus >= 500 && httpStatus <= 599:
+			return true // provider-side fault
+		default:
+			return false // 4xx other than the above is our fault and will not improve
+		}
+	}
+
+	// No response: transport failure. Only timeouts are worth retrying; a
+	// refused connection or DNS failure will not fix itself within the budget.
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return true
@@ -87,13 +115,6 @@ func ShouldRetry(err error, httpStatus int) bool {
 		if errors.As(err, &ne) && ne.Timeout() {
 			return true
 		}
-		return false
-	}
-	if httpStatus == 429 || httpStatus == 408 {
-		return true
-	}
-	if httpStatus >= 500 && httpStatus <= 599 {
-		return true
 	}
 	return false
 }
