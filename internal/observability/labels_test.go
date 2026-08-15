@@ -35,8 +35,9 @@ var reserved = map[string]string{
 func TestMetricLabelsAvoidOperatorReservedNames(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	for _, c := range []prometheus.Collector{
-		APIRequests, WebhookRequests, Enqueues, TwilioSend,
-		WorkerProcessed, WebhookEvents, WebhookMessageUpdateNotFound,
+		APIRequests, WebhookRequests, Enqueues,
+		WebhookEvents, WebhookMessageUpdateNotFound,
+		ProviderCallSeconds, ProviderAttempts, MessageOutcome, ClaimResult,
 		DBRoundTrips, DBPoolConns, DBPoolAcquireSeconds, DBPoolEmptyAcquires,
 	} {
 		if err := reg.Register(c); err != nil {
