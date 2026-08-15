@@ -38,13 +38,24 @@ type Processor struct {
 func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 	started := util.NowUTC()
 	processed := false
-	result := "success"
+
+	// Deliberately empty. An audit found the previous version defaulted this to
+	// "success" and had five error returns that left it there, so failures were
+	// counted as successes. Every exit path below names its outcome, and an
+	// empty one is reported as "unset" rather than silently becoming a success —
+	// so a future unnamed exit shows up as a visible gap instead of inflating
+	// the success rate.
+	outcome := ""
 
 	defer func() {
-		if processed {
-			observability.WorkerProcessed.WithLabelValues(result).Inc()
-			observability.WorkerProcessingSeconds.Observe(time.Since(started).Seconds())
+		if !processed {
+			return
 		}
+		if outcome == "" {
+			outcome = "unset"
+		}
+		observability.MessageOutcome.WithLabelValues(outcome).Inc()
+		observability.WorkerProcessingSeconds.Observe(time.Since(started).Seconds())
 	}()
 
 	// Claiming is what makes this consumer idempotent, and it now also loads the
@@ -56,22 +67,26 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 		return err
 	}
 	if !found {
+		observability.ClaimResult.WithLabelValues("missing").Inc()
 		// The job names a message that does not exist. Returning an error sends
 		// it back to the queue and eventually to the DLQ, where it is visible,
 		// rather than silently dropping it.
-		observability.WorkerProcessed.WithLabelValues("failure_message_missing").Inc()
+
 		return errors.New("message not found: " + job.MessageID)
 	}
 	if !msg.Claimed {
 		// Terminal, already submitted, or held by another worker. Ordinary
-		// duplicate delivery — acknowledge and move on.
+		// duplicate delivery — counted as a claim result, NOT as a message
+		// outcome, so redeliveries stop inflating any per-message ratio.
+		observability.ClaimResult.WithLabelValues("skipped").Inc()
 		return nil
 	}
+	observability.ClaimResult.WithLabelValues("claimed").Inc()
 	processed = true
 
 	bodyTmpl, ok := p.Templates[msg.TemplateID]
 	if !ok || bodyTmpl == "" {
-		result = "failure_invalid_template"
+		outcome = "template_not_found"
 		if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{
 			ID:        job.MessageID,
 			State:     "failed",
@@ -84,33 +99,42 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 	}
 	body := util.RenderTemplate(bodyTmpl, msg.Vars)
 
-	// Send with small retries on transient issues
+	// Send with small retries on transient issues.
+	//
+	// Note there is no timer started here. The metric this replaced began its
+	// clock at this point, so every sample carried the limiter wait and any
+	// retries — and was then quoted as provider latency. The provider call is
+	// timed where the provider call happens, below.
 	var lastErr error
-	start := util.NowUTC()
 	endToEndRecorded := false
 
 	for attemptNum := 0; attemptNum < 3; attemptNum++ {
 		// 1) Rate limit before calling Twilio (per pod)
 		if p.Limiter != nil {
 			waitCtx, cancelWait := context.WithTimeout(ctx, 2*time.Second)
+			waitStart := util.NowUTC()
 			err := p.Limiter.Wait(waitCtx)
+			observability.ProviderWaitSeconds.Observe(time.Since(waitStart).Seconds())
 			cancelWait()
 			if err != nil {
 				// If we can't even acquire a token, treat as transient (don't mark failed)
-				observability.TwilioSend.WithLabelValues("rate_limited_local", "0").Inc()
+				observability.ProviderAttempts.WithLabelValues("rate_limit_timeout", "0").Inc()
 				lastErr = err
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
 		}
 
-		// 2) Circuit breaker wraps the Twilio call
+		// 2) Circuit breaker wraps the provider call. The timer wraps exactly
+		// this and nothing else: not the limiter above, not the backoff below.
+		callStart := util.NowUTC()
 		resAny, err := p.executeWithBreaker(ctx, msg.To, body)
+		callSeconds := time.Since(callStart).Seconds()
 
 		// 3) Handle breaker open (fail fast; let SQS redrive later)
 		if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
-			observability.TwilioSend.WithLabelValues("failed_cb_open", "0").Inc()
-			result = "failure_throttled_cb"
+			observability.ProviderAttempts.WithLabelValues("circuit_open", "0").Inc()
+			outcome = "circuit_breaker_open"
 			// IMPORTANT: do NOT mark message failed; this is transient provider protection.
 			return err
 		}
@@ -123,8 +147,9 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 			r := resAny.(sendResult)
 			resp, httpStatus, raw = r.resp, r.httpStatus, r.raw
 
-			observability.TwilioSend.WithLabelValues("ok", strconv.Itoa(httpStatus)).Inc()
-			observability.TwilioLatency.Observe(time.Since(start).Seconds())
+			observability.ProviderAttempts.WithLabelValues("ok", strconv.Itoa(httpStatus)).Inc()
+			observability.ProviderCallSeconds.WithLabelValues("ok").Observe(callSeconds)
+			outcome = "submitted"
 			if !endToEndRecorded {
 				observability.EndToEndLatency.Observe(time.Since(msg.CreatedAt).Seconds())
 				endToEndRecorded = true
@@ -166,7 +191,8 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 			raw = tce.raw
 		}
 
-		observability.TwilioSend.WithLabelValues("error", strconv.Itoa(httpStatus)).Inc()
+		observability.ProviderAttempts.WithLabelValues("error", strconv.Itoa(httpStatus)).Inc()
+		observability.ProviderCallSeconds.WithLabelValues("error").Observe(callSeconds)
 		if !endToEndRecorded {
 			observability.EndToEndLatency.Observe(time.Since(msg.CreatedAt).Seconds())
 			endToEndRecorded = true
@@ -202,7 +228,7 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 			return recErr
 		}
 		if nonRetryable {
-			result = "failure_non_retryable"
+			outcome = "provider_rejected"
 			return err
 		}
 
@@ -217,7 +243,7 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 	}); err != nil {
 		return err
 	}
-	result = "failure_retry_exhausted"
+	outcome = "retries_exhausted"
 	return lastErr
 }
 

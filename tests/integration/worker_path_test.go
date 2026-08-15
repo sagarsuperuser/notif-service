@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
+	"notif/internal/observability"
 	"notif/internal/providers/twilio"
 	sqsqueue "notif/internal/queue/sqs"
 	"notif/internal/store"
@@ -468,4 +470,99 @@ func TestProcessor_AlreadySubmittedIsSkipped(t *testing.T) {
 	if got := stateOf(t, db, "p-done"); got != "submitted" {
 		t.Errorf("state = %q, want submitted (unchanged)", got)
 	}
+}
+
+// TestProcessor_EveryOutcomeIsNamed is the gate on the defect that made the
+// previous counter unusable.
+//
+// notif_worker_processed_total initialised its label to "success" and had five
+// error returns that never reassigned it, so a template failure, a claim error,
+// a store error and an exhausted retry were all counted as successes. The
+// counter said what the code wished had happened.
+//
+// The replacement starts empty and reports "unset" if any path forgets, so a
+// future unnamed exit shows up as a visible series rather than silently
+// inflating the success rate. This test drives the paths that used to be
+// mislabelled and asserts none of them lands on "unset" — and, crucially, that
+// none lands on the success outcome either.
+func TestProcessor_EveryOutcomeIsNamed(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	observability.MessageOutcome.Reset()
+	if err := reg.Register(observability.MessageOutcome); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	now := util.NowUTC()
+
+	cases := []struct {
+		name        string
+		templates   map[string]string
+		sender      *countingSender
+		wantOutcome string
+	}{
+		{
+			name:        "template missing",
+			templates:   map[string]string{}, // no "tpl"
+			sender:      &countingSender{sid: "SM-x"},
+			wantOutcome: "template_not_found",
+		},
+		{
+			name:        "provider rejects permanently",
+			templates:   map[string]string{"tpl": "hello"},
+			sender:      &countingSender{sid: "SM-y", fail: errNonRetryable{}},
+			wantOutcome: "provider_rejected",
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := fmt.Sprintf("oc-%d", i)
+			seedMessageInState(t, db, id, "oc-tenant", fmt.Sprintf("oc-idem-%d", i), "queued", "", now)
+
+			p := &workerproc.Processor{
+				Store: pg.New(db), Sender: tc.sender, Templates: tc.templates,
+			}
+			_ = p.Process(context.Background(), sqsqueue.SMSJob{MessageID: id})
+
+			got := outcomeCounts(t, reg)
+			if got["unset"] > 0 {
+				t.Errorf("an exit path did not name its outcome (unset=%v) — that is the defect this test exists for", got["unset"])
+			}
+			if got[tc.wantOutcome] == 0 {
+				t.Errorf("expected outcome %q to be recorded; saw %v", tc.wantOutcome, got)
+			}
+			if got["submitted"] > 0 {
+				t.Errorf("a failure was recorded as submitted: %v — this is exactly how the old counter reported failures as successes", got)
+			}
+			observability.MessageOutcome.Reset()
+		})
+	}
+}
+
+type errNonRetryable struct{}
+
+func (errNonRetryable) Error() string { return "permanent provider rejection" }
+
+func outcomeCounts(t *testing.T, reg *prometheus.Registry) map[string]float64 {
+	t.Helper()
+	out := map[string]float64{}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "notif_message_outcome_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "outcome" {
+					out[l.GetValue()] = m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return out
 }
