@@ -411,14 +411,18 @@ func (s *server) postWebhookWithRetry(ctx context.Context, callbackURL, sig stri
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Every attempt is counted, not just the failures that exhaust the
-		// budget. Intermediate retries were previously invisible: the totals
-		// showed 0.19% more callbacks than messages and nothing said why.
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, strings.NewReader(form.Encode()))
+
+		// Counted AFTER the request is built, so the counter means "a POST was
+		// issued" rather than "the loop began an iteration". Previously it
+		// incremented first, which would overcount had request construction
+		// ever failed — a small window, but the counter's whole purpose is to
+		// explain a discrepancy, and a counter that can itself be the
+		// discrepancy is no use for that.
 		mockWebhookAttempts.Inc()
 		if attempt > 0 {
 			mockWebhookRetries.Inc()
 		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("X-Twilio-Signature", sig)
 
