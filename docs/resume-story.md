@@ -47,9 +47,14 @@ double-sending others. Fixed with a separate drain context and an unconditional
 delete, pinned by a test that holds handlers open across shutdown.
 
 **Sized HTTP transport connection pools** after finding three services on Go's
-two-idle-connections-per-host default, which forced a TLS handshake on most
-provider calls. Controlled A/B with identical load and fresh counters: provider
-call latency down 48% (414ms to 217ms) and campaign completion down 14%.
+two-idle-connections-per-host default, which forced a TCP and TLS handshake on
+most provider calls. Controlled A/B with identical load and fresh counters:
+campaign completion down 14% (138s to 119s over 40,000 messages).
+
+The latency half of that result is withdrawn pending re-measurement. It was read
+from a histogram whose clock started before a rate limiter and a retry loop, so
+it never bounded the provider call it was quoted as measuring. The instrument
+has been replaced and the A/B needs re-running against it.
 
 **Removed a hard 300 TPS ceiling** by moving the send queue off SQS FIFO after
 establishing that nothing required global ordering, replacing its five-minute

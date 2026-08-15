@@ -53,9 +53,9 @@ the thirty minutes measured when it was badly misconfigured.
 Scraped from the pod's /metrics after the run.
 
 ```
-notif_worker_processed_total{result="success"}   49942
+notif_worker_processed_total{result="success"}   49942   [metric since DELETED]
 twilio_send_total{http_status="201",result="ok"} 49942
-notif_db_roundtrips_total{outcome="ok"}          99884
+notif_db_roundtrips_total{outcome="ok"}          99884   [renamed notif_db_query_calls_total]
 ```
 
 49,942 messages against 99,884 database round-trips is **exactly 2.00 per
@@ -67,7 +67,7 @@ retries inflating the throughput.
 Timings, same pod:
 
 ```
-twilio_send_latency_seconds       408ms mean   (20362.93s / 49942)
+twilio_send_latency_seconds       408ms mean   [metric since DELETED — see note]
 notif_worker_processing_seconds   418ms mean   (20895.97s / 49942)
 notif_end_to_end_latency_seconds  4.30s mean   (214809.43s / 49942)
 ```
@@ -76,6 +76,33 @@ The provider call is 408ms of the 418ms a message spends being processed, so
 97% of worker time is spent waiting on the provider and 3% on everything this
 service does. That is the correct shape: the remaining engineering value is in
 not adding to it.
+
+## The instruments behind these figures were later found faulty
+
+An audit of every metric against its increment sites, run after this campaign,
+returned six verdicts: five misleading and one wrong. Three affect the numbers
+above and are marked at the point they appear.
+
+notif_worker_processed_total defaulted its outcome label to "success" and had
+five error returns that never reassigned it, so failures counted as successes.
+Deleted, replaced by notif_message_outcome_total, which starts empty.
+
+twilio_send_latency_seconds started its clock before a token-bucket rate limiter
+and a three-attempt retry loop. The 408ms is limiter queueing plus retries plus
+the call, not provider latency. Deleted, replaced by notif_provider_call_seconds
+wrapping only the call, with the limiter measured separately.
+
+notif_db_roundtrips_total is neither every query nor one per round-trip: pgx
+routes pool.Ping below the tracer, out-of-process SQL never reaches it, acquire
+failures produce no increment, and a statement-cache miss is one increment
+covering two wire exchanges. Renamed notif_db_query_calls_total. The 2.00
+per-message ratio also used a denominator that excludes duplicate deliveries
+counted in the numerator.
+
+What survives unaffected: the message counts and states, which come from
+Postgres; the SQS series, which come from CloudWatch; and the round-trip
+reduction itself, which was measured by a dedicated counted pool in
+tests/integration/roundtrips_test.go rather than by the production counter.
 
 ## One thing worth fixing
 
