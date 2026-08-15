@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -105,18 +104,22 @@ func ShouldRetry(err error, httpStatus int) bool {
 		}
 	}
 
-	// No response: transport failure. Only timeouts are worth retrying; a
-	// refused connection or DNS failure will not fix itself within the budget.
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return true
-		}
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			return true
-		}
-	}
-	return false
+	// No response at all: a transport failure, which is ALWAYS transient.
+	//
+	// This branch previously retried only timeouts, on the reasoning that a
+	// refused connection would not recover within the retry budget. That
+	// reasoning was about the wrong loop. Returning false here does not merely
+	// skip the three in-process attempts — it marks the message permanently
+	// failed, which also forecloses the SQS redelivery that exists precisely
+	// for faults lasting longer than a couple of seconds. A provider outage
+	// presents as connection-refused, and the old answer discarded every
+	// message in flight during one.
+	//
+	// The rule that holds: a transport error describes the connection, never
+	// the message. Nothing at this layer can tell you a message is
+	// undeliverable, so nothing here may end it. Only the provider's own
+	// answer can, and by definition there isn't one.
+	return err != nil
 }
 
 func Backoff(attempt int) time.Duration {
