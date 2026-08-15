@@ -319,3 +319,68 @@ func TestConsumer_DrainsInFlightOnShutdown(t *testing.T) {
 			"redelivered and eventually dead-lettered", done, deleted)
 	}
 }
+
+// TestConsumer_HandlerConcurrencyIsBounded pins the guarantee that carries the
+// whole load story now that the per-pod rate limiter is gone.
+//
+// The provider limits how many requests an account may have IN FLIGHT, not how
+// many it may start per second, so the worker's control has to be over in-flight
+// requests. That control is this bound and nothing else: if PollConcurrent ever
+// ran more handlers than it was given, the service would have no way to stay
+// under a provider concurrency allowance.
+//
+// A rate limiter cannot substitute. Rate and concurrency are only equivalent at
+// a fixed latency, and provider latency is exactly what moves during an
+// incident: at 130ms a 70/s limit implies ~9 in flight, and at 6s the same limit
+// implies 420.
+func TestConsumer_HandlerConcurrencyIsBounded(t *testing.T) {
+	const workers = 8
+	f := &fakeSQS{latency: time.Millisecond, remaining: 600}
+	c := &Consumer{
+		SQS: f, QueueURL: "q",
+		MaxMessages: 10, WaitTimeSeconds: 0, VisibilityTimeout: 30,
+		Receivers: 4, DeleteBatchDelay: time.Millisecond,
+	}
+
+	var inFlight, peak, done atomic.Int64
+	finished := make(chan struct{})
+	var once sync.Once
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = c.PollConcurrent(ctx, workers, func(ctx context.Context, job SMSJob) error {
+			n := inFlight.Add(1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			// Hold the slot long enough that an unbounded pool would pile up
+			// visibly rather than racing through one at a time.
+			time.Sleep(2 * time.Millisecond)
+			inFlight.Add(-1)
+			if done.Add(1) == 600 {
+				once.Do(func() { close(finished) })
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		t.Fatalf("drained only %d of 600", done.Load())
+	}
+
+	if got := peak.Load(); got > workers {
+		t.Errorf("peak in-flight handlers = %d with a bound of %d; the only control over provider concurrency "+
+			"does not hold", got, workers)
+	}
+	// A bound nothing reaches proves nothing, so require the pool to have been
+	// genuinely saturated.
+	if got := peak.Load(); got < workers {
+		t.Errorf("peak in-flight handlers = %d, never reached the bound of %d — the test did not exercise it", got, workers)
+	}
+}

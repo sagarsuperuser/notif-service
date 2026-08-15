@@ -26,7 +26,5 @@ data:
   TWILIO_BASE_URL: "http://notif-mock-provider-svc"
 
   # Twilio throttling knobs (per pod)
-  TWILIO_RPS_PER_POD: "70"
-  TWILIO_BURST: "70"
 
   # Webhook behavior knobs

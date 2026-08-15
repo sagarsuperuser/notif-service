@@ -30,18 +30,6 @@ var (
 		[]string{"outcome"},
 	)
 
-	// ProviderWaitSeconds is the local rate limiter, measured separately. This
-	// is the half that used to hide inside the latency figure: when the limiter
-	// is tight, this is where the time goes, and it is our own doing rather
-	// than the provider's.
-	ProviderWaitSeconds = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "notif_provider_rate_limit_wait_seconds",
-			Help:    "Time a send waited on the local token-bucket limiter before its provider call",
-			Buckets: []float64{.001, .005, .01, .05, .1, .25, .5, 1, 2},
-		},
-	)
-
 	// MessageOutcome is one increment per message the worker CLAIMED and
 	// finished, with the outcome named explicitly at each exit. A message the
 	// worker skipped because another worker held it is not an outcome and is
@@ -79,7 +67,7 @@ var (
 
 func RegisterWorkerMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(
-		ProviderCallSeconds, ProviderWaitSeconds,
+		ProviderCallSeconds,
 		MessageOutcome, ClaimResult, ProviderAttempts,
 	)
 }

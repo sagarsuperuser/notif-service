@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/sony/gobreaker"
-	"golang.org/x/time/rate"
 
 	"notif/internal/observability"
 	"notif/internal/providers/twilio"
@@ -31,7 +30,6 @@ type Processor struct {
 	Store           Store
 	Sender          TwilioSender
 	Templates       map[string]string
-	Limiter         *rate.Limiter
 	Breaker         *gobreaker.CircuitBreaker
 	ClaimStaleAfter time.Duration
 }
@@ -105,36 +103,20 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 	// Send with small retries on transient issues.
 	//
 	// Note there is no timer started here. The metric this replaced began its
-	// clock at this point, so every sample carried the limiter wait and any
-	// retries — and was then quoted as provider latency. The provider call is
-	// timed where the provider call happens, below.
+	// clock at this point, so every sample carried the whole retry loop and was
+	// then quoted as provider latency. The provider call is timed where the
+	// provider call happens, below.
 	var lastErr error
 	endToEndRecorded := false
 
 	for attemptNum := 0; attemptNum < 3; attemptNum++ {
-		// 1) Rate limit before calling Twilio (per pod)
-		if p.Limiter != nil {
-			waitCtx, cancelWait := context.WithTimeout(ctx, 2*time.Second)
-			waitStart := util.NowUTC()
-			err := p.Limiter.Wait(waitCtx)
-			observability.ProviderWaitSeconds.Observe(time.Since(waitStart).Seconds())
-			cancelWait()
-			if err != nil {
-				// If we can't even acquire a token, treat as transient (don't mark failed)
-				observability.ProviderAttempts.WithLabelValues("rate_limit_timeout", "0").Inc()
-				lastErr = err
-				time.Sleep(200 * time.Millisecond)
-				continue
-			}
-		}
-
-		// 2) Circuit breaker wraps the provider call. The timer wraps exactly
-		// this and nothing else: not the limiter above, not the backoff below.
+		// The circuit breaker wraps the provider call. The timer wraps exactly
+		// this and nothing else — not the backoff below.
 		callStart := util.NowUTC()
 		resAny, err := p.executeWithBreaker(ctx, msg.To, body)
 		callSeconds := time.Since(callStart).Seconds()
 
-		// 3) Handle breaker open (fail fast; let SQS redrive later)
+		// Breaker open: fail fast and let SQS redrive.
 		if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
 			observability.ProviderAttempts.WithLabelValues("circuit_open", "0").Inc()
 			outcome = "circuit_breaker_open"

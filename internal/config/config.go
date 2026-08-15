@@ -62,13 +62,11 @@ type WorkerConfig struct {
 	ProviderMaxIdleConns int `envconfig:"PROVIDER_MAX_IDLE_CONNS" default:"0"`
 
 	// Twilio
-	TwilioAccountSID          string  `envconfig:"TWILIO_ACCOUNT_SID" required:"true"`
-	TwilioAuthToken           string  `envconfig:"TWILIO_AUTH_TOKEN" required:"true"`
-	TwilioMessagingServiceSID string  `envconfig:"TWILIO_MESSAGING_SERVICE_SID"`
-	TwilioFromNumber          string  `envconfig:"TWILIO_FROM_NUMBER"`
-	TwilioBaseURL             string  `envconfig:"TWILIO_BASE_URL" default:"https://api.twilio.com"`
-	TwilioRPSPerPod           float64 `envconfig:"TWILIO_RPS_PER_POD" default:"5"`
-	TwilioBurst               int     `envconfig:"TWILIO_BURST" default:"10"`
+	TwilioAccountSID          string `envconfig:"TWILIO_ACCOUNT_SID" required:"true"`
+	TwilioAuthToken           string `envconfig:"TWILIO_AUTH_TOKEN" required:"true"`
+	TwilioMessagingServiceSID string `envconfig:"TWILIO_MESSAGING_SERVICE_SID"`
+	TwilioFromNumber          string `envconfig:"TWILIO_FROM_NUMBER"`
+	TwilioBaseURL             string `envconfig:"TWILIO_BASE_URL" default:"https://api.twilio.com"`
 }
 
 type WebhookConfig struct {
