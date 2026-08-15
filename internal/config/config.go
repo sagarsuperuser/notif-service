@@ -55,6 +55,12 @@ type WorkerConfig struct {
 
 	WorkerConcurrency int `envconfig:"WORKER_CONCURRENCY" default:"20"`
 
+	// Idle connections kept per host for provider calls. Exists as a knob so an
+	// A/B can vary ONLY this, on one build, with one set of instruments — the
+	// alternative is swapping images, which also swaps the metrics and makes the
+	// two arms unmeasurable against each other. 0 means size it to concurrency.
+	ProviderMaxIdleConns int `envconfig:"PROVIDER_MAX_IDLE_CONNS" default:"0"`
+
 	// Twilio
 	TwilioAccountSID          string  `envconfig:"TWILIO_ACCOUNT_SID" required:"true"`
 	TwilioAuthToken           string  `envconfig:"TWILIO_AUTH_TOKEN" required:"true"`

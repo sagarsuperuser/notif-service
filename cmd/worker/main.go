@@ -30,6 +30,18 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// providerIdleConns sizes the provider transport pool. Zero means match worker
+// concurrency, which is the correct default: every handler may hold a
+// connection at once. A non-zero value is for experiments that need to vary
+// this alone — notably reproducing Go's two-connection default, which forces a
+// TLS handshake on most calls.
+func providerIdleConns(cfg config.WorkerConfig) int {
+	if cfg.ProviderMaxIdleConns > 0 {
+		return cfg.ProviderMaxIdleConns
+	}
+	return cfg.WorkerConcurrency + 20
+}
+
 func main() {
 	cfg := config.LoadWorker()
 	logging.Init("worker", cfg.LogFormat)
@@ -126,7 +138,7 @@ func main() {
 		// Sized to worker concurrency: every handler may hold a connection to
 		// the provider at once, and the default pool of two would make the rest
 		// pay a TCP and TLS handshake per send.
-		HTTP:                httpx.Client(8*time.Second, cfg.WorkerConcurrency+20),
+		HTTP:                httpx.Client(8*time.Second, providerIdleConns(cfg)),
 		MessagingServiceSID: cfg.TwilioMessagingServiceSID,
 		FromNumber:          cfg.TwilioFromNumber,
 		BaseURL:             cfg.TwilioBaseURL,
