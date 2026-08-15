@@ -14,7 +14,7 @@ idle-connection pool.
 |---|---|---|---|
 | campaign duration | 138s | 119s | **−14%** |
 | provider call latency, mean | 414 ms | 217 ms | **−48%** |
-| DB pool "empty acquire" events | 8,961 | 191 | **−98%** |
+| DB connections constructed | 8,961 | 191 | **−98%** |
 | cumulative wait for a connection | 111.1s | 7.7s | **−93%** |
 | messages delivered | 40,000 | 40,000 | — |
 | DB round-trips | 80,000 | 80,000 | unchanged |
@@ -27,17 +27,34 @@ host, so every provider call past the second paid a TCP and TLS handshake before
 sending a byte. That accounts straightforwardly for the latency halving, and for
 the shorter campaign that follows from it.
 
-**What is not established.** Why the same change moved a DATABASE pool counter
-by 98% is unexplained. An earlier version of this document asserted that slow
-provider calls made handlers hold their database connections longer, which is
-wrong: the worker acquires a connection for ClaimAndLoad and releases it, makes
-the provider call holding nothing, then acquires again for RecordAttempt. If
-anything, slower HTTP should mean handlers spend more time outside the pool and
-contend for it less — the opposite of what was measured.
+**The database row, correctly read.** This metric is not what its name
+suggests. pgx increments EmptyAcquireCount at two places, and the second is:
 
-So the correlation is real and controlled, and the mechanism behind that one row
-is not known. Quoting it as cause-and-effect would be inventing the interesting
-half. Establishing it needs a rebuild with per-phase connection-acquire timing.
+    // The resource is not idle, but there is enough space to create one.
+    res := p.createNewResource()
+    ...
+    p.emptyAcquireCount += 1
+
+So it counts every acquisition that had to CONSTRUCT a connection, not only
+those that queued behind a busy one. It is a measure of connection CHURN, not
+of contention or exhaustion.
+
+That resolves the row without contradicting the code. Handlers acquire a
+connection, run a query of about a millisecond, and release it, so with a
+hundred handlers against twenty connections the pool is almost always idle and
+true contention is rare — which is why the acquired gauge never showed a busy
+pool. What differs between the arms is how often connections went cold enough
+to be reaped and had to be rebuilt. Slower provider calls space the queries
+further apart; faster ones keep the pool warm.
+
+So the same root cause runs through both layers: connections that could not stay
+warm, once in the HTTP transport and once in the database pool.
+
+An earlier version of this document said instead that slow provider calls made
+handlers hold database connections longer. That was wrong — the connection is
+released before the provider call — and it is recorded here because the
+correction came from reading pgx's source rather than from the measurement,
+which had been consistent all along and merely mislabelled.
 
 The same default was present in three places: the SQS client, the worker's
 provider client, and the simulator's webhook client. Two carried enough traffic
