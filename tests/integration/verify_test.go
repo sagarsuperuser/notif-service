@@ -132,9 +132,20 @@ func TestVerify_EachInvariantCatchesItsViolation(t *testing.T) {
 			},
 		},
 		{
-			invariant: "no message was left queued",
+			// last_error is what distinguishes the two queued checks, so each
+			// corruption must set it deliberately. Corrupting only the state
+			// would trip whichever check happens to match and leave the other
+			// unproven.
+			invariant: "no message was left queued without being attempted",
 			corrupt: func(t *testing.T, db *pgxpool.Pool) {
-				exec(t, db, `UPDATE messages SET state='queued' WHERE id='vm-0004'`)
+				exec(t, db, `UPDATE messages SET state='queued', last_error=NULL WHERE id='vm-0004'`)
+			},
+		},
+		{
+			invariant: "no message was parked after repeated provider failures",
+			corrupt: func(t *testing.T, db *pgxpool.Pool) {
+				exec(t, db, `UPDATE messages SET state='queued', last_error='twilio_retry_exhausted'
+				              WHERE id='vm-0004'`)
 			},
 		},
 		{

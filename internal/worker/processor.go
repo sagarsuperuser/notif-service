@@ -20,6 +20,7 @@ type Store interface {
 	ClaimAndLoad(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (store.ClaimedMessage, bool, error)
 	RecordAttempt(ctx context.Context, in store.AttemptRecord) error
 	MarkMessageState(ctx context.Context, in store.MessageStateUpdate) error
+	ReleaseForRetry(ctx context.Context, id, lastErr string, now time.Time) (bool, error)
 }
 
 type TwilioSender interface {
@@ -86,13 +87,15 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 
 	bodyTmpl, ok := p.Templates[msg.TemplateID]
 	if !ok || bodyTmpl == "" {
+		// Not terminal. Templates are loaded from configuration at boot, so a
+		// missing one is at least as likely to be a bad deploy as a bad
+		// message — and the two are indistinguishable from here. Failing the
+		// message permanently would destroy valid traffic during a config
+		// glitch, while handing it back costs a few redeliveries and puts it
+		// in the DLQ where it can be redriven once the template is restored.
+		// Of the two ways to be wrong, only one loses messages.
 		outcome = "template_not_found"
-		if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{
-			ID:        job.MessageID,
-			State:     "failed",
-			LastError: "template_not_found",
-			Now:       util.NowUTC(),
-		}); err != nil {
+		if _, err := p.Store.ReleaseForRetry(ctx, job.MessageID, "template_not_found", util.NowUTC()); err != nil {
 			return err
 		}
 		return errors.New("template_not_found: " + msg.TemplateID)
@@ -135,7 +138,18 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 		if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
 			observability.ProviderAttempts.WithLabelValues("circuit_open", "0").Inc()
 			outcome = "circuit_breaker_open"
-			// IMPORTANT: do NOT mark message failed; this is transient provider protection.
+			// Not a message failure — the provider is being protected, and this
+			// message never reached it.
+			//
+			// The claim is released rather than abandoned in 'processing'. If it
+			// were left held, the redelivery could only re-claim it once the row
+			// aged past the stale window, which makes recovery depend on two
+			// timeouts lining up. Releasing it makes the next delivery claimable
+			// immediately and leaves the stale window as a backstop for crashes,
+			// which is the only thing it can actually cover.
+			if _, relErr := p.Store.ReleaseForRetry(ctx, job.MessageID, "circuit_breaker_open", util.NowUTC()); relErr != nil {
+				return relErr
+			}
 			return err
 		}
 
@@ -235,12 +249,26 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 		time.Sleep(twilio.Backoff(attemptNum))
 	}
 
-	if err := p.Store.MarkMessageState(ctx, store.MessageStateUpdate{
-		ID:        job.MessageID,
-		State:     "failed",
-		LastError: "twilio_retry_exhausted",
-		Now:       util.NowUTC(),
-	}); err != nil {
+	// Exhausting the in-process attempts is NOT terminal, and treating it as
+	// terminal defeated the outer retry entirely.
+	//
+	// There are two nested loops by design: three attempts here over a couple
+	// of seconds, and up to sqs_send_max_receive_count deliveries outside,
+	// spaced by the visibility timeout. The outer loop is the one that matters
+	// for a provider outage, since no amount of retrying within two seconds
+	// survives an incident measured in minutes.
+	//
+	// Writing state='failed' here cut that off. ClaimAndLoad only claims
+	// 'queued' or stale 'processing', so the redelivery could not re-claim a
+	// failed row; it counted as skipped, returned nil, and the consumer
+	// deleted the receipt. The send was abandoned after one silent redelivery
+	// and never reached the DLQ — which is why "messages in DLQ: 0" could
+	// never have caught this.
+	//
+	// The branch above for an open circuit already states this rule ("do NOT
+	// mark message failed; this is transient provider protection"). This path
+	// now follows it.
+	if _, err := p.Store.ReleaseForRetry(ctx, job.MessageID, "twilio_retry_exhausted", util.NowUTC()); err != nil {
 		return err
 	}
 	outcome = "retries_exhausted"

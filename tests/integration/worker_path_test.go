@@ -595,3 +595,182 @@ func outcomeCounts(t *testing.T, reg *prometheus.Registry) map[string]float64 {
 	}
 	return out
 }
+
+// readMessage returns the state and last_error a message actually holds.
+func readMessage(t *testing.T, db *pgxpool.Pool, id string) (state string, lastErr string) {
+	t.Helper()
+	var le *string
+	if err := db.QueryRow(context.Background(),
+		`SELECT state, last_error FROM messages WHERE id=$1`, id).Scan(&state, &le); err != nil {
+		t.Fatalf("read message %s: %v", id, err)
+	}
+	if le != nil {
+		lastErr = *le
+	}
+	return state, lastErr
+}
+
+// TestProcessor_TransientFailureStaysRecoverable is the regression test for a
+// send that was abandoned without a trace.
+//
+// A transient provider failure used to end with state='failed'. ClaimAndLoad
+// claims only 'queued' or stale 'processing', so the SQS redelivery could not
+// re-claim the row: it counted as skipped, Process returned nil, and the
+// consumer deleted the receipt. The message was dropped after one silent
+// redelivery and never reached the DLQ.
+//
+// The assertion that matters is not the state itself but what the state
+// permits — so this drives the real redelivery through the real Processor and
+// requires the retry to actually happen.
+func TestProcessor_TransientFailureStaysRecoverable(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	const id = "recoverable-1"
+	seedMessageInState(t, db, id, "rec-tenant", "rec-idem", "queued", "", util.NowUTC())
+
+	sender := &countingSender{sid: "SM-rec", fail: errTransient{}, failStatus: 503}
+	p := &workerproc.Processor{
+		Store: pg.New(db), Sender: sender, Templates: map[string]string{"tpl": "hello"},
+	}
+
+	// First delivery: the provider is down, so every attempt fails.
+	err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: id})
+	if err == nil {
+		t.Fatal("Process returned nil after exhausting retries; the consumer would delete the receipt and the " +
+			"message would never redrive to the DLQ")
+	}
+	if got := sender.calls(); got != 3 {
+		t.Fatalf("provider called %d times, want 3 in-process attempts", got)
+	}
+
+	state, lastErr := readMessage(t, db, id)
+	if state == "failed" {
+		t.Fatalf("message is terminally failed after a TRANSIENT failure; a failed row cannot be re-claimed, " +
+			"so the redelivery would be skipped and acknowledged")
+	}
+	if lastErr == "" {
+		t.Error("nothing recorded why the message was handed back; the row is indistinguishable from one never attempted")
+	}
+
+	// Second delivery, provider recovered. This is the assertion the state
+	// exists to support: the redelivery must be claimable and must send.
+	sender.fail = nil
+	if err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: id}); err != nil {
+		t.Fatalf("redelivery failed: %v", err)
+	}
+	if got := sender.calls(); got != 4 {
+		t.Errorf("provider called %d times total, want 4 — the redelivery did not reach the provider, "+
+			"meaning the message was silently skipped", got)
+	}
+	if state, _ := readMessage(t, db, id); state != "submitted" {
+		t.Errorf("state after recovery = %q, want submitted", state)
+	}
+}
+
+// TestReleaseForRetry_DoesNotClobberATerminalState guards the write itself.
+//
+// A send whose response never arrived can still have reached the provider, so a
+// delivery callback may move the row forward while the worker is still deciding
+// it failed. An unguarded reset to 'queued' would send that recipient a second
+// SMS.
+func TestReleaseForRetry_DoesNotClobberATerminalState(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	st := pg.New(db)
+
+	for _, state := range []string{"delivered", "submitted", "failed", "suppressed", "queued"} {
+		t.Run(state, func(t *testing.T) {
+			id := "clobber-" + state
+			seedMessageInState(t, db, id, "clob-tenant", "clob-idem-"+state, state, "", util.NowUTC())
+
+			released, err := st.ReleaseForRetry(context.Background(), id, "should_not_apply", util.NowUTC())
+			if err != nil {
+				t.Fatalf("ReleaseForRetry: %v", err)
+			}
+			if released {
+				t.Errorf("reported a release of a %s message; only a held claim may be handed back", state)
+			}
+			if got, _ := readMessage(t, db, id); got != state {
+				t.Errorf("state changed from %q to %q — the guard did not hold", state, got)
+			}
+		})
+	}
+
+	// The one case it must act on.
+	id := "clobber-processing"
+	seedMessageInState(t, db, id, "clob-tenant", "clob-idem-processing", "processing", "", util.NowUTC())
+	released, err := st.ReleaseForRetry(context.Background(), id, "twilio_retry_exhausted", util.NowUTC())
+	if err != nil {
+		t.Fatalf("ReleaseForRetry: %v", err)
+	}
+	if !released {
+		t.Error("a held claim was not handed back")
+	}
+	state, lastErr := readMessage(t, db, id)
+	if state != "queued" || lastErr != "twilio_retry_exhausted" {
+		t.Errorf("got state=%q last_error=%q, want queued/twilio_retry_exhausted", state, lastErr)
+	}
+}
+
+// TestClaimAndLoad_ReclaimsAtTheRedeliveryBoundary covers the crash path, which
+// is the only thing the stale window still has to cover.
+//
+// A worker writes updated_at some interval after the message was received, so
+// the row becomes stale that same interval after the redelivery is due. When
+// the stale window equalled the visibility timeout, the redelivery always
+// arrived while the row still looked fresh, the worker treated it as held by
+// someone else, and the consumer deleted the receipt.
+func TestClaimAndLoad_ReclaimsAtTheRedeliveryBoundary(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	st := pg.New(db)
+
+	const visibility = 60 * time.Second
+	// The dead worker received the message at T and claimed it 3s later, a
+	// plausible receive-to-claim latency for a saturated pool.
+	received := util.NowUTC().Add(-visibility)
+	claimedAt := received.Add(3 * time.Second)
+	redeliveredAt := received.Add(visibility)
+
+	seed := func(id string) {
+		seedMessageInState(t, db, id, "stale-tenant", "stale-idem-"+id, "processing", "", claimedAt)
+	}
+
+	t.Run("window equal to the visibility timeout drops the message", func(t *testing.T) {
+		seed("stale-equal")
+		_, found, err := st.ClaimAndLoad(context.Background(), "stale-equal", redeliveredAt, visibility)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if !found {
+			t.Fatal("row missing")
+		}
+		// Documents the old behaviour rather than endorsing it: the redelivery
+		// cannot re-claim, so the worker acknowledges and the send is lost.
+		var claimed bool
+		if err := db.QueryRow(context.Background(),
+			`SELECT state='processing' AND updated_at=$2 FROM messages WHERE id=$1`,
+			"stale-equal", claimedAt).Scan(&claimed); err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if !claimed {
+			t.Skip("environment reclaimed at the boundary; the race is timing-dependent by nature")
+		}
+	})
+
+	t.Run("half the visibility timeout reclaims it", func(t *testing.T) {
+		seed("stale-half")
+		msg, found, err := st.ClaimAndLoad(context.Background(), "stale-half", redeliveredAt, visibility/2)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if !found {
+			t.Fatal("row missing")
+		}
+		if !msg.Claimed {
+			t.Error("a crashed worker's message was not re-claimed at the redelivery boundary — it would be " +
+				"acknowledged and silently dropped")
+		}
+	})
+}
