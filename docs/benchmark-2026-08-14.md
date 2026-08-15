@@ -9,9 +9,17 @@ The **accept path**: `POST /v1/sms/messages` through to a durably queued send.
 That is the path a caller waits on, and the one whose cost per request was the
 subject of the work leading up to this.
 
-The send path is deliberately not the headline. It is bounded by the provider's
-rate limit (`TWILIO_RPS_PER_POD=70`), not by anything in this service, so
-measuring it would measure the limiter.
+The send path is deliberately not the headline. It is bounded by
+`TWILIO_RPS_PER_POD=70`, so measuring it would measure the limiter.
+
+> **Correction, 15 August 2026.** This section originally called that "the
+> provider's rate limit ... not [something] in this service". That was backwards.
+> `TWILIO_RPS_PER_POD` was a token bucket inside this service, and the ceiling it
+> produced was self-imposed rather than external. The measurement below is
+> unaffected — 142/s is what the run did — but the attribution was wrong, and
+> being wrong in that particular direction is what let the limiter survive as
+> long as it did: a ceiling blamed on the provider is nobody's bug to fix.
+> The limiter has since been removed; see "Sends" below.
 
 ## Stack
 
@@ -71,7 +79,11 @@ the whole ladder is 1.52s, dominated by the top two steps.
 At 1,000 rps the run needed ~16 concurrent connections to hold the rate, which
 puts per-request latency around 16ms — the API tier was at 12% CPU.
 
-## Sends: ~142/s, and that is the real ceiling
+## Sends: ~142/s, which was a self-imposed ceiling
+
+> **Corrected heading, 15 August 2026.** This section was titled "and that is
+> the real ceiling". The rate was real and remains as measured; calling it *the*
+> ceiling was not. It was the per-pod limiter, described below.
 
 The number that matters for anything time-sensitive is how fast messages LEAVE
 the queue, and it is far below the accept rate.
@@ -84,8 +96,13 @@ send throughput     ~142/s
 ```
 
 That is exactly two worker pods times TWILIO_RPS_PER_POD=70 — the configured
-per-pod provider rate limit, not a property of the code. The receiving end was
-the mock provider, not a real one.
+per-pod limiter, which was very much a property of the code. The receiving end
+was the mock provider, not a real one.
+
+The limiter has since been deleted. It bounded requests per second while the
+provider bounds requests in flight, and being per-pod under an autoscaler that
+adds pods on queue depth, its account-wide ceiling rose with backlog. 142/s was
+this service throttling itself, not the provider pushing back.
 
 So this run demonstrates an accept path that sustains 2,000/s and a send path
 that sustained ~142/s against a synthetic provider. Quoting the first number
@@ -134,9 +151,10 @@ acknowledged and lost.
 
 At the end of the ramp, 1,374,558 messages were still queued and 0 were in the
 DLQ. The accept path outran the send path by more than an order of magnitude,
-which is what the queue is there for: the provider rate limit sets how fast
-messages leave, and the queue lets a burst be accepted long before it can be
-delivered.
+which is what the queue is there for: the drain rate sets how fast messages
+leave, and the queue lets a burst be accepted long before it can be delivered.
+On this run that drain rate was the limiter described above rather than
+anything the provider imposed.
 
 ## What this does not show
 
