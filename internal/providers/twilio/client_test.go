@@ -64,10 +64,18 @@ func TestShouldRetry_ClassifiesRealProviderResponses(t *testing.T) {
 	}
 }
 
-// TestShouldRetry_TransportFailures covers the only case where the error value
-// carries the information, because no response arrived to carry a status.
+// TestShouldRetry_TransportFailures covers the case where no response arrived
+// at all, and every one of them must be transient.
+//
+// An earlier version of this test asserted the opposite for a refused
+// connection — "it will not fix itself inside the retry budget". That reasoning
+// was about the three in-process attempts, but the code path it justified marks
+// the message permanently failed, which also cancels the SQS redelivery that
+// exists for exactly this. A provider outage presents as connection-refused, so
+// the belief this test used to pin would discard every message in flight during
+// one. Caught by running an outage rather than by reading the code.
 func TestShouldRetry_TransportFailures(t *testing.T) {
-	t.Run("connection refused is permanent", func(t *testing.T) {
+	t.Run("connection refused is transient", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		url := srv.URL
 		srv.Close() // nothing is listening now
@@ -82,8 +90,9 @@ func TestShouldRetry_TransportFailures(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected a transport error")
 		}
-		if ShouldRetry(err, status) {
-			t.Error("a refused connection was classified retryable; it will not fix itself inside the retry budget")
+		if !ShouldRetry(err, status) {
+			t.Error("a refused connection was classified permanent; that ends the message and cancels the SQS " +
+				"redelivery, so a provider outage would discard everything in flight")
 		}
 	})
 
@@ -97,11 +106,23 @@ func TestShouldRetry_TransportFailures(t *testing.T) {
 		}
 	})
 
+	t.Run("other transport failures are transient too", func(t *testing.T) {
+		// None of these describe the message; they all describe the connection.
+		for _, err := range []error{
+			errors.New("dial tcp: lookup provider: no such host"),
+			errors.New("read: connection reset by peer"),
+			errors.New("http2: server sent GOAWAY"),
+		} {
+			if !ShouldRetry(err, 0) {
+				t.Errorf("%v was classified permanent; nothing at the transport layer can prove a message "+
+					"undeliverable", err)
+			}
+		}
+	})
+
 	t.Run("no error and no status is not retryable", func(t *testing.T) {
 		if ShouldRetry(nil, 0) {
 			t.Error("nothing to retry when there is neither an error nor a status")
 		}
 	})
 }
-
-var _ = errors.Is
