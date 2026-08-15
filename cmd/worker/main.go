@@ -27,7 +27,6 @@ import (
 	workerproc "notif/internal/worker"
 
 	"github.com/sony/gobreaker"
-	"golang.org/x/time/rate"
 )
 
 // providerIdleConns sizes the provider transport pool. Zero means match worker
@@ -143,7 +142,6 @@ func main() {
 		FromNumber:          cfg.TwilioFromNumber,
 		BaseURL:             cfg.TwilioBaseURL,
 	}
-	limiter := rate.NewLimiter(rate.Limit(cfg.TwilioRPSPerPod), cfg.TwilioBurst)
 	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
 		Name:        "twilio",
 		MaxRequests: 3,
@@ -157,7 +155,6 @@ func main() {
 		Store:           store,
 		Sender:          sender,
 		Templates:       templates,
-		Limiter:         limiter,
 		Breaker:         cb,
 		ClaimStaleAfter: claimStaleAfter(cfg.SQSVizTimeout),
 	}
