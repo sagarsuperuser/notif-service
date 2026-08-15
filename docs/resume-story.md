@@ -14,13 +14,34 @@ rather than quietly dropped, because how they were caught is part of the story.
 > self-managed k3s across EC2 with RDS Postgres. Delivered a 100,000-message
 > campaign end to end in 284 seconds at roughly 500 messages/second on 4 vCPU
 > of workers, reconciled exactly across three independent records, with zero
-> duplicates, zero drops and zero dead-lettered.
+> duplicates, zero drops and zero dead-lettered — and held that same campaign at
+> zero message loss through a 58-second total provider outage.
 
 ---
 
 ## Resume bullets
 
 Pick three or four. Each is defensible under follow-up.
+
+**Recovered 8.8% of a 100,000-message campaign that was being silently
+discarded**, by finding that the retry classifier tested the error before the
+HTTP status — and every provider response carries both, so the status branches
+were dead code and a 429 was treated as permanent. A terminally failed message
+cannot be re-claimed, so its queue redelivery was acknowledged and deleted: the
+sends vanished with the dead-letter queue reading zero, which is why no alarm
+existed to catch it. Proved by a controlled A/B on AWS — same injection, same
+duration, only the worker image differing: 90,146 delivered against 98,874, with
+failures afterwards matching the provider's permanent rejections exactly
+(1,125 = 1,125).
+
+**Kept a 58-second total provider outage at zero message loss** by moving the
+retry budget out of the worker and into the queue. Transient failures now
+release their claim instead of writing a terminal state, so SQS redelivery — the
+only retry that spans an incident measured in minutes rather than seconds — is
+still available. During the outage the circuit breaker released 15,434 in-flight
+messages back to the queue and shielded the provider from those calls entirely;
+all of them were re-claimed and delivered on recovery, and the run reconciled at
+100,000 of 100,000.
 
 **Cut database round-trips per message from 13 to 4** by collapsing
 multi-statement sequences into single CTEs — the accept path from 7 statements
