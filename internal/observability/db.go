@@ -10,16 +10,25 @@ import (
 )
 
 var (
-	// DBRoundTrips counts every query sent to Postgres, labelled by the service
+	// DBQueryCalls counts pgx query CALLS that complete through a traced pool.
+	//
+	// Deliberately not called round-trips any more. An audit established it is
+	// neither "every query" nor "one per round-trip": pgx routes pool.Ping below
+	// the query tracer, out-of-process SQL never touches it, an acquire failure
+	// produces no increment at all, and a statement-cache miss is one increment
+	// covering two wire exchanges. It is a good measure of application query
+	// volume and a bad one for database load.
+	//
+	// DBQueryCalls counts every query sent to Postgres, labelled by the service
 	// that sent it. Divided by the request rate this is statements per request —
 	// the quantity that actually sets the database's CPU, and the one that made
 	// this system look database-bound when it was not. Seven statements per
 	// accepted send at 500 requests/second is 3,500 statements/second; one is
 	// 500. Same offered load, same database.
-	DBRoundTrips = prometheus.NewCounterVec(
+	DBQueryCalls = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "notif_db_roundtrips_total",
-			Help: "Queries sent to Postgres, by service and outcome",
+			Name: "notif_db_query_calls_total",
+			Help: "pgx query calls completing through a traced pool, by component and outcome. NOT every statement the database receives: excludes pool.Ping, out-of-process SQL (reconcile CronJob, migrate Job, verify-run), and acquire failures; a statement-cache miss is one increment but two wire round-trips",
 		},
 		[]string{"component", "outcome"},
 	)
@@ -49,7 +58,7 @@ var (
 	)
 
 	// DBPoolAcquireSeconds is cumulative time callers spent acquiring a
-	// connection, and DBPoolEmptyAcquires counts the acquires that found the
+	// connection, and DBPoolSlowAcquires counts the acquires that found the
 	// pool empty and had to wait. Either one rising while DBQuerySeconds stays
 	// flat is pool exhaustion, full stop — the database is answering as fast as
 	// ever and the queue is in front of it, not behind it.
@@ -61,10 +70,10 @@ var (
 		[]string{"component"},
 	)
 
-	DBPoolEmptyAcquires = prometheus.NewGaugeVec(
+	DBPoolSlowAcquires = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "notif_db_pool_empty_acquires_total",
-			Help: "Acquires that found the pool empty and had to wait for a connection",
+			Name: "notif_db_pool_slow_acquires_total",
+			Help: "Acquires that did not get an immediately-idle connection: pgx counts BOTH waiting on the pool semaphore AND constructing a new connection, so this mixes contention with pool growth and is not a contention figure on its own",
 		},
 		[]string{"component"},
 	)
@@ -95,7 +104,7 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	if data.Err != nil {
 		outcome = "error"
 	}
-	DBRoundTrips.WithLabelValues(t.Service, outcome).Inc()
+	DBQueryCalls.WithLabelValues(t.Service, outcome).Inc()
 	if start, ok := ctx.Value(queryStartKey{}).(time.Time); ok {
 		DBQuerySeconds.Observe(time.Since(start).Seconds())
 	}
@@ -121,11 +130,11 @@ func SamplePool(ctx context.Context, service string, pool *pgxpool.Pool, every t
 			DBPoolConns.WithLabelValues(service, "max").Set(float64(s.MaxConns()))
 			DBPoolConns.WithLabelValues(service, "constructing").Set(float64(s.ConstructingConns()))
 			DBPoolAcquireSeconds.WithLabelValues(service).Set(s.AcquireDuration().Seconds())
-			DBPoolEmptyAcquires.WithLabelValues(service).Set(float64(s.EmptyAcquireCount()))
+			DBPoolSlowAcquires.WithLabelValues(service).Set(float64(s.EmptyAcquireCount()))
 		}
 	}
 }
 
 func RegisterDB(reg prometheus.Registerer) {
-	reg.MustRegister(DBRoundTrips, DBQuerySeconds, DBPoolConns, DBPoolAcquireSeconds, DBPoolEmptyAcquires)
+	reg.MustRegister(DBQueryCalls, DBQuerySeconds, DBPoolConns, DBPoolAcquireSeconds, DBPoolSlowAcquires)
 }

@@ -38,7 +38,7 @@ func TestMetricLabelsAvoidOperatorReservedNames(t *testing.T) {
 		APIRequests, WebhookRequests, Enqueues,
 		WebhookEvents, WebhookMessageUpdateNotFound,
 		ProviderCallSeconds, ProviderAttempts, MessageOutcome, ClaimResult,
-		DBRoundTrips, DBPoolConns, DBPoolAcquireSeconds, DBPoolEmptyAcquires,
+		DBQueryCalls, DBPoolConns, DBPoolAcquireSeconds, DBPoolSlowAcquires,
 	} {
 		if err := reg.Register(c); err != nil {
 			t.Fatalf("register: %v", err)
@@ -54,7 +54,7 @@ func TestMetricLabelsAvoidOperatorReservedNames(t *testing.T) {
 	// to make its labels observable.
 	APIRequests.WithLabelValues("/v1/sms/messages", "202")
 	WebhookRequests.WithLabelValues("/v1/webhooks/twilio/status", "200")
-	DBRoundTrips.WithLabelValues("api", "ok")
+	DBQueryCalls.WithLabelValues("api", "ok")
 	families, err = reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)

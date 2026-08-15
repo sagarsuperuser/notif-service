@@ -261,9 +261,9 @@ func TestQueryTracer_CountsWhatTheBenchmarkWillReport(t *testing.T) {
 	}
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(observability.DBRoundTrips)
-	t.Cleanup(func() { observability.DBRoundTrips.Reset() })
-	observability.DBRoundTrips.Reset()
+	reg.MustRegister(observability.DBQueryCalls)
+	t.Cleanup(func() { observability.DBQueryCalls.Reset() })
+	observability.DBQueryCalls.Reset()
 
 	pool, err := pg.NewPool(context.Background(), traced, pg.PoolOptions{
 		MaxConns: 1, MinConns: 1,
@@ -277,7 +277,7 @@ func TestQueryTracer_CountsWhatTheBenchmarkWillReport(t *testing.T) {
 		t.Fatalf("ping: %v", err)
 	}
 
-	before := counterValue(t, observability.DBRoundTrips, "test", "ok")
+	before := counterValue(t, observability.DBQueryCalls, "test", "ok")
 
 	s := pg.New(pool)
 	now := util.NowUTC()
@@ -290,7 +290,7 @@ func TestQueryTracer_CountsWhatTheBenchmarkWillReport(t *testing.T) {
 		t.Fatalf("CreateMessage: %v", err)
 	}
 
-	after := counterValue(t, observability.DBRoundTrips, "test", "ok")
+	after := counterValue(t, observability.DBQueryCalls, "test", "ok")
 	if delta := after - before; delta != 1 {
 		t.Errorf("one accepted send moved notif_db_roundtrips_total by %v, want 1", delta)
 	}
