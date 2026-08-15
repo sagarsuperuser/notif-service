@@ -22,13 +22,22 @@ idle-connection pool.
 The last two rows are the controls: identical delivery and identical database
 work prove nothing else moved.
 
-**The finding worth keeping.** The symptom appeared on the database — a
-twenty-connection pool running dry nine thousand times — and the cause was an
-HTTP client two layers away. Go's default transport keeps two idle connections
-per host, so every provider call past the second paid a TCP and TLS handshake
-before sending a byte. That doubled the call, handlers held their database
-connection across it, and the pool ran out. Fixing the HTTP transport removed
-the database contention.
+**What is established.** Go's default transport keeps two idle connections per
+host, so every provider call past the second paid a TCP and TLS handshake before
+sending a byte. That accounts straightforwardly for the latency halving, and for
+the shorter campaign that follows from it.
+
+**What is not established.** Why the same change moved a DATABASE pool counter
+by 98% is unexplained. An earlier version of this document asserted that slow
+provider calls made handlers hold their database connections longer, which is
+wrong: the worker acquires a connection for ClaimAndLoad and releases it, makes
+the provider call holding nothing, then acquires again for RecordAttempt. If
+anything, slower HTTP should mean handlers spend more time outside the pool and
+contend for it less — the opposite of what was measured.
+
+So the correlation is real and controlled, and the mechanism behind that one row
+is not known. Quoting it as cause-and-effect would be inventing the interesting
+half. Establishing it needs a rebuild with per-phase connection-acquire timing.
 
 The same default was present in three places: the SQS client, the worker's
 provider client, and the simulator's webhook client. Two carried enough traffic
