@@ -4,7 +4,43 @@ Every figure here came from a counter or a test that can be re-run. Where a
 number is not independently measured, it says so. Claims that did not survive
 checking were removed rather than softened — several were.
 
-## 1. HTTP connection pool — controlled A/B
+## 1. Retry classification — controlled A/B on AWS
+
+Same 100,000-message campaign, same 10% failure injection (6:3:1 across HTTP
+429 / 500 / 400, verified against the provider before use), same 408-second
+accept duration. One variable: the worker image.
+
+| | `sha-41c0375` | `sha-96bad7d` | change |
+|---|---|---|---|
+| delivered | 90,146 | 98,874 | **+8,728** |
+| failed | 9,854 | 1,125 | **−8,729** |
+| in dead-letter queue | 0 | 0 | — |
+| attempts per message | 1 for all 100,000 | up to 6 | — |
+| accepted | 100,000 | 100,000 | — |
+| accept duration | 408s | 408s | — |
+
+The last two rows are the controls: identical acceptance and identical duration
+show the accept path did not move.
+
+**What is established.** `ShouldRetry` tested `err != nil` before the HTTP
+status, and `SendSMS` returns a non-nil error alongside every non-2xx response,
+so the status branches were unreachable. The "attempts per message" row measures
+this directly rather than inferring it: in the before arm every message was
+attempted exactly once, so the three-attempt loop never ran at all.
+
+**Why the dead-letter queue is 0 on both arms, and why that is the point.** A
+message written `state='failed'` cannot be re-claimed, so its redelivery was
+counted a duplicate and acknowledged. The 8,838 abandoned sends never reached
+the dead-letter queue, which is why the metric that existed to catch this
+reported success throughout.
+
+**The strongest single check** is that the after arm's 1,125 failures equal the
+1,125 HTTP 400s the provider returned. Every remaining failure is a permanent
+rejection; no transient failure was lost.
+
+Full method and the outage run: [campaign-100k/retry-handling-ab-2026-08-15.md](campaign-100k/retry-handling-ab-2026-08-15.md).
+
+## 2. HTTP connection pool — controlled A/B
 
 Same code, same 40,000-message campaign, same 500 MPS provider profile, fresh
 pods on both arms so counters start at zero. One variable: the transport's
@@ -49,7 +85,7 @@ from two idle connections per host forcing a TLS handshake on most calls, and
 the shorter campaign follows from the latency.
 
 
-## 2. Database round-trips per message
+## 3. Database round-trips per message
 
 Measured by a pgx query tracer against real Postgres, with the previous
 multi-statement sequence replayed on the same counter as the baseline.
@@ -64,7 +100,7 @@ Confirmed in production during a 100,000-message campaign: 200,000 worker
 round-trips for 100,000 messages, and 300,000 for 300,000 callbacks — exactly
 2.00 and 1.00.
 
-## 3. SQS consumer concurrency
+## 4. SQS consumer concurrency
 
 The consumer issued one ReceiveMessage at a time, so its ceiling was ten
 messages divided by round-trip time regardless of how many handlers waited
@@ -81,7 +117,7 @@ receiver count) is the stable part and is what the test asserts.
 Batching, same suite: 500 enqueues become 50 SendMessageBatch calls, and 200
 deletions become 20 DeleteMessageBatch calls.
 
-## 4. Queue choice
+## 5. Queue choice
 
 The send queue was SQS FIFO, which outside high-throughput mode is limited to
 300 transactions per second per API action. Nothing required global ordering,
@@ -93,10 +129,27 @@ Not measured: no run was taken against the FIFO queue, so there is no
 before-and-after here. The 300 figure is Twilio's documented limit, not an
 observation.
 
-## 5. Defects found by operating the system
+## 6. Defects found by operating the system
 
 Each has a mechanism, a fix, and a regression test. None was reachable by
 reading the code.
+
+**Retry classification, and the test that protected it.** Covered in §1. Worth
+noting separately is how it survived: the integration suite contained a case
+named "provider rejects permanently" whose fake returned HTTP 500 — a textbook
+transient failure — and asserted the outcome the defect produced. It passed for
+exactly that reason. The same pattern then repeated one branch over: the test
+added alongside the fix asserted that a refused connection was permanent, in as
+many words, and that belief also had to be corrected. Both were caught by
+running the failure rather than reading the branch.
+
+**Transport failures classified permanent.** A connection refused returns no
+HTTP status, and the classifier ended the message. The reasoning — that a
+refused connection will not recover inside three in-process attempts — was true
+of the wrong loop: the terminal write it justified also cancels the SQS
+redelivery meant for faults lasting minutes. A provider outage presents as
+connection-refused, so the code discarded whatever was in flight during one.
+Found while constructing an outage run, not while reading the function.
 
 **Consumer starvation.** A 15-second HTTP client timeout killed every
 20-second SQS long poll. Asymmetric and therefore invisible: SendMessage
@@ -129,7 +182,7 @@ and `service` are reserved; the Operator relabels the application's value to
 now walks every label against the reserved set, which is how the second
 collision was found.
 
-## 6. Campaign result
+## 7. Campaign result
 
 100,000 messages, short-code profile at 500 MPS, on 4 vCPU of workers.
 

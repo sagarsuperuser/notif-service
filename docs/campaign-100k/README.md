@@ -23,6 +23,9 @@ main queue              0
 dead-letter queue       0
 ```
 
+> The last line is weaker evidence than it looks. Nothing failed on this run, so
+> nothing could have been dead-lettered. See "What this run does not show".
+
 ## CloudWatch — AWS/SQS, one-minute periods
 
 Independent of the application. `notif-prod-test-send`.
@@ -125,6 +128,14 @@ but it is real contention and the pool is the wrong size for the concurrency.
 - **Failure handling.** `MOCK_SUCCESS_RATE` was 1.0. Real traffic carries a few
   percent of failures with retries and dead-lettering, which this clean run
   deliberately excludes.
+
+  This turned out to matter more than "deliberately excludes" suggests. Because
+  nothing failed, the "dead-letter queue 0" above is not evidence that failure
+  handling worked — it is evidence that failure handling never ran. When the
+  same campaign was later run with failures injected, the pre-existing code
+  discarded 8.8% of it and still reported an empty dead-letter queue, because a
+  message failed terminally cannot reach one. See
+  [retry-handling-ab-2026-08-15.md](retry-handling-ab-2026-08-15.md).
 - **Multi-segment messages.** MPS is counted in segments, so a campaign of
   two-segment messages halves the effective rate.
 - **Grafana.** As above.
