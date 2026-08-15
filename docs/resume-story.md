@@ -47,9 +47,9 @@ double-sending others. Fixed with a separate drain context and an unconditional
 delete, pinned by a test that holds handlers open across shutdown.
 
 **Sized HTTP transport connection pools** after finding three services on Go's
-two-idle-connections-per-host default. Controlled A/B with identical load and
-fresh counters: provider call latency down 48% (414ms to 217ms), database
-connections constructed down 98% (8,961 to 191), campaign completion down 14%.
+two-idle-connections-per-host default, which forced a TLS handshake on most
+provider calls. Controlled A/B with identical load and fresh counters: provider
+call latency down 48% (414ms to 217ms) and campaign completion down 14%.
 
 **Removed a hard 300 TPS ceiling** by moving the send queue off SQS FIFO after
 establishing that nothing required global ordering, replacing its five-minute
@@ -131,10 +131,12 @@ in front of it.
 **"More numbers multiply campaign throughput."** The opposite: it is
 snowshoeing, which providers discourage, and 10DLC allocates per campaign.
 
-**"Slow provider calls held database connections longer."** Contradicted by the
-code — the connection is released before the provider call. The metric was
-measuring connection construction, not contention, which reading pgx's source
-settled without another experiment.
+**Three explanations for one database counter.** A pool metric moved 98% in the
+same A/B, and each account of why was wrong: that handlers held connections
+across the provider call (the code releases first), that connections were reaped
+for idleness (the timeout is ten minutes, the run was 138 seconds), and that the
+counter purely measures construction (it counts semaphore waits too). The
+measurement is real; the mechanism is unknown, so the figure is not quoted.
 
 Each was caught by verification that kept running after the claim was made: CI
 found the race in code that already had tests, an adversarial review pass killed
