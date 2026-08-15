@@ -363,6 +363,10 @@ type countingSender struct {
 	n    int
 	sid  string
 	fail error
+	// failStatus is the HTTP status returned alongside fail. It matters:
+	// retry classification keys off the status, so a fake that returns the
+	// wrong one tests the wrong branch.
+	failStatus int
 }
 
 func (s *countingSender) SendSMS(ctx context.Context, req twilio.SendRequest) (twilio.SendResponse, int, []byte, error) {
@@ -370,7 +374,11 @@ func (s *countingSender) SendSMS(ctx context.Context, req twilio.SendRequest) (t
 	s.n++
 	s.mu.Unlock()
 	if s.fail != nil {
-		return twilio.SendResponse{}, 500, []byte(`{"message":"boom"}`), s.fail
+		st := s.failStatus
+		if st == 0 {
+			st = 500
+		}
+		return twilio.SendResponse{}, st, []byte(`{"message":"boom"}`), s.fail
 	}
 	return twilio.SendResponse{Sid: s.sid, Status: "queued"}, 201, []byte(`{"sid":"` + s.sid + `"}`), nil
 }
@@ -509,10 +517,27 @@ func TestProcessor_EveryOutcomeIsNamed(t *testing.T) {
 			wantOutcome: "template_not_found",
 		},
 		{
+			// A 400 is the real permanent rejection: the request was malformed
+			// and will be malformed again.
+			//
+			// This case previously returned 500 while calling itself
+			// non-retryable, and passed — because ShouldRetry checked the error
+			// before the status and classified every provider failure
+			// permanent. The test was pinning the defect rather than the
+			// intended behaviour, which is why the defect survived.
 			name:        "provider rejects permanently",
 			templates:   map[string]string{"tpl": "hello"},
-			sender:      &countingSender{sid: "SM-y", fail: errNonRetryable{}},
+			sender:      &countingSender{sid: "SM-y", fail: errPermanent{}, failStatus: 400},
 			wantOutcome: "provider_rejected",
+		},
+		{
+			// The companion case, absent before: a 5xx is transient, so the
+			// worker must retry and only then give up. Without this, the two
+			// classifications are indistinguishable to the suite.
+			name:        "provider fails transiently",
+			templates:   map[string]string{"tpl": "hello"},
+			sender:      &countingSender{sid: "SM-z", fail: errTransient{}, failStatus: 503},
+			wantOutcome: "retries_exhausted",
 		},
 	}
 
@@ -541,9 +566,13 @@ func TestProcessor_EveryOutcomeIsNamed(t *testing.T) {
 	}
 }
 
-type errNonRetryable struct{}
+type errPermanent struct{}
 
-func (errNonRetryable) Error() string { return "permanent provider rejection" }
+func (errPermanent) Error() string { return "permanent provider rejection" }
+
+type errTransient struct{}
+
+func (errTransient) Error() string { return "transient provider failure" }
 
 func outcomeCounts(t *testing.T, reg *prometheus.Registry) map[string]float64 {
 	t.Helper()
