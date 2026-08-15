@@ -138,15 +138,84 @@ run look tidier than it was.
 
 ---
 
+---
+
+## Run D — exhausting the dead-letter queue, and getting the messages back
+
+Runs A–C all ended with an empty dead-letter queue, so the redrive path was
+still unproven. Reaching it needs a fault outlasting `maxReceiveCount ×
+visibility timeout` — 5 × 60s. Run D sends 20,000 messages and takes the
+provider away for **8 minutes 51 seconds** (08:32:40–08:41:31 UTC).
+
+Queue depths through the outage, from CloudWatch-independent SQS attributes:
+
+| time (UTC) | main visible / in flight | dead-letter |
+|---|---|---|
+| 08:32:49 | 0 / 0 | 0 |
+| 08:33:44 | 0 / 13,805 | 0 |
+| 08:34:40 | 0 / 18,067 | 0 |
+| 08:36:33 | 0 / 18,067 | 0 |
+| 08:38:25 | 0 / 18,067 | **8,253** |
+| 08:39:21 | 0 / 0 | **18,067** |
+
+The five redeliveries take about five minutes to burn, which is why the
+dead-letter queue stays empty for the first six minutes and then fills in
+roughly ninety seconds.
+
+### The state that makes recovery possible
+
+With the provider still down and all 18,067 messages dead-lettered:
+
+```
+queued      18,067   last_error = circuit_breaker_open
+submitted    1,334
+delivered      599
+                        total 20,000 ✓
+```
+
+Not one message is `failed`. That is the whole point of the arc: the rows stay
+claimable, so the copies sitting in the dead-letter queue are still worth
+something. Under the pre-#59 code these 18,067 would have been terminally
+`failed` **and** absent from the dead-letter queue — invisible to an operator and
+unrecoverable by any means short of a manual SQL replay.
+
+### Recovery
+
+Provider restored at 08:41:31. One AWS redrive command
+(`sqs start-message-move-task`, dead-letter queue → main queue) issued at
+08:41:49:
+
+| time (UTC) | main visible / in flight | dead-letter |
+|---|---|---|
+| 08:41:58 | 692 / 1,091 | 8,467 |
+| 08:42:39 | 0 / 365 | 18,067 → draining |
+| 08:43:20 | 0 / 0 | **0** |
+
+Final:
+
+```
+delivered   18,666
+submitted    1,334   (same provider-restart artifact as run C)
+failed           0
+dead-letter      0
+              total 20,000 ✓
+```
+
+**Every dead-lettered message was recovered and delivered, with zero permanent
+failures.** Elapsed from redrive to empty: about ninety seconds.
+
+The 1,334 `submitted` were all submitted between 08:32:27 and 08:32:35 — the
+eight seconds before the provider pod was killed — reproducing run C's artifact
+exactly: the provider had issued their SIDs and held their delivery callbacks in
+memory. Two runs, same window, same cause.
+
+---
+
 ## What these runs do not show
 
 - **A real provider.** Still the in-cluster simulator. It models documented
   limits (concurrency 429s, per-sender MPS, queue overflow) and now failure
   injection, but it is not Twilio.
-- **A DLQ under stress.** Every run ended with an empty dead-letter queue,
-  because no message exhausted all five redeliveries. The redrive path to the
-  DLQ is covered by integration tests, not by these campaigns. An outage longer
-  than `5 × visibility timeout` would be needed to exercise it here.
 - **Multi-segment messages**, which halve effective throughput per segment.
 
 ## One procedural note

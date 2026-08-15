@@ -12,7 +12,7 @@ rather than quietly dropped, because how they were caught is part of the story.
 > Built a multi-tenant SMS notification service in Go on AWS — HTTP API,
 > SQS, worker pool, provider integration, delivery-receipt ingestion — on
 > self-managed k3s across EC2 with RDS Postgres. Delivered a 100,000-message
-> campaign end to end in 284 seconds at roughly 500 messages/second on 4 vCPU
+> campaign end to end in 293 seconds at roughly 340 messages/second on 4 vCPU
 > of workers, reconciled exactly across three independent records, with zero
 > duplicates, zero drops and zero dead-lettered — and held that same campaign at
 > zero message loss through a 58-second total provider outage.
@@ -34,6 +34,16 @@ duration, only the worker image differing: 90,146 delivered against 98,874, with
 failures afterwards matching the provider's permanent rejections exactly
 (1,125 = 1,125).
 
+**Proved dead-letter recovery end to end** by taking the provider down for
+almost nine minutes — long enough for 18,067 messages to exhaust all five SQS
+redeliveries and land in the dead-letter queue. Because a transient failure now
+releases its claim instead of writing a terminal state, every one of those rows
+stayed claimable, so a single redrive command returned all 18,067 to the main
+queue and they delivered in about ninety seconds: 20,000 of 20,000 accounted,
+zero permanently failed. Under the previous code the same outage would have
+marked them failed and left the dead-letter queue empty — unrecoverable and
+invisible at once.
+
 **Kept a 58-second total provider outage at zero message loss** by moving the
 retry budget out of the worker and into the queue. Transient failures now
 release their claim instead of writing a terminal state, so SQS redelivery — the
@@ -45,9 +55,11 @@ all of them were re-claimed and delivered on recovery, and the run reconciled at
 
 **Cut database round-trips per message from 13 to 4** by collapsing
 multi-statement sequences into single CTEs — the accept path from 7 statements
-to 1, the worker from 4 to 2, the provider callback from as many as 11 to 1.
-Verified by differential tests that replay the original sequence and require
-identical results, with both paths measured on the same query counter.
+to 1, the worker from 4 to 2, the provider callback from 2 plus a retried UPDATE
+to 1. The first two are differential — the old sequence is replayed on the same
+counter — and the callback's old count is read from the previous code, not
+replayed. Each differential test requires identical results from both paths, so
+the reduction cannot come from doing less work.
 
 **Diagnosed a production-only consumer starvation** in which a 15-second HTTP
 client timeout silently killed every 20-second SQS long poll. The failure was
@@ -67,22 +79,12 @@ so rolling deploys during a campaign were both dead-lettering messages and
 double-sending others. Fixed with a separate drain context and an unconditional
 delete, pinned by a test that holds handlers open across shutdown.
 
-**Sized HTTP transport connection pools** after finding three services on Go's
-two-idle-connections-per-host default, which forced a TCP and TLS handshake on
-most provider calls. Controlled A/B with identical load and fresh counters:
-campaign completion down 14% (138s to 119s over 40,000 messages).
-
-The latency half of that result is withdrawn pending re-measurement. It was read
-from a histogram whose clock started before a rate limiter and a retry loop, so
-it never bounded the provider call it was quoted as measuring. The instrument
-has been replaced and the A/B needs re-running against it.
-
 **Removed a hard 300 TPS ceiling** by moving the send queue off SQS FIFO after
 establishing that nothing required global ordering, replacing its five-minute
 deduplication window with a database uniqueness constraint that outlives it.
 
 **Introduced the repository's first CI test gate** and grew integration
-coverage from 405 lines to roughly 3,300, using differential testing against
+coverage from 405 lines to 4,415 across 19 files, using differential testing against
 the previous implementation and requiring every new guarantee to fail under
 mutation before trusting it.
 
@@ -156,6 +158,21 @@ in front of it.
 
 **"More numbers multiply campaign throughput."** The opposite: it is
 snowshoeing, which providers discourage, and 10DLC allocates per campaign.
+
+**"Connection pool sizing cut provider latency 48% and the campaign 14%."**
+Withdrawn in full after re-measuring. The latency came from a histogram whose
+clock started before a rate limiter and a retry loop, so it never bounded the
+call it was quoted as measuring. Re-run against an instrument that wraps only
+the provider call: 218.0 ms at 2 idle connections against 218.4 ms at 120 — no
+effect. The stated mechanism was wrong too: it blamed TLS handshakes on a path
+that is plain HTTP to an in-cluster service, so there was no handshake to save.
+Connection reuse does matter against a real provider over TLS; this environment
+simply cannot show it.
+
+**"100,000 delivered in 284 seconds at roughly 500 messages/second."** Two
+errors. The run's own output says 293 seconds, and 100,000 over 293 seconds is
+341/second — the 500 was the provider's configured ceiling, not the rate
+achieved against it.
 
 **Three explanations for one database counter.** A pool metric moved 98% in the
 same A/B, and each account of why was wrong: that handlers held connections

@@ -40,61 +40,60 @@ rejection; no transient failure was lost.
 
 Full method and the outage run: [campaign-100k/retry-handling-ab-2026-08-15.md](campaign-100k/retry-handling-ab-2026-08-15.md).
 
-## 2. HTTP connection pool — controlled A/B
+## 2. HTTP connection pool — re-measured, and the original claim withdrawn
 
-Same code, same 40,000-message campaign, same 500 MPS provider profile, fresh
-pods on both arms so counters start at zero. One variable: the transport's
-idle-connection pool.
+This section previously reported a 48% fall in provider call latency and a 14%
+shorter campaign from raising the transport's idle-connection pool from Go's
+default of 2 to 120. **Neither reproduces.** Re-run on 15 August 2026 with the
+same 40,000-message campaign, fresh pods per arm, one variable:
 
-| | default (2 idle/host) | sized (120 idle/host) | change |
+| | 2 idle/host | 120 idle/host | change |
 |---|---|---|---|
-| campaign duration | 138s | 119s | **−14%** |
-| provider call latency, mean | 414 ms | 217 ms | **−48%** |
-| DB pool EmptyAcquireCount | 8,961 | 191 | −98%, unexplained — see below |
-| cumulative wait for a connection | 111.1s | 7.7s | **−93%** |
-| messages delivered | 40,000 | 40,000 | — |
-| DB round-trips | 80,000 | 80,000 | unchanged |
+| provider call, mean | 218.0 ms | 218.4 ms | **+0.2% — none** |
+| campaign duration | 143s | 138s | −3.5%, within noise |
+| messages | 40,000 | 40,000 | control |
 
-The last two rows are the controls: identical delivery and identical database
-work prove nothing else moved.
+Mean is `notif_provider_call_seconds_sum / _count` summed across both worker
+pods: 8721.82s / 40,000 against 8735.82s / 40,000.
 
-**What is established.** Go's default transport keeps two idle connections per
-host, so every provider call past the second paid a TCP and TLS handshake before
-sending a byte. That accounts straightforwardly for the latency halving, and for
-the shorter campaign that follows from it.
+**Why the original number was wrong.** It came from
+`twilio_send_latency_seconds`, which started its clock before a token-bucket
+rate limiter and a three-attempt retry loop. It measured limiter queueing plus
+retries plus the call, and pool size changes throughput, which changes queueing.
+That metric was later deleted as misleading; this section kept quoting it. The
+replacement, `notif_provider_call_seconds`, wraps the provider call and nothing
+else, and the limiter has since been removed entirely.
 
-**The database row is unexplained, and should not be quoted.** pgx increments
-EmptyAcquireCount in two places: once when a caller waited on the pool semaphore
-before getting an idle connection, and once when it had to construct a new one.
-It is therefore a mix of contention and construction, and this run cannot say
-which dominated.
+**Why the stated mechanism was also wrong.** The old text explained the gain as
+"every provider call past the second paid a TCP and TLS handshake". There is no
+TLS on this path: `TWILIO_BASE_URL` is `http://notif-mock-provider-svc`, plain
+HTTP to an in-cluster service one hop away. There was no handshake cost for a
+larger pool to save, which is exactly what re-measuring shows.
 
-Three explanations were offered for it during this work and all three were
-wrong. That handlers held database connections across the provider call —
-contradicted by the code, which releases before the call. That connections went
-idle and were reaped — impossible, since MaxConnIdleTime is ten minutes and the
-run was 138 seconds. That it purely counts construction — a half-reading of the
-library, which counts semaphore waits too.
+**What is still true.** Connection reuse matters when a handshake and a real
+round-trip are involved — against a provider over TLS on the public internet,
+where a fresh connection costs two round-trips before the first byte. That case
+is real and is why `PROVIDER_MAX_IDLE_CONNS` remains configurable. This
+environment cannot demonstrate it, and the number that claimed to was measuring
+something else.
 
-The measurement is real and was taken twice under controlled conditions. The
-mechanism is not known. Settling it needs the two increment sites counted
-separately, which is a small change and a rebuild.
-
-The rest of the A/B does not depend on it: the latency halving follows directly
-from two idle connections per host forcing a TLS handshake on most calls, and
-the shorter campaign follows from the latency.
-
+The `EmptyAcquireCount` figures previously quoted here (8,961 → 191) came from
+the same run and the same conditions and are withdrawn with it. That counter
+also mixes semaphore waits with connection construction, so it could not have
+settled the question either way.
 
 ## 3. Database round-trips per message
 
-Measured by a pgx query tracer against real Postgres, with the previous
-multi-statement sequence replayed on the same counter as the baseline.
+Measured by a pgx query tracer against real Postgres. For the accept and worker
+paths the previous multi-statement sequence is replayed on the same counter, so
+both columns are measured; the callback row's "before" is counted from the
+previous implementation rather than replayed, and is marked accordingly.
 
-| path | before | after |
-|---|---|---|
-| accept a send | 7 (9 when the daily cap was spent) | **1** |
-| worker success path | 4 | **2** |
-| provider callback | 2, plus an UPDATE retried up to 10 times | **1** |
+| path | before | after | before measured? |
+|---|---|---|---|
+| accept a send | 7 (9 when the daily cap was spent) | **1** | yes — replayed |
+| worker success path | 4 | **2** | yes — replayed |
+| provider callback | 2, plus an UPDATE retried up to 10 times | **1** | no — read from the old code |
 
 Confirmed in production during a 100,000-message campaign: 200,000 worker
 round-trips for 100,000 messages, and 300,000 for 300,000 callbacks — exactly
@@ -182,13 +181,39 @@ and `service` are reserved; the Operator relabels the application's value to
 now walks every label against the reserved set, which is how the second
 collision was found.
 
-## 7. Campaign result
+## 7. Dead-letter recovery — measured
+
+20,000 messages, provider removed for 8m51s, which is longer than
+`maxReceiveCount (5) × visibility timeout (60s)` and therefore long enough to
+exhaust the queue's own retries.
+
+```
+during the outage, with everything dead-lettered
+  messages in dead-letter queue      18,067
+  message rows state='failed'             0
+  message rows state='queued'        18,067   last_error=circuit_breaker_open
+
+after one `sqs start-message-move-task` back to the main queue
+  delivered                          18,666
+  failed                                  0
+  dead-letter queue                       0
+  total accounted             20,000 / 20,000
+```
+
+The two rows that matter are `failed = 0` alongside `dead-letter = 18,067`. The
+dead-letter queue holds a redrivable copy only because the message row stayed
+claimable; a terminal row would have made the redrive a no-op. Recovery took
+about ninety seconds from issuing the command.
+
+Full timeline: [campaign-100k/retry-handling-ab-2026-08-15.md](campaign-100k/retry-handling-ab-2026-08-15.md).
+
+## 8. Campaign result
 
 100,000 messages, short-code profile at 500 MPS, on 4 vCPU of workers.
 
 ```
 delivered            100,000 / 100,000
-duration                        284s
+duration                        293s
 dead-lettered                      0
 duplicate sends                    0
 messages left queued               0
