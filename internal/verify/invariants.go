@@ -90,13 +90,30 @@ func Checks(o Options) []Invariant {
 			Args: []any{o.Since, o.ClaimStaleAfter},
 		},
 		{
-			Name: "no message was left queued",
-			Why: "a queued message is one the API accepted and no worker picked up — a silent drop. Run this " +
-				"after the queue has drained, or it reports work still legitimately in flight.",
+			// Split from a single "no message was left queued" check. A worker
+			// that gives up on a transient provider failure now hands the
+			// message back rather than failing it permanently, so 'queued' has
+			// two meanings and one check covering both would explain neither.
+			// last_error is what separates them: it is only set once something
+			// has actually been attempted.
+			Name: "no message was left queued without being attempted",
+			Why: "a queued message with no recorded error is one the API accepted and no worker ever picked up — " +
+				"a silent drop. Run this after the queue has drained, or it reports work still legitimately in flight.",
 			Query: `
 				SELECT count(*), coalesce(max(id), '')
 				  FROM messages
-				 WHERE created_at >= $1 AND state = 'queued'`,
+				 WHERE created_at >= $1 AND state = 'queued' AND last_error IS NULL`,
+			Args: []any{o.Since},
+		},
+		{
+			Name: "no message was parked after repeated provider failures",
+			Why: "a queued message carrying an error was attempted, failed transiently, and handed back to the " +
+				"queue. A few during an incident are the design working; any left once the queue has drained " +
+				"have exhausted their redeliveries and are sitting in the dead-letter queue awaiting a redrive.",
+			Query: `
+				SELECT count(*), coalesce(max(id), '')
+				  FROM messages
+				 WHERE created_at >= $1 AND state = 'queued' AND last_error IS NOT NULL`,
 			Args: []any{o.Since},
 		},
 		{

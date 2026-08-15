@@ -25,6 +25,28 @@ func (s *Store) MarkMessageState(ctx context.Context, in store.MessageStateUpdat
 	return err
 }
 
+// ReleaseForRetry hands a message back to the queue after a transient failure,
+// and is guarded on purpose.
+//
+// The guard is `state='processing'`, meaning "we still hold this claim". A
+// blind UPDATE would race the delivery-callback path: a send whose response we
+// never saw can still produce a webhook that moves the row to delivered, and
+// resetting that back to queued would send the recipient a second SMS.
+//
+// The bool reports whether the reset actually happened, so the caller can tell
+// "handed back" from "something else owns this now" instead of assuming.
+func (s *Store) ReleaseForRetry(ctx context.Context, id, lastErr string, now time.Time) (bool, error) {
+	tag, err := s.DB.Exec(ctx, `
+		UPDATE messages
+		   SET state='queued', last_error=$2, updated_at=$3
+		 WHERE id=$1 AND state='processing'
+	`, id, nullIfEmpty(lastErr), now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // CreateMessage accepts (or rejects) one send request in a SINGLE round-trip,
 // replacing a 7-statement sequence — idempotency SELECT, message INSERT,
 // suppression SELECT, consent SELECT, then BEGIN + cap upsert + COMMIT — that

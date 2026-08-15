@@ -159,7 +159,7 @@ func main() {
 		Templates:       templates,
 		Limiter:         limiter,
 		Breaker:         cb,
-		ClaimStaleAfter: time.Duration(cfg.SQSVizTimeout) * time.Second,
+		ClaimStaleAfter: claimStaleAfter(cfg.SQSVizTimeout),
 	}
 
 	// start polling
@@ -246,4 +246,33 @@ func main() {
 			"deadline", drainDeadline)
 		slog.Info("worker shutdown timeout waiting for poll loop")
 	}
+}
+
+// claimStaleAfter is how long a message may sit in 'processing' before another
+// worker may take it over, and it must be STRICTLY shorter than the SQS
+// visibility timeout.
+//
+// It used to be exactly equal, which made recovery from a crashed worker a
+// coin flip. A claim writes updated_at some interval d after the message was
+// received, so the row is considered stale at receive+d+window while the
+// redelivery arrives at receive+visibility. With window == visibility, the
+// redelivery is early by exactly d and the row does not look stale yet — the
+// worker then counts the delivery as "held by someone else", returns nil, and
+// the consumer deletes the receipt. A message whose worker died is silently
+// dropped, and because nothing errors it never reaches the DLQ either.
+//
+// d is the receive-to-claim latency, which grows precisely when the system is
+// loaded, so the failure is likeliest under the conditions that cause worker
+// restarts in the first place.
+//
+// Half the visibility timeout leaves d tens of seconds of headroom. Shortening
+// the window cannot cause a duplicate send: SQS will not hand the same message
+// to a second consumer before the visibility timeout regardless, so no other
+// claimant exists during the interval this shortens.
+func claimStaleAfter(visibilityTimeoutSeconds int32) time.Duration {
+	v := time.Duration(visibilityTimeoutSeconds) * time.Second
+	if v <= 0 {
+		return 30 * time.Second
+	}
+	return v / 2
 }
