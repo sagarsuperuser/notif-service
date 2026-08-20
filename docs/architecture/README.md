@@ -23,6 +23,6 @@ This folder contains production-oriented architecture views for `notif-service`.
 - Keep these diagrams updated when changing:
   - queue topology
   - webhook mode
-  - worker/webhook-processor scaling
-  - node pool/taint strategy
+  - worker scaling (KEDA on queue depth)
+  - node topology (one server + one worker ASG)
   - database topology (direct RDS; pgx pooling in the services)
