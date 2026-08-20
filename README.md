@@ -74,6 +74,7 @@ make reset             # stop + delete volumes
 - K8s deploy (dev overlay): `make k8s-up`
 - Restart workloads: `make k8s-restart`
 - Terraform stack: `infra/`
+- Dev note: **branch from `origin/main` explicitly** (`git fetch origin && git switch -c my-branch origin/main`). Local `main` checkouts in worktree setups run behind — three stale-base incidents in one week, including the PR that added this line.
 
 ## Results
 
