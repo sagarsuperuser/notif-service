@@ -115,18 +115,22 @@ Throughput means nothing on its own. A number this size is easy to reach by
 dropping, double-sending, or double-charging a recipient's daily cap, and none
 of those shows up in a latency histogram.
 
-The repository defines eight invariants (internal/verify/invariants.go). The
-table below reports six of them, checked with direct SQL over all 1,479,081
+The repository defines nine invariants (internal/verify/invariants.go). The
+table below reports five of them, checked with direct SQL over all 1,479,081
 accepted messages.
 
-**cmd/verify-run was not run, and would have failed this run.** Its
-"no message was left queued" check treats a queued message as a silent drop and
-is meant to run after the queue has drained; 1,374,558 were still queued, so it
-would report that many violations and exit non-zero. The two daily-cap checks
-are also absent here because the cap was configured at 1,000,000 and nothing
-could approach it.
+**cmd/verify-run was not run, and would have failed this run.** Two of its
+checks split the queued messages by whether one has ever been attempted: "no
+message was left queued without being attempted" treats a queued message as a
+silent drop, and its companion, "no message was parked after repeated provider
+failures", covers the ones handed back after a transient error. Both are meant
+to run after the queue has drained, and both are absent here for that reason —
+mid-run, a message sitting in the queue is work still in flight, not work
+abandoned. 1,374,558 were still queued, so between them they would report that
+many violations and exit non-zero. The two daily-cap checks are also absent
+here because the cap was configured at 1,000,000 and nothing could approach it.
 
-Read the table as "these six held", not as "the suite passed":
+Read the table as "these five held", not as "the suite passed":
 
 | invariant | result |
 |---|---|
@@ -135,11 +139,11 @@ Read the table as "these six held", not as "the suite passed":
 | idempotency keys unique per tenant | **0 violations** |
 | suppressed messages never sent | **0 violations** |
 | nothing stuck mid-flight | **0 violations** |
-| messages in DLQ | **0** — see caveat |
 
-The DLQ result is a null result rather than a pass. Redrive fires after five
-receives (sqs_send_max_receive_count = 5) and about 93% of the corpus had never
-been received even once when this was measured, so an empty DLQ was
+The DLQ held **0** messages, which is a queue observation rather than one of
+the nine invariants — and a null result rather than a pass. Redrive fires after
+five receives (sqs_send_max_receive_count = 5) and about 93% of the corpus had
+never been received even once when this was measured, so an empty DLQ was
 arithmetically guaranteed regardless of whether the system is correct.
 
 The count is worth its own line: k6 reported 1,479,077 requests accepted, and

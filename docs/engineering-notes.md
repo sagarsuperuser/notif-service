@@ -19,9 +19,9 @@ rather than quietly dropped, because how they were caught is part of the story.
 
 ---
 
-## Resume bullets
+## What was built and how it was proven
 
-Pick three or four. Each is defensible under follow-up.
+Each is defensible under follow-up.
 
 **Recovered 8.8% of a 100,000-message campaign that was being silently
 discarded**, by finding that the retry classifier tested the error before the
@@ -83,10 +83,12 @@ delete, pinned by a test that holds handlers open across shutdown.
 establishing that nothing required global ordering, replacing its five-minute
 deduplication window with a database uniqueness constraint that outlives it.
 
-**Introduced the repository's first CI test gate** and grew integration
-coverage from 405 lines to 4,415 across 19 files, using differential testing against
-the previous implementation and requiring every new guarantee to fail under
-mutation before trusting it.
+**Introduced the repository's first CI test gate** and grew the test suite from
+401 lines in a single integration file to 4,415 lines across 19 files, of which
+3,103 lines across 9 files are integration tests against real Postgres — one
+of them drives SQS through LocalStack instead — using differential testing
+against the previous implementation and requiring every new guarantee to fail
+under mutation before trusting it.
 
 **Built an invariant harness that gates load-test results on correctness** — no
 duplicate sends, no drops, no daily-cap overshoot — with every invariant itself

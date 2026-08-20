@@ -1,5 +1,7 @@
 # Benchmark Scenario: 500 RPS for 10 Minutes
 
+> **Superseded.** This is the February 2026 run that found the processing ceiling at ~241 ops/sec; the current measurements are in [benchmark-2026-08-14.md](../benchmark-2026-08-14.md).
+
 ## 1) Test Goal
 Validate steady-state behavior at **500 RPS** for **10 minutes**.
 
