@@ -12,14 +12,13 @@ It accepts message requests, enqueues send jobs to SQS, processes sends asynchro
 - `cmd/webhook`: webhook ingest endpoint
 - `internal/`: domain, service, queue, store, provider, observability code
 - `deploy/k8s`: Kubernetes manifests and overlays
-- `infra`: Terraform infrastructure (AWS network, SQS, RDS, etc.)
+- `infra`: Terraform infrastructure — deliberately small: public subnets + SG-locked ingress (no NAT), no load balancer (DNS → server EIP → ingress-nginx NodePort), one k3s server + one spot worker ASG, RDS Postgres reached directly by the pgx pools (no RDS Proxy), SQS FIFO + DLQ, SSM for access
 - `docs/architecture`: architecture diagrams
 
 ## Architecture (High Level)
 1. API writes message intent to DB and enqueues send job.
 2. Worker consumes queue, applies rate limit/retry/backoff/circuit-breaker, calls provider, updates DB.
-3. Provider webhook is ingested and enqueued.
-4. Webhook processor consumes webhook queue and applies terminal status updates.
+3. Provider webhook applies the terminal status update in one statement (ingest-only handler; no intermediate queue).
 
 See diagrams: `docs/architecture/README.md`.
 
@@ -75,6 +74,7 @@ make reset             # stop + delete volumes
 - K8s deploy (dev overlay): `make k8s-up`
 - Restart workloads: `make k8s-restart`
 - Terraform stack: `infra/`
+- Dev note: **branch from `origin/main` explicitly** (`git fetch origin && git switch -c my-branch origin/main`). Local `main` checkouts in worktree setups run behind — three stale-base incidents in one week, including the PR that added this line.
 
 ## Results
 

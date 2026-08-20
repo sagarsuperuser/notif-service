@@ -1,12 +1,5 @@
 prometheus:
   prometheusSpec:
-    nodeSelector:
-      workload: monitoring
-    tolerations:
-      - key: workload
-        operator: Equal
-        value: monitoring
-        effect: NoSchedule
     retention: 2d
     resources:
       requests:
@@ -23,13 +16,6 @@ prometheus:
 
 alertmanager:
   alertmanagerSpec:
-    nodeSelector:
-      workload: monitoring
-    tolerations:
-      - key: workload
-        operator: Equal
-        value: monitoring
-        effect: NoSchedule
     resources:
       requests:
         cpu: 50m
@@ -49,13 +35,6 @@ grafana:
     storageClassName: gp3
     accessModes: ["ReadWriteOnce"]
     size: 2Gi
-  nodeSelector:
-    workload: monitoring
-  tolerations:
-    - key: workload
-      operator: Equal
-      value: monitoring
-      effect: NoSchedule
   sidecar:
     dashboards:
       enabled: true

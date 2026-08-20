@@ -1,5 +1,7 @@
 # 100,000-message campaign — evidence
 
+> Historical record: this ran on the pre-2026-08-20 architecture (NAT + private subnets, internal API NLB path, bastion, RDS Postgres behind RDS Proxy, role-pinned node pools). The infrastructure has since been simplified — see `docs/architecture/` — but the numbers here describe the runs as they ran and are not restated.
+
 Run on AWS, 15 August 2026. Commit `sha-3d08e8d`. Provider profile: short code
 at 500 MPS (Twilio's own Account Based Throughput worked example).
 

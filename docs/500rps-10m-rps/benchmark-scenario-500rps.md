@@ -2,6 +2,8 @@
 
 > **Superseded.** This is the February 2026 run that found the processing ceiling at ~241 ops/sec; the current measurements are in [benchmark-2026-08-14.md](../benchmark-2026-08-14.md).
 
+
+> Historical record: this ran on the pre-2026-08-20 architecture (NAT + private subnets, internal API NLB path, bastion, RDS Postgres behind RDS Proxy, role-pinned node pools). The infrastructure has since been simplified — see `docs/architecture/` — but the numbers here describe the runs as they ran and are not restated.
 ## 1) Test Goal
 Validate steady-state behavior at **500 RPS** for **10 minutes**.
 

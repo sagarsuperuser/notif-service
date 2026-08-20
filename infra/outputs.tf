@@ -1,23 +1,22 @@
 output "vpc_id" { value = aws_vpc.this.id }
 
-output "api_nlb_dns" {
-  value = one(aws_lb.api[*].dns_name)
+output "k3s_server_public_ip" {
+  description = "Stable public endpoint: kubeconfig target, DNS target for ingress, and the API cert's SAN."
+  value       = aws_eip.k3s_server.public_ip
 }
 
-output "ingress_nlb_dns" {
-  value = one(aws_lb.ingress[*].dns_name)
+output "k3s_server_private_ip" {
+  description = "The address agents join through."
+  value       = aws_instance.k3s_server.private_ip
 }
 
-output "bastion_public_ip" {
-  value = try(aws_instance.bastion[0].public_ip, null)
+output "ingress_url" {
+  description = "The public entry point (ingress-nginx NodePort behind the server EIP)."
+  value       = "http://${aws_eip.k3s_server.public_ip}:${var.ingress_http_nodeport}"
 }
 
 output "rds_endpoint" {
   value = aws_db_instance.postgres.address
-}
-
-output "rds_proxy_endpoint" {
-  value = aws_db_proxy.postgres.endpoint
 }
 
 output "rds_port" { value = aws_db_instance.postgres.port }
@@ -34,14 +33,4 @@ output "sqs_dlq_url" { value = aws_sqs_queue.dlq.url }
 output "k3s_token" {
   value     = random_password.k3s_token.result
   sensitive = true
-}
-
-output "k3s_server_private_ips" {
-  description = "Control-plane addresses. Without a load balancer this is how agents and kubectl reach the API."
-  value       = aws_instance.k3s_server[*].private_ip
-}
-
-output "k3s_api_endpoint" {
-  description = "The address agents join through — the NLB when there is one, the single server's private IP otherwise."
-  value       = local.k3s_api_endpoint
 }

@@ -7,52 +7,48 @@ flowchart TB
     provider["Provider Twilio Mock"]
   end
 
-  subgraph aws[AWS VPC]
-    nlb[NLB / Ingress NodePort]
+  subgraph aws[AWS VPC — public subnets, SG-locked]
+    entry["server EIP :30080/:30443 (ingress-nginx NodePort)"]
 
-    subgraph k8s[Kubernetes Cluster]
+    subgraph k8s["k3s: 1 server (m7i.large) + worker ASG (c7i.large, spot)"]
       api[notif-api]
       worker[notif-worker]
       webhook["notif-webhook ingest"]
-      whproc[webhook-processor]
       keda[KEDA]
       prom[Prometheus]
       grafana[Grafana]
     end
 
-    qsend[(SQS send (standard))]
-    qwebhook[(SQS webhook-events)]
-    dbproxy[(RDS Proxy)]
-    db[(Postgres RDS)]
+    qsend[(SQS send.fifo + DLQ)]
+    db[(Postgres RDS — direct, pgx pools)]
   end
 
   %% ingress and request path
-  client --> nlb
-  nlb --> api
-  provider --> nlb
-  nlb --> webhook
+  client --> entry
+  entry --> api
+  provider --> entry
+  entry --> webhook
 
   %% message processing
   api --> qsend
   qsend --> worker
   worker --> provider
 
-  %% webhook processing
-  webhook --> qwebhook
-  qwebhook --> whproc
-
   %% data path
-  api --> dbproxy --> db
-  worker --> dbproxy
-  whproc --> dbproxy
+  api --> db
+  worker --> db
+  webhook --> db
 
   %% control and observability
   keda -. scales by queue depth .-> worker
-  keda -. scales by queue depth .-> whproc
 
   api -. metrics .-> prom
   worker -. metrics .-> prom
   webhook -. metrics .-> prom
-  whproc -. metrics .-> prom
   prom --> grafana
 ```
+
+Access for operators is SSM (no bastion, no SSH required); kubectl reaches
+the server EIP on 6443, SG-locked to the admin CIDR. SQS is reached via the
+internet gateway (public subnets — no NAT, so no per-GB toll on the
+worker→SQS path).

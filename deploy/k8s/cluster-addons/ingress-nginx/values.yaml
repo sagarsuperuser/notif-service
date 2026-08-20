@@ -2,21 +2,12 @@ controller:
   kind: Deployment
   replicaCount: 2
 
-  nodeSelector:
-    workload: ingress
-
-  tolerations:
-    - key: "workload"
-      operator: "Equal"
-      value: "ingress"
-      effect: "NoSchedule"
-
   service:
     type: NodePort
     nodePorts:
       http: 30080
       https: 30443
-    externalTrafficPolicy: Local
+    externalTrafficPolicy: Cluster
 
   ingressClassResource:
     name: nginx

@@ -1,5 +1,7 @@
 # Failure handling under load — controlled A/B, 15 August 2026
 
+> Historical record: this ran on the pre-2026-08-20 architecture (NAT + private subnets, internal API NLB path, bastion, RDS Postgres behind RDS Proxy, role-pinned node pools). The infrastructure has since been simplified — see `docs/architecture/` — but the numbers here describe the runs as they ran and are not restated.
+
 Three 100,000-message campaigns on the same AWS stack, run to answer one
 question: **what happens to a message when the provider says no?**
 
