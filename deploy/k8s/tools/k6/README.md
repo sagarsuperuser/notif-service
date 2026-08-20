@@ -4,7 +4,7 @@ This folder contains in-cluster k6 jobs with per-request dynamic `idempotencyKey
 
 ## Scenarios
 
-### 1) Baseline steady (~56 req/sec for 30 minutes)
+### 1) Steady 500 req/sec for 10 minutes
 ```bash
 kubectl apply -f deploy/k8s/tools/k6/notif-api-500rps-30m.yaml
 kubectl logs -l job-name=k6-notif-api-500rps-30m -f
@@ -37,7 +37,8 @@ kubectl apply -f deploy/k8s/tools/k6/notif-api-stepramp.yaml
 kubectl logs -l job-name=k6-notif-api-stepramp -f
 ```
 
-Holds 200, 500, 1000, 2000, 3000, 4000 and 5000 rps for three minutes each.
+Holds 200, 500, 1000, 2000, 3000, 4000 and 5000 rps for `STAGE_SECONDS` each;
+the manifest sets 90s.
 A fixed-rate run can only tell you whether that one rate works; it cannot tell
 you where the limit is, and a run well under the limit looks the same as a run
 at half of it. The knee is the step where p99 departs from flat.

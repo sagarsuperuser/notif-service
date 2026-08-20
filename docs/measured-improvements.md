@@ -22,6 +22,13 @@ accept duration. One variable: the worker image.
 The last two rows are the controls: identical acceptance and identical duration
 show the accept path did not move.
 
+The two deltas differ by one because the after arm's own rows do: 98,874 + 1,125
+= 99,999. One accepted message was never attempted and appears in neither queue.
+`PurgeQueue` was issued seconds before that run, and AWS documents that a purge
+can take up to 60 seconds and may delete messages sent while it is in progress.
+Recorded rather than rounded away; the full note is at the end of the linked
+timeline.
+
 **What is established.** `ShouldRetry` tested `err != nil` before the HTTP
 status, and `SendSMS` returns a non-nil error alongside every non-2xx response,
 so the status branches were unreachable. The "attempts per message" row measures
@@ -195,6 +202,7 @@ during the outage, with everything dead-lettered
 
 after one `sqs start-message-move-task` back to the main queue
   delivered                          18,666
+  submitted                           1,334   provider-restart artifact, see timeline
   failed                                  0
   dead-letter queue                       0
   total accounted             20,000 / 20,000
@@ -250,7 +258,7 @@ figures were captured before teardown; the CloudWatch series remain in AWS.
 Captured from Postgres before the environment was destroyed.
 
 ```
-run     messages   started              ended
+run     messages   started (UTC)        ended (UTC)
 clean    100,000   2026-08-14 19:13:14  19:18:01
 final    100,000   2026-08-14 20:14:35  20:19:18
 prom     100,000   2026-08-14 20:41:18  20:46:01

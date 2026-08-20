@@ -2,6 +2,8 @@
 
 Event-driven SMS notification service built in Go.
 
+Correctness under injected provider failure: idempotent at-least-once delivery, no duplicate sends, no drops, dead-letter redrive drilled — and throughput reported only alongside invariants checked against the database in SQL (`internal/verify` defines nine), never latency alone.
+
 It accepts message requests, enqueues send jobs to SQS, processes sends asynchronously in workers, ingests provider webhooks, and reconciles final delivery state.
 
 ## What Is In This Repo
@@ -24,7 +26,7 @@ See diagrams: `docs/architecture/README.md`.
 ## Local Quick Start
 
 Prerequisites:
-- Go 1.22+
+- Go 1.25+
 - Docker / Docker Compose
 - `psql`
 
@@ -74,7 +76,23 @@ make reset             # stop + delete volumes
 - Restart workloads: `make k8s-restart`
 - Terraform stack: `infra/`
 
-## Benchmarks and Docs
-- Architecture docs: `docs/architecture/`
-- 500 RPS benchmark report: `docs/500rps-10m-rps/benchmark-scenario-500rps.md`
-- Grafana dashboards: `deploy/grafana/dashboards/`
+## Results
+
+- [100k campaign](docs/campaign-100k/README.md) — 100,000 delivered in 293 s, reconciled
+  against AWS CloudWatch (a recording this service does not produce), zero duplicates,
+  zero drops, zero dead-lettered.
+- [Retry-handling A/B](docs/campaign-100k/retry-handling-ab-2026-08-15.md) — controlled
+  experiment on live AWS: 8,728 of 100,000 sends were being silently discarded by a
+  classifier that tested the error before the HTTP status.
+- [Accept-path benchmark](docs/benchmark-2026-08-14.md) — 2,000 accepts/sec sustained,
+  p99 142 ms, and why the send path's separate ~142/s ceiling was our own limiter.
+- [Measured improvements](docs/measured-improvements.md) — every figure re-derivable;
+  withdrawn claims kept, not deleted.
+- [Architecture](docs/architecture/) · [Grafana dashboards](deploy/grafana/dashboards/)
+- [500 RPS capacity study (Feb 2026)](docs/500rps-10m-rps/benchmark-scenario-500rps.md)
+  — the earlier run that found the processing ceiling at ~241 ops/sec. Superseded;
+  kept because it is where the bottleneck work started.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
