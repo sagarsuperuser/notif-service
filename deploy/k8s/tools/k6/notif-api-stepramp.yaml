@@ -20,13 +20,9 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      nodeSelector:
-        workload: monitoring
-      tolerations:
-        - key: workload
-          operator: Equal
-          value: "monitoring"
-          effect: NoSchedule
+      # No node pin: the role-pinned pools are gone (2026-08-20). For a
+      # measurement run, isolate the load generator by giving it its own
+      # node (scale worker_count up by one) rather than by taints.
       containers:
         - name: k6
           image: grafana/k6:latest

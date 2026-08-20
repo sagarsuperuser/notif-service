@@ -6,32 +6,60 @@ data "aws_availability_zones" "azs" {
   state = "available"
 }
 
+# -----------------------------------------------------------------------------
+# Topology, and why it is this small (2026-08-20 simplification):
+#
+#   internet ── DNS ──► server EIP :30080/:30443 (ingress-nginx NodePort)
+#   admin    ── SG-locked ──► server :6443 (kubectl) · SSM sessions (no SSH needed)
+#   nodes    ── IGW ──► SQS / provider APIs        (public subnets; no NAT)
+#   nodes    ──► RDS Postgres :5432                (direct; no RDS Proxy)
+#
+# Everything that was here before and is gone now, with the reason:
+#   - Load balancers (internal API NLB + internet-facing ingress NLB, with
+#     their TGs/listeners/SGs and the use_load_balancers toggle): this account
+#     cannot create load balancers at all (an account-level hold — the API
+#     returns OperationNotPermitted; only AWS Support can lift it), so the
+#     stack already ran with the toggle off. The toggle and both code paths
+#     are gone: agents join the single server on its private IP, kubectl and
+#     the public entry point use the server's EIP, ingress-nginx is reached
+#     on its NodePorts. One entry point, no conditional resource graph.
+#   - NAT gateway + EIP + private subnets/route tables: NAT bills per GB and
+#     every worker→SQS byte paid it. Public subnets with SG-locked ingress
+#     behave identically for this workload and SQS via the IGW is free.
+#     Nothing accepts inbound except the NodePorts, the admin CIDR, and SSM.
+#   - Bastion (+ its SG and rules): ssm.tf already gives key-less, audited
+#     access via Session Manager; 6443/SSH are SG-locked to admin_cidr for
+#     the cases that want them. A jumpbox guards nothing here.
+#   - RDS Proxy (+ its SG, IAM role, Secrets Manager secret): the services'
+#     pgx pools hold a handful of long-lived connections; there is no
+#     connection storm for a proxy to absorb. The campaign docs that ran
+#     behind the proxy are historical records and say so.
+#   - 3-server etcd control plane + five role-pinned agent pools + three spot
+#     ASGs: workload isolation mattered while benchmarking (the campaign docs
+#     record that reasoning); the running system is one server (k3s sqlite) +
+#     one worker ASG. The k8s manifests no longer pin workload=
+#     nodeSelectors/taints.
+#
+# Kept on purpose: non-burstable instance types (t-family CPU credits make
+# sustained behaviour time-dependent — the original tfvars reasoning holds for
+# any long-running work, not just benchmarks), ssm.tf (SSM access + SQS via
+# the instance role instead of static keys), SQS FIFO + DLQ, RDS, EBS-CSI IAM.
+# -----------------------------------------------------------------------------
+
 locals {
   name = "${var.project}-${var.env}"
   azs  = slice(data.aws_availability_zones.azs.names, 0, var.az_count)
 
-  public_subnet_cidrs  = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i)]
-  private_subnet_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i + 10)]
-  db_master_password   = coalesce(var.db_password, random_password.db_password.result)
+  public_subnet_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i)]
+  db_master_password  = coalesce(var.db_password, random_password.db_password.result)
 
-  # Pause mode keeps control-plane + monitoring capacity alive, and pauses the rest.
-  effective_k3s_server_count = var.k3s_server_count
-  effective_k3s_agents_on_demand = var.pause_environment ? {
-    monitoring    = var.k3s_agents_on_demand.monitoring
-    mock_provider = 0
-    worker        = 0
-    ingress       = 0
-    general       = 0
-  } : var.k3s_agents_on_demand
-  effective_k3s_agents_spot = var.pause_environment ? {
-    worker        = 0
-    mock_provider = 0
-    general       = 0
-  } : var.k3s_agents_spot
+  # Pause mode: keep the server (control plane + anything scheduled on it),
+  # scale the worker pool to zero.
+  effective_worker_count = var.pause_environment ? 0 : var.worker_count
 }
 
 # -------------------------
-# VPC + Subnets
+# VPC + public subnets
 # -------------------------
 resource "aws_vpc" "this" {
   cidr_block           = var.vpc_cidr
@@ -53,25 +81,9 @@ resource "aws_subnet" "public" {
   cidr_block              = local.public_subnet_cidrs[each.value]
   map_public_ip_on_launch = true
 
-  tags = {
-    Name = "${local.name}-public-${each.key}"
-  }
+  tags = { Name = "${local.name}-public-${each.key}" }
 }
 
-resource "aws_subnet" "private" {
-  for_each = { for i, az in local.azs : az => i }
-
-  vpc_id                  = aws_vpc.this.id
-  availability_zone       = each.key
-  cidr_block              = local.private_subnet_cidrs[each.value]
-  map_public_ip_on_launch = false
-
-  tags = {
-    Name = "${local.name}-private-${each.key}"
-  }
-}
-
-# Public route table
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.this.id
   tags   = { Name = "${local.name}-public-rt" }
@@ -89,66 +101,9 @@ resource "aws_route_table_association" "public_assoc" {
   route_table_id = aws_route_table.public.id
 }
 
-# NAT (one NAT for MVP)
-resource "aws_eip" "nat" {
-  domain = "vpc"
-  tags   = { Name = "${local.name}-nat-eip" }
-}
-
-resource "aws_nat_gateway" "nat" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = values(aws_subnet.public)[0].id
-  tags          = { Name = "${local.name}-nat" }
-  depends_on    = [aws_internet_gateway.igw]
-}
-
-# Private route table
-resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.this.id
-  tags   = { Name = "${local.name}-private-rt" }
-}
-
-resource "aws_route" "private_nat" {
-  route_table_id         = aws_route_table.private.id
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.nat.id
-}
-
-resource "aws_route_table_association" "private_assoc" {
-  for_each       = aws_subnet.private
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.private.id
-}
-
 # -------------------------
-# Security Groups
+# Security groups
 # -------------------------
-resource "aws_security_group" "bastion" {
-  name        = "${local.name}-bastion-sg"
-  description = "Bastion SG"
-  vpc_id      = aws_vpc.this.id
-
-  # OPTIONAL SSH from your IP (if you use SSH).
-  dynamic "ingress" {
-    for_each = var.bastion_ssh_cidr == null ? [] : [1]
-    content {
-      from_port   = var.ssh_port
-      to_port     = var.ssh_port
-      protocol    = "tcp"
-      cidr_blocks = [var.bastion_ssh_cidr]
-    }
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "${local.name}-bastion-sg" }
-}
-
 resource "aws_security_group" "nodes" {
   name        = "${local.name}-nodes-sg"
   description = "k3s nodes SG"
@@ -164,27 +119,38 @@ resource "aws_security_group" "nodes" {
   tags = { Name = "${local.name}-nodes-sg" }
 }
 
-# SSH from bastion (optional)
-resource "aws_security_group_rule" "nodes_ssh_from_bastion" {
-  count                    = var.key_name == null ? 0 : 1
-  type                     = "ingress"
-  security_group_id        = aws_security_group.nodes.id
-  from_port                = var.ssh_port
-  to_port                  = var.ssh_port
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.bastion.id
-}
-
-# node-to-node (self-referencing rules)
-resource "aws_security_group_rule" "nodes_etcd" {
+# kubectl / k3s API, admin only.
+resource "aws_security_group_rule" "nodes_6443_from_admin" {
   type              = "ingress"
   security_group_id = aws_security_group.nodes.id
-  from_port         = var.k3s_etcd_port_start
-  to_port           = var.k3s_etcd_port_end
+  from_port         = var.k3s_api_port
+  to_port           = var.k3s_api_port
+  protocol          = "tcp"
+  cidr_blocks       = [var.admin_cidr]
+}
+
+# agents join the server on 6443 inside the VPC
+resource "aws_security_group_rule" "nodes_6443_from_nodes" {
+  type              = "ingress"
+  security_group_id = aws_security_group.nodes.id
+  from_port         = var.k3s_api_port
+  to_port           = var.k3s_api_port
   protocol          = "tcp"
   self              = true
 }
 
+# SSH, admin only, only when a key is configured (SSM is the primary path).
+resource "aws_security_group_rule" "nodes_ssh_from_admin" {
+  count             = var.key_name == null ? 0 : 1
+  type              = "ingress"
+  security_group_id = aws_security_group.nodes.id
+  from_port         = var.ssh_port
+  to_port           = var.ssh_port
+  protocol          = "tcp"
+  cidr_blocks       = [var.admin_cidr]
+}
+
+# node-to-node: kubelet, flannel vxlan, nodeport range
 resource "aws_security_group_rule" "nodes_kubelet" {
   type              = "ingress"
   security_group_id = aws_security_group.nodes.id
@@ -212,99 +178,25 @@ resource "aws_security_group_rule" "nodes_nodeports" {
   self              = true
 }
 
-# Internal API NLB SG (so only bastion can hit 6443)
-resource "aws_security_group" "api_nlb" {
-  name        = "${local.name}-api-nlb-sg"
-  description = "Internal API NLB SG"
-  vpc_id      = aws_vpc.this.id
-
-  egress {
-    from_port       = var.k3s_api_port
-    to_port         = var.k3s_api_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.nodes.id]
-  }
-
-  tags = { Name = "${local.name}-api-nlb-sg" }
-}
-
-resource "aws_security_group_rule" "api_nlb_6443_from_bastion" {
-  type                     = "ingress"
-  security_group_id        = aws_security_group.api_nlb.id
-  from_port                = var.k3s_api_port
-  to_port                  = var.k3s_api_port
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.bastion.id
-}
-
-resource "aws_security_group_rule" "api_nlb_6443_from_nodes" {
-  type                     = "ingress"
-  security_group_id        = aws_security_group.api_nlb.id
-  from_port                = var.k3s_api_port
-  to_port                  = var.k3s_api_port
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.nodes.id
-}
-# Nodes allow 6443 only from api-nlb SG + node self (k3s server comms)
-resource "aws_security_group_rule" "nodes_6443_from_api_nlb" {
-  type                     = "ingress"
-  security_group_id        = aws_security_group.nodes.id
-  from_port                = var.k3s_api_port
-  to_port                  = var.k3s_api_port
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.api_nlb.id
-}
-
-resource "aws_security_group_rule" "nodes_6443_from_nodes" {
-  type                     = "ingress"
-  security_group_id        = aws_security_group.nodes.id
-  from_port                = var.k3s_api_port
-  to_port                  = var.k3s_api_port
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.nodes.id
-}
-
-# Internet-facing Ingress NLB SG
-resource "aws_security_group" "ingress_nlb" {
-  name        = "${local.name}-ingress-nlb-sg"
-  description = "Ingress NLB SG"
-  vpc_id      = aws_vpc.this.id
-
-  egress {
-    from_port       = var.ingress_http_nodeport
-    to_port         = var.ingress_https_nodeport
-    protocol        = "tcp"
-    security_groups = [aws_security_group.nodes.id]
-  }
-
-  tags = { Name = "${local.name}-ingress-nlb-sg" }
-}
-
-resource "aws_security_group_rule" "ingress_nlb_80_from_world" {
+# The public entry point: ingress-nginx NodePorts, world-reachable.
+# (There is no load balancer in front — see the header. DNS points at the
+# server's EIP; TLS is cert-manager's job inside the cluster.)
+resource "aws_security_group_rule" "nodes_ingress_http_from_world" {
   type              = "ingress"
-  security_group_id = aws_security_group.ingress_nlb.id
-  from_port         = var.ingress_public_http_port
-  to_port           = var.ingress_public_http_port
+  security_group_id = aws_security_group.nodes.id
+  from_port         = var.ingress_http_nodeport
+  to_port           = var.ingress_http_nodeport
   protocol          = "tcp"
   cidr_blocks       = ["0.0.0.0/0"]
 }
 
-resource "aws_security_group_rule" "ingress_nlb_443_from_world" {
+resource "aws_security_group_rule" "nodes_ingress_https_from_world" {
   type              = "ingress"
-  security_group_id = aws_security_group.ingress_nlb.id
-  from_port         = var.ingress_public_https_port
-  to_port           = var.ingress_public_https_port
+  security_group_id = aws_security_group.nodes.id
+  from_port         = var.ingress_https_nodeport
+  to_port           = var.ingress_https_nodeport
   protocol          = "tcp"
   cidr_blocks       = ["0.0.0.0/0"]
-}
-
-resource "aws_security_group_rule" "nodes_nodeports_from_ingress_nlb" {
-  type                     = "ingress"
-  security_group_id        = aws_security_group.nodes.id
-  from_port                = var.ingress_http_nodeport
-  to_port                  = var.ingress_https_nodeport
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.ingress_nlb.id
 }
 
 # RDS SG
@@ -354,132 +246,12 @@ resource "random_password" "k3s_token" {
 }
 
 # -------------------------
-# NLBs
+# IAM for k3s nodes (EBS CSI; ssm.tf attaches SSM + SQS to the same role)
 # -------------------------
-
-# API NLB (internal)
-resource "aws_lb" "api" {
-  count = var.use_load_balancers ? 1 : 0
-
-  name               = "${local.name}-api"
-  internal           = true
-  load_balancer_type = "network"
-  subnets            = [for s in aws_subnet.private : s.id]
-
-  # If your account/region supports NLB SGs, keep this.
-  # If it errors, remove `security_groups` and rely on nodes SG allowing VPC CIDR instead.
-  security_groups = [aws_security_group.api_nlb.id]
-
-  tags = { Name = "${local.name}-api-nlb" }
-}
-
-resource "aws_lb_target_group" "api_6443" {
-  count = var.use_load_balancers ? 1 : 0
-
-  name        = "${local.name}-api-6443"
-  port        = var.k3s_api_port
-  protocol    = "TCP"
-  vpc_id      = aws_vpc.this.id
-  target_type = "instance"
-
-  health_check {
-    protocol = "TCP"
-    port     = tostring(var.k3s_api_port)
-  }
-}
-
-resource "aws_lb_listener" "api_6443" {
-  count = var.use_load_balancers ? 1 : 0
-
-  load_balancer_arn = aws_lb.api[0].arn
-  port              = var.k3s_api_port
-  protocol          = "TCP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = one(aws_lb_target_group.api_6443[*].arn)
-  }
-}
-
-# Ingress NLB (internet-facing)
-resource "aws_lb" "ingress" {
-  count = var.use_load_balancers ? 1 : 0
-
-  name               = "${local.name}-ingress"
-  internal           = false
-  load_balancer_type = "network"
-  subnets            = [for s in aws_subnet.public : s.id]
-  security_groups    = [aws_security_group.ingress_nlb.id]
-  tags               = { Name = "${local.name}-ingress-nlb" }
-}
-
-resource "aws_lb_target_group" "ingress_http" {
-  count = var.use_load_balancers ? 1 : 0
-
-  name        = "${local.name}-ing-http"
-  port        = var.ingress_http_nodeport
-  protocol    = "TCP"
-  vpc_id      = aws_vpc.this.id
-  target_type = "instance"
-
-  health_check {
-    protocol = "TCP"
-    port     = tostring(var.ingress_http_nodeport)
-  }
-}
-
-resource "aws_lb_target_group" "ingress_https" {
-  count = var.use_load_balancers ? 1 : 0
-
-  name        = "${local.name}-ing-https"
-  port        = var.ingress_https_nodeport
-  protocol    = "TCP"
-  vpc_id      = aws_vpc.this.id
-  target_type = "instance"
-
-  health_check {
-    protocol = "TCP"
-    port     = tostring(var.ingress_https_nodeport)
-  }
-}
-
-resource "aws_lb_listener" "ingress_80" {
-  count = var.use_load_balancers ? 1 : 0
-
-  load_balancer_arn = aws_lb.ingress[0].arn
-  port              = var.ingress_public_http_port
-  protocol          = "TCP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.ingress_http[0].arn
-  }
-}
-
-resource "aws_lb_listener" "ingress_443" {
-  count = var.use_load_balancers ? 1 : 0
-
-  load_balancer_arn = aws_lb.ingress[0].arn
-  port              = var.ingress_public_https_port
-  protocol          = "TCP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.ingress_https[0].arn
-  }
-}
-
-# -------------------------
-# EC2 instances
-# -------------------------
-# IAM instance profile for k3s nodes (servers + agents).
-# This is used by in-cluster components like the AWS EBS CSI driver to provision/attach EBS volumes.
 data "aws_iam_policy_document" "k3s_nodes_assume_role" {
   statement {
-    effect = "Allow"
-    actions = [
-      "sts:AssumeRole",
-    ]
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
     principals {
       type        = "Service"
       identifiers = ["ec2.amazonaws.com"]
@@ -491,12 +263,9 @@ resource "aws_iam_role" "k3s_nodes" {
   name               = "${local.name}-k3s-nodes"
   assume_role_policy = data.aws_iam_policy_document.k3s_nodes_assume_role.json
 
-  tags = {
-    Name = "${local.name}-k3s-nodes"
-  }
+  tags = { Name = "${local.name}-k3s-nodes" }
 }
 
-# Minimal permissions for AWS EBS CSI on k3s-on-EC2.
 resource "aws_iam_role_policy" "k3s_nodes_ebs_csi" {
   name = "${local.name}-k3s-nodes-ebs-csi"
   role = aws_iam_role.k3s_nodes.id
@@ -534,302 +303,74 @@ resource "aws_iam_instance_profile" "k3s_nodes" {
   role = aws_iam_role.k3s_nodes.name
 }
 
-# Bastion (public)
-resource "aws_instance" "bastion" {
-  count = 1
+# -------------------------
+# k3s: one server + one worker ASG
+# -------------------------
 
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_types.bastion
-  subnet_id                   = values(aws_subnet.public)[count.index].id
-  vpc_security_group_ids      = [aws_security_group.bastion.id]
-  associate_public_ip_address = true
-  key_name                    = var.key_name
-
-  root_block_device {
-    volume_size = var.bastion_root_volume_size_gb
-    volume_type = var.root_volume_type
-  }
-
-  tags = {
-    Name = "${local.name}-bastion"
-    Role = "bastion"
-  }
+# Stable public endpoint: kubeconfig, DNS target for ingress, and the cert
+# SAN; survives instance replacement. Allocated before the instance so
+# user_data can reference it.
+resource "aws_eip" "k3s_server" {
+  domain = "vpc"
+  tags   = { Name = "${local.name}-k3s-server-eip" }
 }
 
-# k3s server user_data templates
 locals {
-  # The address agents use to reach the control plane.
-  #
-  # With a load balancer this is the NLB, which is what makes a multi-server
-  # control plane possible: servers two and three join through the same stable
-  # address. Without one, a single server's private IP is the endpoint, so the
-  # control plane cannot be HA — which is why use_load_balancers=false also
-  # forces k3s_server_count to 1 (see the validation on that variable).
-  #
-  # The control plane is not in the data path: it schedules pods, it does not
-  # carry requests. A single server is a real availability limitation for
-  # production and no limitation at all for a throughput measurement.
-  k3s_api_endpoint = var.use_load_balancers ? aws_lb.api[0].dns_name : aws_instance.k3s_server[0].private_ip
-
-  # Only meaningful when a load balancer exists; the placeholder keeps the
-  # template a string when one does not, since a second control-plane node
-  # cannot be created in that mode anyway.
-  k3s_join_address = coalesce(one(aws_lb.api[*].dns_name), "load-balancer-disabled")
-
   k3s_common = <<-EOT
     #!/bin/bash
     set -euo pipefail
     curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${var.k3s_version} sh -s - \
   EOT
 
-  server1_user_data = <<-EOT
+  # Single server, k3s's default embedded sqlite (no --cluster-init/etcd).
+  # Untainted: the server also schedules workloads.
+  server_user_data = <<-EOT
     ${local.k3s_common} server \
-      --cluster-init \
       --token ${random_password.k3s_token.result} \
-      ${var.use_load_balancers ? "--tls-san ${aws_lb.api[0].dns_name}" : ""} \
+      --tls-san ${aws_eip.k3s_server.public_ip} \
       --write-kubeconfig-mode 644 \
-      --node-taint node-role.kubernetes.io/control-plane=true:NoSchedule \
-      --disable traefik
-  EOT
-
-  # Additional control-plane nodes exist only when a load balancer does (a
-  # single server has no stable address for others to join through), so this
-  # names the NLB directly. Routing it via k3s_api_endpoint would make the
-  # server depend on its own address and turn the graph into a cycle.
-  server_join_user_data = <<-EOT
-    ${local.k3s_common} server \
-      --server https://${local.k3s_join_address}:${var.k3s_api_port} \
-      --token ${random_password.k3s_token.result} \
-      --tls-san ${local.k3s_join_address} \
-      --write-kubeconfig-mode 644 \
-      --node-taint node-role.kubernetes.io/control-plane=true:NoSchedule \
       --disable traefik
   EOT
 
   agent_user_data = <<-EOT
     ${local.k3s_common} agent \
-      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
+      --server https://${aws_instance.k3s_server.private_ip}:${var.k3s_api_port} \
       --token ${random_password.k3s_token.result}
   EOT
-
-  agent_worker_user_data = <<-EOT
-    ${local.k3s_common} agent \
-      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
-      --token ${random_password.k3s_token.result} \
-      --node-label workload=worker \
-      --node-taint workload=worker:NoSchedule
-  EOT
-
-  agent_mock_provider_user_data = <<-EOT
-    ${local.k3s_common} agent \
-      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
-      --token ${random_password.k3s_token.result} \
-      --node-label workload=mock-provider \
-      --node-taint workload=mock-provider:NoSchedule
-  EOT
-
-  agent_ingress_user_data = <<-EOT
-    ${local.k3s_common} agent \
-      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
-      --token ${random_password.k3s_token.result} \
-      --node-label workload=ingress \
-      --node-taint workload=ingress:NoSchedule
-  EOT
-
-  agent_monitoring_user_data = <<-EOT
-    ${local.k3s_common} agent \
-      --server https://${local.k3s_api_endpoint}:${var.k3s_api_port} \
-      --token ${random_password.k3s_token.result} \
-      --node-label workload=monitoring \
-      --node-taint workload=monitoring:NoSchedule
-  EOT
-
-  # On-demand agent role layout (by index):
-  #   [0..monitoring)                  => monitoring
-  #   [monitoring..mock_end)           => mock-provider
-  #   [mock_end..worker_end)           => worker
-  #   [worker_end..ingress_end)        => ingress
-  #   [ingress_end..total)             => general (no special taints/labels)
-  od_monitoring_count = local.effective_k3s_agents_on_demand.monitoring
-  od_mock_count       = local.effective_k3s_agents_on_demand.mock_provider
-  od_worker_count     = local.effective_k3s_agents_on_demand.worker
-  od_ingress_count    = local.effective_k3s_agents_on_demand.ingress
-  od_total = (
-    local.effective_k3s_agents_on_demand.monitoring +
-    local.effective_k3s_agents_on_demand.mock_provider +
-    local.effective_k3s_agents_on_demand.worker +
-    local.effective_k3s_agents_on_demand.ingress +
-    local.effective_k3s_agents_on_demand.general
-  )
-
-  od_mock_end    = local.od_monitoring_count + local.od_mock_count
-  od_worker_end  = local.od_mock_end + local.od_worker_count
-  od_ingress_end = local.od_worker_end + local.od_ingress_count
-
-  od_ingress_start = local.od_worker_end
 }
 
-# Spot workers (ASG)
-resource "aws_launch_template" "k3s_agent_spot" {
-  name_prefix = "${local.name}-k3s-agent-spot-"
+resource "aws_instance" "k3s_server" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.k3s_server_instance_type
+  subnet_id              = values(aws_subnet.public)[0].id
+  vpc_security_group_ids = [aws_security_group.nodes.id]
+  key_name               = var.key_name
+  iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
+
+  root_block_device {
+    volume_size = var.root_volume_size_server_gb
+    volume_type = var.root_volume_type
+  }
+
+  user_data = local.server_user_data
+
+  tags = {
+    Name = "${local.name}-k3s-server"
+    Role = "k3s-server"
+  }
+}
+
+resource "aws_eip_association" "k3s_server" {
+  instance_id   = aws_instance.k3s_server.id
+  allocation_id = aws_eip.k3s_server.id
+}
+
+resource "aws_launch_template" "k3s_worker" {
+  name_prefix = "${local.name}-k3s-worker-"
   image_id    = data.aws_ami.ubuntu.id
 
   # Mixed instances policy overrides this; keep a stable default.
-  instance_type = var.spot_instance_types.worker[0]
-  key_name      = var.key_name
-
-  # Join as a worker-dedicated node (label+taint) so it matches worker scheduling.
-  user_data              = base64encode(local.agent_worker_user_data)
-  vpc_security_group_ids = [aws_security_group.nodes.id]
-
-  iam_instance_profile {
-    name = aws_iam_instance_profile.k3s_nodes.name
-  }
-
-  block_device_mappings {
-    device_name = "/dev/sda1"
-    ebs {
-      volume_size = var.root_volume_size_worker_gb
-      volume_type = var.root_volume_type
-    }
-  }
-
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name = "${local.name}-k3s-agent-spot"
-      Role = "k3s-agent"
-    }
-  }
-
-  depends_on = [aws_lb_listener.api_6443]
-}
-
-resource "aws_autoscaling_group" "k3s_agent_spot" {
-  name                = "${local.name}-k3s-agent-spot"
-  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
-
-  min_size         = local.effective_k3s_agents_spot.worker
-  max_size         = local.effective_k3s_agents_spot.worker
-  desired_capacity = local.effective_k3s_agents_spot.worker
-
-  # Use mixed instances so AWS can pick from instance types and AZs for capacity.
-  mixed_instances_policy {
-    instances_distribution {
-      on_demand_percentage_above_base_capacity = 0
-      spot_allocation_strategy                 = "capacity-optimized"
-    }
-
-    launch_template {
-      launch_template_specification {
-        launch_template_id = aws_launch_template.k3s_agent_spot.id
-        version            = "$Latest"
-      }
-
-      dynamic "override" {
-        for_each = var.spot_instance_types.worker
-        content {
-          instance_type = override.value
-        }
-      }
-    }
-  }
-
-  tag {
-    key                 = "Name"
-    value               = "${local.name}-k3s-agent-spot"
-    propagate_at_launch = true
-  }
-
-  tag {
-    key                 = "Role"
-    value               = "k3s-agent"
-    propagate_at_launch = true
-  }
-}
-
-# Spot nodes for mock-provider (separate ASG so we can use a different taint/label).
-resource "aws_launch_template" "k3s_agent_spot_mock_provider" {
-  name_prefix = "${local.name}-k3s-agent-spot-mock-provider-"
-  image_id    = data.aws_ami.ubuntu.id
-
-  instance_type = var.spot_instance_types.mock_provider[0]
-  key_name      = var.key_name
-
-  user_data              = base64encode(local.agent_mock_provider_user_data)
-  vpc_security_group_ids = [aws_security_group.nodes.id]
-
-  iam_instance_profile {
-    name = aws_iam_instance_profile.k3s_nodes.name
-  }
-
-  block_device_mappings {
-    device_name = "/dev/sda1"
-    ebs {
-      volume_size = var.root_volume_size_worker_gb
-      volume_type = var.root_volume_type
-    }
-  }
-
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name = "${local.name}-k3s-agent-spot-mock-provider"
-      Role = "k3s-agent"
-    }
-  }
-
-  depends_on = [aws_lb_listener.api_6443]
-}
-
-resource "aws_autoscaling_group" "k3s_agent_spot_mock_provider" {
-  name                = "${local.name}-k3s-agent-spot-mock-provider"
-  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
-
-  min_size         = local.effective_k3s_agents_spot.mock_provider
-  max_size         = local.effective_k3s_agents_spot.mock_provider
-  desired_capacity = local.effective_k3s_agents_spot.mock_provider
-
-  mixed_instances_policy {
-    instances_distribution {
-      on_demand_percentage_above_base_capacity = 0
-      spot_allocation_strategy                 = "capacity-optimized"
-    }
-
-    launch_template {
-      launch_template_specification {
-        launch_template_id = aws_launch_template.k3s_agent_spot_mock_provider.id
-        version            = "$Latest"
-      }
-
-      dynamic "override" {
-        for_each = var.spot_instance_types.mock_provider
-        content {
-          instance_type = override.value
-        }
-      }
-    }
-  }
-
-  tag {
-    key                 = "Name"
-    value               = "${local.name}-k3s-agent-spot-mock-provider"
-    propagate_at_launch = true
-  }
-
-  tag {
-    key                 = "Role"
-    value               = "k3s-agent"
-    propagate_at_launch = true
-  }
-}
-
-# Spot nodes for general workloads (no special taints/labels).
-resource "aws_launch_template" "k3s_agent_spot_general" {
-  name_prefix = "${local.name}-k3s-agent-spot-general-"
-  image_id    = data.aws_ami.ubuntu.id
-
-  instance_type = var.spot_instance_types.general[0]
+  instance_type = var.worker_instance_types[0]
   key_name      = var.key_name
 
   user_data              = base64encode(local.agent_user_data)
@@ -850,36 +391,38 @@ resource "aws_launch_template" "k3s_agent_spot_general" {
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name = "${local.name}-k3s-agent-spot-general"
+      Name = "${local.name}-k3s-worker"
       Role = "k3s-agent"
     }
   }
-
-  depends_on = [aws_lb_listener.api_6443]
 }
 
-resource "aws_autoscaling_group" "k3s_agent_spot_general" {
-  name                = "${local.name}-k3s-agent-spot-general"
-  vpc_zone_identifier = [for s in aws_subnet.private : s.id]
+resource "aws_autoscaling_group" "k3s_worker" {
+  name                = "${local.name}-k3s-worker"
+  vpc_zone_identifier = [for s in aws_subnet.public : s.id]
 
-  min_size         = local.effective_k3s_agents_spot.general
-  max_size         = local.effective_k3s_agents_spot.general
-  desired_capacity = local.effective_k3s_agents_spot.general
+  min_size         = local.effective_worker_count
+  max_size         = local.effective_worker_count
+  desired_capacity = local.effective_worker_count
 
   mixed_instances_policy {
     instances_distribution {
-      on_demand_percentage_above_base_capacity = 0
+      # Spot by default. The old tfvars' no-spot rule protected benchmark
+      # reproducibility; those campaigns are historical records now, and the
+      # running system prefers the discount. Set 100 to force on-demand for
+      # a measurement run.
+      on_demand_percentage_above_base_capacity = var.worker_on_demand_percentage
       spot_allocation_strategy                 = "capacity-optimized"
     }
 
     launch_template {
       launch_template_specification {
-        launch_template_id = aws_launch_template.k3s_agent_spot_general.id
+        launch_template_id = aws_launch_template.k3s_worker.id
         version            = "$Latest"
       }
 
       dynamic "override" {
-        for_each = var.spot_instance_types.general
+        for_each = var.worker_instance_types
         content {
           instance_type = override.value
         }
@@ -889,7 +432,7 @@ resource "aws_autoscaling_group" "k3s_agent_spot_general" {
 
   tag {
     key                 = "Name"
-    value               = "${local.name}-k3s-agent-spot-general"
+    value               = "${local.name}-k3s-worker"
     propagate_at_launch = true
   }
 
@@ -900,98 +443,8 @@ resource "aws_autoscaling_group" "k3s_agent_spot_general" {
   }
 }
 
-# 3 servers (one per AZ)
-resource "aws_instance" "k3s_server" {
-  count = local.effective_k3s_server_count
-
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_types.k3s_server
-  subnet_id              = values(aws_subnet.private)[count.index].id
-  vpc_security_group_ids = [aws_security_group.nodes.id]
-  key_name               = var.key_name
-  iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
-
-  root_block_device {
-    volume_size = var.root_volume_size_server_gb
-    volume_type = var.root_volume_type
-  }
-
-  user_data = count.index == 0 ? local.server1_user_data : local.server_join_user_data
-
-  tags = {
-    Name = "${local.name}-k3s-server-${count.index + 1}"
-    Role = "k3s-server"
-  }
-
-  depends_on = [aws_lb_listener.api_6443]
-}
-
-# Attach servers to API TG
-resource "aws_lb_target_group_attachment" "api_servers" {
-  count            = var.use_load_balancers ? local.effective_k3s_server_count : 0
-  target_group_arn = one(aws_lb_target_group.api_6443[*].arn)
-  target_id        = aws_instance.k3s_server[count.index].id
-  port             = var.k3s_api_port
-}
-
-# Workers (spread across AZs)
-resource "aws_instance" "k3s_agent_ondemand" {
-  count = local.od_total
-
-  ami = data.aws_ami.ubuntu.id
-  # Monitoring workers need more RAM; keep the rest smaller for cost.
-  instance_type = count.index < local.od_monitoring_count ? var.instance_types.k3s_agent_monitoring : var.instance_types.k3s_agent_default
-  # Only 3 private subnets (1 per AZ). Distribute agents evenly across them.
-  subnet_id              = values(aws_subnet.private)[count.index % length(values(aws_subnet.private))].id
-  vpc_security_group_ids = [aws_security_group.nodes.id]
-  key_name               = var.key_name
-  iam_instance_profile   = aws_iam_instance_profile.k3s_nodes.name
-
-  root_block_device {
-    volume_size = count.index < local.od_monitoring_count ? var.root_volume_size_monitoring_worker_gb : var.root_volume_size_worker_gb
-    volume_type = var.root_volume_type
-  }
-
-  # Dedicate the first N on-demand agents to special workloads via label+taint at join time.
-  user_data = (
-    count.index < local.od_monitoring_count ? local.agent_monitoring_user_data :
-    count.index < local.od_mock_end ? local.agent_mock_provider_user_data :
-    count.index < local.od_worker_end ? local.agent_worker_user_data :
-    count.index < local.od_ingress_end ? local.agent_ingress_user_data :
-    local.agent_user_data
-  )
-
-  tags = {
-    Name = "${local.name}-k3s-agent-od-${count.index + 1}"
-    Role = "k3s-agent"
-  }
-
-  depends_on = [aws_lb_listener.api_6443]
-}
-
-# Attach workers to ingress target groups
-resource "aws_lb_target_group_attachment" "ingress_workers_http_ondemand" {
-  for_each = var.use_load_balancers ? {
-    for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id
-    if idx >= local.od_ingress_start && idx < local.od_ingress_end
-  } : {}
-  target_group_arn = one(aws_lb_target_group.ingress_http[*].arn)
-  target_id        = each.value
-  port             = var.ingress_http_nodeport
-}
-
-resource "aws_lb_target_group_attachment" "ingress_workers_https_ondemand" {
-  for_each = var.use_load_balancers ? {
-    for idx, inst in aws_instance.k3s_agent_ondemand : idx => inst.id
-    if idx >= local.od_ingress_start && idx < local.od_ingress_end
-  } : {}
-  target_group_arn = one(aws_lb_target_group.ingress_https[*].arn)
-  target_id        = each.value
-  port             = var.ingress_https_nodeport
-}
-
 # -------------------------
-# RDS Postgres
+# RDS Postgres (direct; the pgx pools in the services are the pooling story)
 # -------------------------
 resource "random_password" "db_password" {
   length  = var.db_password_length
@@ -1000,7 +453,7 @@ resource "random_password" "db_password" {
 
 resource "aws_db_subnet_group" "db" {
   name       = "${local.name}-db-subnets"
-  subnet_ids = [for s in aws_subnet.private : s.id]
+  subnet_ids = [for s in aws_subnet.public : s.id]
 }
 
 resource "aws_db_instance" "postgres" {
@@ -1027,165 +480,22 @@ resource "aws_db_instance" "postgres" {
 }
 
 # -------------------------
-# RDS Proxy (Secrets Manager auth)
+# SQS FIFO + DLQ
 # -------------------------
-
-resource "aws_secretsmanager_secret" "db_credentials" {
-  name = "${local.name}-db-credentials"
-}
-
-resource "aws_secretsmanager_secret_version" "db_credentials" {
-  secret_id = aws_secretsmanager_secret.db_credentials.id
-
-  # RDS Proxy expects username/password in the JSON secret.
-  secret_string = jsonencode({
-    username = var.db_username
-    password = local.db_master_password
-    engine   = "postgres"
-    host     = aws_db_instance.postgres.address
-    port     = var.postgres_port
-    dbname   = var.db_name
-  })
-}
-
-resource "aws_iam_role" "rds_proxy" {
-  name = "${local.name}-rds-proxy-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Service = "rds.amazonaws.com"
-        }
-        Action = "sts:AssumeRole"
-      },
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "rds_proxy_secrets" {
-  name = "${local.name}-rds-proxy-secrets"
-  role = aws_iam_role.rds_proxy.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret",
-        ]
-        Resource = aws_secretsmanager_secret.db_credentials.arn
-      },
-    ]
-  })
-}
-
-resource "aws_security_group" "rds_proxy" {
-  name        = "${local.name}-rds-proxy-sg"
-  description = "RDS Proxy SG"
-  vpc_id      = aws_vpc.this.id
-
-  ingress {
-    from_port       = var.postgres_port
-    to_port         = var.postgres_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.nodes.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "${local.name}-rds-proxy-sg" }
-}
-
-resource "aws_security_group_rule" "rds_5432_from_proxy" {
-  type                     = "ingress"
-  security_group_id        = aws_security_group.rds.id
-  from_port                = var.postgres_port
-  to_port                  = var.postgres_port
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.rds_proxy.id
-}
-
-resource "aws_db_proxy" "postgres" {
-  name          = "${local.name}-rds-proxy"
-  engine_family = "POSTGRESQL"
-
-  role_arn               = aws_iam_role.rds_proxy.arn
-  vpc_subnet_ids         = [for s in aws_subnet.private : s.id]
-  vpc_security_group_ids = [aws_security_group.rds_proxy.id]
-
-  require_tls         = true
-  idle_client_timeout = var.rds_proxy_idle_client_timeout_seconds
-
-  auth {
-    auth_scheme = "SECRETS"
-    secret_arn  = aws_secretsmanager_secret.db_credentials.arn
-    iam_auth    = "DISABLED"
-  }
-
-  depends_on = [
-    aws_secretsmanager_secret_version.db_credentials,
-    aws_db_instance.postgres,
-  ]
-}
-
-resource "aws_db_proxy_default_target_group" "postgres" {
-  db_proxy_name = aws_db_proxy.postgres.name
-
-  connection_pool_config {
-    max_connections_percent      = var.rds_proxy_max_connections_percent
-    max_idle_connections_percent = var.rds_proxy_max_idle_connections_percent
-    connection_borrow_timeout    = var.rds_proxy_connection_borrow_timeout_seconds
-  }
-}
-
-resource "aws_db_proxy_target" "postgres" {
-  db_proxy_name     = aws_db_proxy.postgres.name
-  target_group_name = aws_db_proxy_default_target_group.postgres.name
-  # This must be the DB instance identifier (not the internal RDS resource ID).
-  db_instance_identifier = aws_db_instance.postgres.identifier
-}
-
-# -------------------------
-# SQS send queue (standard) + DLQ
-# -------------------------
-#
-# Standard, not FIFO. A FIFO queue outside high-throughput mode is capped at 300
-# transactions per second per API action, and 3,000 messages per second even
-# with batching — a ceiling below what this service is built to sustain, bought
-# in exchange for an ordering guarantee nothing here needs. Two SMS to different
-# recipients are unrelated; two to the same recipient are ordered by when the
-# customer sent them, not by the queue.
-#
-# FIFO's deduplication is likewise not load-bearing. The message row's
-# (tenant_id, idempotency_key) unique constraint decides whether a send exists,
-# and the worker's claim decides who may send it. Both outlive SQS's 5-minute
-# deduplication window, which would additionally have swallowed a legitimate
-# resend of the same key on minute four.
 resource "aws_sqs_queue" "dlq" {
-  name = "${local.name}-send-dlq"
+  name                        = "${local.name}-send-dlq.fifo"
+  fifo_queue                  = true
+  content_based_deduplication = true
 }
 
 resource "aws_sqs_queue" "main" {
-  name                       = "${local.name}-send"
-  visibility_timeout_seconds = var.sqs_send_visibility_timeout_seconds
+  name                        = "${local.name}-send.fifo"
+  fifo_queue                  = true
+  content_based_deduplication = true
+  visibility_timeout_seconds  = var.sqs_send_visibility_timeout_seconds
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn
     maxReceiveCount     = var.sqs_send_max_receive_count
   })
 }
-
-# -------------------------
-# Webhook events queue (standard) + DLQ
-# -------------------------
-

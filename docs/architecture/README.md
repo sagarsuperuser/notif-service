@@ -25,4 +25,4 @@ This folder contains production-oriented architecture views for `notif-service`.
   - webhook mode
   - worker/webhook-processor scaling
   - node pool/taint strategy
-  - database/proxy topology
+  - database topology (direct RDS; pgx pooling in the services)

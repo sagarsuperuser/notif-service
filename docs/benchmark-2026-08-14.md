@@ -1,5 +1,7 @@
 # Benchmark — 14 August 2026
 
+> Historical record: this ran on the pre-2026-08-20 architecture (NAT + private subnets, internal API NLB path, bastion, RDS Postgres behind RDS Proxy, role-pinned node pools). The infrastructure has since been simplified — see `docs/architecture/` — but the numbers here describe the runs as they ran and are not restated.
+
 Measured on AWS, against real RDS Postgres and real SQS. Every number here
 came from a run on the stack described below; nothing is extrapolated.
 

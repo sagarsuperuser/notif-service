@@ -24,13 +24,11 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant API as notif-api
-    participant DB as Postgres (via RDS Proxy)
+    participant DB as Postgres (RDS, direct — pgx pools)
     participant QSend as SQS send
     participant W as notif-worker
     participant P as Provider
-    participant WH as notif-webhook ingest
-    participant QWebhook as SQS webhook-events
-    participant WHP as webhook-processor
+    participant WH as notif-webhook
 
     rect rgb(214, 230, 255)
     Note over C,API: API accept path
@@ -51,14 +49,12 @@ sequenceDiagram
     end
 
     rect rgb(255, 228, 214)
-    Note over P,WHP: Webhook processing path
+    Note over P,WH: Webhook path
     P->>WH: Delivery webhook
     Note over P,WH: Retries only on non-2xx
-    WH->>QWebhook: Enqueue webhook event
+    WH->>DB: Apply terminal state + store event (one statement)
     WH-->>P: 200 OK
-    QWebhook-->>WHP: Receive webhook event
-    WHP->>DB: Apply terminal state and store event
     end
 
-    Note over QSend,QWebhook: SQS delivery is at-least-once
+    Note over QSend,W: SQS delivery is at-least-once
 ```

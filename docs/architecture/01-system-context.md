@@ -5,44 +5,43 @@ flowchart LR
     subgraph ext[External]
       users[Clients / Campaign Systems]
       k6[k6 Load Job]
-    provider["Provider Twilio Mock"]
+      provider["Provider Twilio Mock"]
     end
 
     subgraph aws[AWS]
-      ingress[NLB + NodePort]
+      entry["server EIP : ingress-nginx NodePort"]
       api[notif-api]
       worker[notif-worker]
       webhook[notif-webhook]
-      whproc[webhook-processor]
       keda[KEDA]
       mon[Prometheus + Grafana]
 
       qsend[(SQS Send Queue)]
-      qwebhook[(SQS Webhook Events Queue)]
-      dbproxy[(RDS Proxy)]
       db[(Postgres RDS)]
     end
 
-    users --> ingress --> api
-    k6 --> ingress
+    users --> entry --> api
+    k6 --> entry
 
     api --> qsend
     qsend --> worker
     worker --> provider
 
-    provider --> ingress --> webhook
-    webhook --> qwebhook
-    qwebhook --> whproc
+    provider --> entry --> webhook
 
-    api --> dbproxy --> db
-    worker --> dbproxy
-    whproc --> dbproxy
+    api --> db
+    worker --> db
+    webhook --> db
 
     keda -. scales .-> worker
-    keda -. scales .-> whproc
 
     api -. metrics .-> mon
     worker -. metrics .-> mon
     webhook -. metrics .-> mon
-    whproc -. metrics .-> mon
 ```
+
+No load balancer (the account cannot create them; DNS points at the server
+EIP), no RDS Proxy (each service's pgx pool talks to Postgres directly), no
+webhook queue (the webhook handler applies the status update in one
+statement). The pre-2026-08-20 topology these replaced is recorded in the
+campaign docs.
