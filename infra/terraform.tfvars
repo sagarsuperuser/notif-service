@@ -9,10 +9,11 @@ pause_environment = false
 # does not need it.
 worker_count = 2
 
-# Spot by default. The campaigns ran on-demand so a spot interruption could
-# not silently change a measurement; that reasoning lives with the campaign
-# docs. Set worker_on_demand_percentage = 100 to reproduce a measurement run.
-worker_on_demand_percentage = 0
+# On-demand plain-ASG launches only, in THIS account: the spot vCPU quota is
+# 1 (L-34B43A08) and the EC2 Fleet-request quota rejects mixed-instances ASGs
+# even for on-demand — both found by the verification apply. workers_use_spot
+# stays false until a quota increase.
+workers_use_spot = false
 
 # Non-burstable types — t-family CPU credits make sustained behaviour depend
 # on prior idle time (see variables.tf).

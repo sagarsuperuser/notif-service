@@ -369,9 +369,22 @@ resource "aws_launch_template" "k3s_worker" {
   name_prefix = "${local.name}-k3s-worker-"
   image_id    = data.aws_ami.ubuntu.id
 
-  # Mixed instances policy overrides this; keep a stable default.
-  instance_type = var.worker_instance_types[0]
+  instance_type = var.worker_instance_type
   key_name      = var.key_name
+
+  # Optional spot without the EC2 Fleet API: this account's Fleet-request
+  # quota (and its 1-vCPU spot quota) rejects mixed-instances ASGs outright —
+  # the verification apply failed twice on it, once for spot and once for
+  # on-demand-via-Fleet. A plain ASG launch avoids the Fleet API entirely.
+  dynamic "instance_market_options" {
+    for_each = var.workers_use_spot ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        spot_instance_type = "one-time"
+      }
+    }
+  }
 
   user_data              = base64encode(local.agent_user_data)
   vpc_security_group_ids = [aws_security_group.nodes.id]
@@ -405,29 +418,9 @@ resource "aws_autoscaling_group" "k3s_worker" {
   max_size         = local.effective_worker_count
   desired_capacity = local.effective_worker_count
 
-  mixed_instances_policy {
-    instances_distribution {
-      # Spot by default. The old tfvars' no-spot rule protected benchmark
-      # reproducibility; those campaigns are historical records now, and the
-      # running system prefers the discount. Set 100 to force on-demand for
-      # a measurement run.
-      on_demand_percentage_above_base_capacity = var.worker_on_demand_percentage
-      spot_allocation_strategy                 = "capacity-optimized"
-    }
-
-    launch_template {
-      launch_template_specification {
-        launch_template_id = aws_launch_template.k3s_worker.id
-        version            = "$Latest"
-      }
-
-      dynamic "override" {
-        for_each = var.worker_instance_types
-        content {
-          instance_type = override.value
-        }
-      }
-    }
+  launch_template {
+    id      = aws_launch_template.k3s_worker.id
+    version = "$Latest"
   }
 
   tag {

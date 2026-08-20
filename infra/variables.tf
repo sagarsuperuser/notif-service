@@ -51,10 +51,9 @@ variable "k3s_server_instance_type" {
   default = "m7i.large" # 2 vCPU / 8 GiB — control plane + scheduled workloads
 }
 
-variable "worker_instance_types" {
-  type        = list(string)
-  default     = ["c7i.large", "c6i.large"]
-  description = "Instance types for the worker ASG (mixed instances policy picks per capacity)."
+variable "worker_instance_type" {
+  type    = string
+  default = "c7i.large"
 }
 
 variable "worker_count" {
@@ -63,10 +62,10 @@ variable "worker_count" {
   description = "Size of the worker ASG."
 }
 
-variable "worker_on_demand_percentage" {
-  type        = number
-  default     = 0
-  description = "0 = all spot (the running default). 100 = all on-demand — use for measurement runs, where a spot interruption would silently change the number."
+variable "workers_use_spot" {
+  type        = bool
+  default     = false
+  description = "Launch workers as one-time spot instances. Off by default: this account's spot vCPU quota (1) blocks it, and measurement runs want on-demand anyway (a spot interruption silently changes the number)."
 }
 
 # Root disk sizes (gp3).
