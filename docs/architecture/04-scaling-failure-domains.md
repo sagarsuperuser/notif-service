@@ -34,7 +34,7 @@ flowchart LR
 
   overload_worker["If send rate > worker throughput, queue lag rises"]:::risk
   overload_db["If DB CPU/connections saturate, timeout/error rates rise"]:::risk
-  spot_loss["If spot nodes are evicted, replicas drop and latency spikes"]:::risk
+  spot_loss["If a worker node is lost (or spot is enabled and evicted), replicas drop and latency spikes"]:::risk
   controls["Controls: KEDA bounds, worker/webhook concurrency caps, retries with exponential backoff, circuit breakers, pgx pool caps, DLQ, idempotency"]:::ctrl
 
   qsend -.-> overload_worker
@@ -50,7 +50,9 @@ Backpressure operating rule:
 
 How this scales (and what it costs today by not pre-building it):
 - Workers scale by one variable (`worker_count`; KEDA scales pods within the
-  pool). A measurement-grade pool is `worker_on_demand_percentage = 100`.
+  pool). Workers are on-demand (`workers_use_spot = false`, the default and the
+  only option this account's spot quota allows); a spot pool is a one-variable
+  change once the quota is raised, at the cost of interruption risk.
 - The single k3s server is the availability trade: control plane and ingress
   entry ride one instance (its EIP survives replacement; ~5 min to recreate
   from Terraform). If that ever stops being acceptable, the upgrade path is

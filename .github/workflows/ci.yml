@@ -65,7 +65,26 @@ jobs:
         run: go build ./...
 
       - name: go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags=integration ./tests/...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l cmd internal tests)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      # Pinned so a new release cannot turn an unrelated PR red.
+      - name: staticcheck
+        run: |
+          go run honnef.co/go/tools/cmd/staticcheck@2026.2.1 ./...
+          go run honnef.co/go/tools/cmd/staticcheck@2026.2.1 -tags=integration ./tests/...
+
+      # Fails only on vulnerabilities the code can actually reach.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
       - name: Unit tests
         run: go test ./... -race

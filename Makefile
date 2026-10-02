@@ -22,15 +22,15 @@ queues:
 	docker exec -i $(LS_CONTAINER) bash -lc '\
 	set -euo pipefail; \
 	echo "Creating DLQ..."; \
-	awslocal sqs create-queue --queue-name notif-send-dlq.fifo \
-	  --attributes "{\"FifoQueue\":\"true\",\"ContentBasedDeduplication\":\"true\"}" >/dev/null || true; \
-	DLQ_URL=$$(awslocal sqs get-queue-url --queue-name notif-send-dlq.fifo --query QueueUrl --output text); \
+	awslocal sqs create-queue --queue-name notif-send-dlq \
+	  --attributes "{\"MessageRetentionPeriod\":\"1209600\"}" >/dev/null || true; \
+	DLQ_URL=$$(awslocal sqs get-queue-url --queue-name notif-send-dlq --query QueueUrl --output text); \
 	DLQ_ARN=$$(awslocal sqs get-queue-attributes --queue-url "$$DLQ_URL" --attribute-names QueueArn --query Attributes.QueueArn --output text); \
 	REDRIVE=$$(printf "{\"deadLetterTargetArn\":\"%s\",\"maxReceiveCount\":\"5\"}" "$$DLQ_ARN"); \
 	REDRIVE_ESC=$${REDRIVE//\"/\\\"}; \
-	echo "Creating main FIFO queue with DLQ redrive..."; \
-	awslocal sqs create-queue --queue-name notif-send.fifo \
-	  --attributes "{\"FifoQueue\":\"true\",\"ContentBasedDeduplication\":\"true\",\"RedrivePolicy\":\"$$REDRIVE_ESC\"}" >/dev/null || true; \
+	echo "Creating main standard queue with DLQ redrive (standard, like prod; see infra/main.tf)..."; \
+	awslocal sqs create-queue --queue-name notif-send \
+	  --attributes "{\"VisibilityTimeout\":\"180\",\"RedrivePolicy\":\"$$REDRIVE_ESC\"}" >/dev/null || true; \
 	awslocal sqs list-queues; \
 	echo "Done.";'
 

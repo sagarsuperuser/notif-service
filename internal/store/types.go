@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 type Message struct {
 	ID            string
@@ -41,7 +44,17 @@ type MessageForWorker struct {
 type ClaimedMessage struct {
 	MessageForWorker
 	Claimed bool
+	// ClaimedAt is the updated_at this claim wrote, and serves as the claim's
+	// token: every later write on the claimed row requires it, so a worker
+	// whose claim went stale and was taken over cannot overwrite the new
+	// holder's result. Zero when Claimed is false.
+	ClaimedAt time.Time
 }
+
+// ErrClaimLost reports that a guarded write found the row no longer held by
+// this claim — another worker re-claimed it, or a delivery callback already
+// moved it on. The write was not applied.
+var ErrClaimLost = errors.New("claim lost: row is no longer held by this worker")
 
 // MessageTransition is a state change applied to the message row in the same
 // statement as the attempt that caused it. Provider and ProviderMsgID are only
@@ -53,6 +66,10 @@ type MessageTransition struct {
 	ProviderMsgID string
 	LastError     string
 	Now           time.Time
+	// ClaimedAt is the claim token from ClaimAndLoad. When set, the transition
+	// applies only while the row is still 'processing' under that claim; when
+	// zero, only the 'processing' guard applies.
+	ClaimedAt time.Time
 }
 
 // AttemptRecord is one provider attempt plus, optionally, the message-state
@@ -98,7 +115,18 @@ type CreateMessageResult struct {
 	State     string
 	LastError string
 	Existing  bool
+	// The request the row was created from, so an idempotent retry can be
+	// checked against it: a reused key with a different payload is a conflict,
+	// not a retry.
+	To         string
+	TemplateID string
+	CampaignID string
+	Vars       map[string]string
 }
+
+// LastErrorEnqueueFailed marks a 'queued' row whose job may never have reached
+// the queue. A retry with the same idempotency key re-enqueues it.
+const LastErrorEnqueueFailed = "enqueue_failed"
 
 // DeliveryEventRecord is one provider callback, applied in a single round-trip:
 // the event is always persisted, and the message row is advanced only when the

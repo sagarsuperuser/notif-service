@@ -33,14 +33,20 @@ func (s *Store) MarkMessageState(ctx context.Context, in store.MessageStateUpdat
 // never saw can still produce a webhook that moves the row to delivered, and
 // resetting that back to queued would send the recipient a second SMS.
 //
+// claimedAt is the claim token ClaimAndLoad returned. With it, the guard also
+// means "processing under OUR claim": a worker whose claim went stale and was
+// re-claimed by another must not hand that worker's live row back to the queue,
+// which would let a third worker send it again. Zero skips the token check.
+//
 // The bool reports whether the reset actually happened, so the caller can tell
 // "handed back" from "something else owns this now" instead of assuming.
-func (s *Store) ReleaseForRetry(ctx context.Context, id, lastErr string, now time.Time) (bool, error) {
+func (s *Store) ReleaseForRetry(ctx context.Context, id, lastErr string, claimedAt, now time.Time) (bool, error) {
 	tag, err := s.DB.Exec(ctx, `
 		UPDATE messages
 		   SET state='queued', last_error=$2, updated_at=$3
 		 WHERE id=$1 AND state='processing'
-	`, id, nullIfEmpty(lastErr), now)
+		   AND ($4::timestamptz IS NULL OR updated_at = $4)
+	`, id, nullIfEmpty(lastErr), now, nullIfZero(claimedAt))
 	if err != nil {
 		return false, err
 	}
@@ -116,17 +122,40 @@ func (s *Store) CreateMessage(ctx context.Context, in store.CreateMessageInput) 
 			SELECT $1,$2,$3,$4,$5,$6,$7, d.state, NULLIF(d.last_error,''), $10,$10 FROM decision d
 			ON CONFLICT (tenant_id, idempotency_key) DO UPDATE
 				SET updated_at = messages.updated_at
-			RETURNING id, state, COALESCE(last_error,'') AS last_error, (xmax = 0) AS inserted
+			RETURNING id, state, COALESCE(last_error,'') AS last_error, (xmax = 0) AS inserted,
+			          to_phone, template_id, COALESCE(campaign_id,'') AS campaign_id, vars_json
 		)
-		SELECT id, state, last_error, inserted FROM ins
+		SELECT id, state, last_error, inserted, to_phone, template_id, campaign_id, vars_json FROM ins
 	`, in.ID, in.TenantID, in.IdemKey, in.To, in.TemplateID, b, nullIfEmpty(in.CampaignID),
 		day, in.MaxPerDay, in.Now)
 
-	if err := row.Scan(&out.MessageID, &out.State, &out.LastError, &inserted); err != nil {
+	var varsJSON []byte
+	if err := row.Scan(&out.MessageID, &out.State, &out.LastError, &inserted,
+		&out.To, &out.TemplateID, &out.CampaignID, &varsJSON); err != nil {
 		return store.CreateMessageResult{}, err
 	}
+	_ = json.Unmarshal(varsJSON, &out.Vars)
 	out.Existing = !inserted
 	return out, nil
+}
+
+// SetEnqueueFailed marks (failed=true) or clears the "job may not have reached
+// the queue" flag on a message. Guarded on state='queued': once a worker has
+// claimed the row the job evidently arrived, and nothing here may move a row
+// the worker or webhook owns.
+func (s *Store) SetEnqueueFailed(ctx context.Context, id string, failed bool, now time.Time) error {
+	if failed {
+		_, err := s.DB.Exec(ctx, `
+			UPDATE messages SET last_error=$2, updated_at=$3
+			 WHERE id=$1 AND state='queued'
+		`, id, store.LastErrorEnqueueFailed, now)
+		return err
+	}
+	_, err := s.DB.Exec(ctx, `
+		UPDATE messages SET last_error=NULL
+		 WHERE id=$1 AND state='queued' AND last_error=$2
+	`, id, store.LastErrorEnqueueFailed)
+	return err
 }
 
 // RecordDeliveryEvent applies one provider callback in a SINGLE round-trip:
@@ -190,7 +219,7 @@ func (s *Store) GetMessage(ctx context.Context, msgID string) (store.Message, bo
 		&m.Provider, &m.ProviderMsgID, &m.LastError, &m.CreatedAt, &m.UpdatedAt)
 
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Message{}, false, nil
 		}
 		return store.Message{}, false, err
@@ -211,6 +240,9 @@ func (s *Store) GetMessage(ctx context.Context, msgID string) (store.Message, bo
 // referencing a row that does not exist and should be surfaced, the second is
 // the ordinary duplicate-delivery case and is simply skipped.
 func (s *Store) ClaimAndLoad(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (store.ClaimedMessage, bool, error) {
+	// Postgres stores microseconds. Truncating here makes the ClaimedAt token
+	// returned below compare equal to the updated_at the claim wrote.
+	now = now.Truncate(time.Microsecond)
 	staleBefore := now.Add(-staleAfter)
 	var out store.ClaimedMessage
 	var varsJSON []byte
@@ -240,6 +272,9 @@ func (s *Store) ClaimAndLoad(ctx context.Context, msgID string, now time.Time, s
 		return store.ClaimedMessage{}, false, err
 	}
 	_ = json.Unmarshal(varsJSON, &out.Vars)
+	if out.Claimed {
+		out.ClaimedAt = now
+	}
 	return out, true, nil
 }
 
@@ -252,6 +287,13 @@ func (s *Store) ClaimAndLoad(ctx context.Context, msgID string, now time.Time, s
 // shapes. Provider and provider_msg_id are written only when non-empty, so a
 // later failed attempt cannot erase the id an earlier successful submit
 // recorded.
+//
+// The transition is guarded like ReleaseForRetry: it applies only while the row
+// is 'processing' (and, with a claim token, under this claim). Unguarded, a
+// worker whose claim went stale could overwrite the new holder's result — or a
+// 'delivered' the webhook had already written — with its own stale outcome.
+// When a transition was requested and the guard refused it, the attempt row is
+// still written (it happened) and store.ErrClaimLost is returned.
 func (s *Store) RecordAttempt(ctx context.Context, in store.AttemptRecord) error {
 	reqB, _ := json.Marshal(in.Attempt.RequestJSON)
 	respB, _ := json.Marshal(in.Attempt.ResponseJSON)
@@ -260,7 +302,7 @@ func (s *Store) RecordAttempt(ctx context.Context, in store.AttemptRecord) error
 	if t == nil {
 		t = &store.MessageTransition{}
 	}
-	_, err := s.DB.Exec(ctx, `
+	tag, err := s.DB.Exec(ctx, `
 		WITH att AS (
 			INSERT INTO provider_attempts
 				(message_id, provider, provider_msg_id, http_status, error_code, error_msg, request_json, response_json)
@@ -273,12 +315,27 @@ func (s *Store) RecordAttempt(ctx context.Context, in store.AttemptRecord) error
 		       last_error = NULLIF($13,''),
 		       updated_at = $14
 		 WHERE id = $1 AND $9::bool
+		   AND state = 'processing'
+		   AND ($15::timestamptz IS NULL OR updated_at = $15)
 	`,
 		in.Attempt.MessageID, in.Attempt.Provider, nullIfEmpty(in.Attempt.ProviderMsgID),
 		in.Attempt.HTTPStatus, nullIfEmpty(in.Attempt.ErrorCode), nullIfEmpty(in.Attempt.ErrorMsg),
 		reqB, respB,
-		in.Transition != nil, t.State, t.Provider, t.ProviderMsgID, t.LastError, t.Now)
-	return err
+		in.Transition != nil, t.State, t.Provider, t.ProviderMsgID, t.LastError, t.Now, nullIfZero(t.ClaimedAt))
+	if err != nil {
+		return err
+	}
+	if in.Transition != nil && tag.RowsAffected() == 0 {
+		return store.ErrClaimLost
+	}
+	return nil
+}
+
+func nullIfZero(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
 }
 
 func nullIfEmpty(s string) any {

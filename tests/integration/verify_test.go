@@ -149,6 +149,22 @@ func TestVerify_EachInvariantCatchesItsViolation(t *testing.T) {
 			},
 		},
 		{
+			invariant: "no message was left queued without being attempted",
+			corrupt: func(t *testing.T, db *pgxpool.Pool) {
+				// The API could not enqueue it and the client never retried.
+				exec(t, db, `UPDATE messages SET state='queued', last_error='enqueue_failed' WHERE id='vm-0004'`)
+			},
+		},
+		{
+			invariant: "no message is still submitted after its final delivery report",
+			corrupt: func(t *testing.T, db *pgxpool.Pool) {
+				exec(t, db, `UPDATE messages SET state='submitted' WHERE id='vm-0008'`)
+				exec(t, db, `INSERT INTO delivery_events (provider, provider_msg_id, vendor_status, payload_json, received_at)
+				             SELECT provider, provider_msg_id, 'delivered', '{}'::jsonb, now() - interval '1 hour'
+				               FROM messages WHERE id='vm-0008'`)
+			},
+		},
+		{
 			invariant: "suppressed messages were never sent",
 			corrupt: func(t *testing.T, db *pgxpool.Pool) {
 				exec(t, db, `UPDATE messages SET state='suppressed' WHERE id='vm-0005'`)

@@ -81,9 +81,10 @@ make reset             # stop + delete volumes
 - [100k campaign](docs/campaign-100k/README.md) — 100,000 delivered in 293 s, reconciled
   against AWS CloudWatch (a recording this service does not produce), zero duplicates,
   zero drops, zero dead-lettered.
-- [Retry-handling A/B](docs/campaign-100k/retry-handling-ab-2026-08-15.md) — controlled
-  experiment on live AWS: 8,728 of 100,000 sends were being silently discarded by a
-  classifier that tested the error before the HTTP status.
+- [Failure handling under load](docs/campaign-100k/retry-handling-ab-2026-08-15.md) —
+  before/after runs on live AWS: 8,728 of 100,000 sends were being silently discarded by
+  a classifier that tested the error before the HTTP status; after the fix, a provider
+  outage lost zero messages and a full dead-letter queue was recovered with one redrive.
 - [Accept-path benchmark](docs/benchmark-2026-08-14.md) — 2,000 accepts/sec sustained,
   p99 142 ms, and why the send path's separate ~142/s ceiling was our own limiter.
 - [Measured improvements](docs/measured-improvements.md) — every figure re-derivable;

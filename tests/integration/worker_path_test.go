@@ -6,6 +6,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -367,11 +368,19 @@ type countingSender struct {
 	// retry classification keys off the status, so a fake that returns the
 	// wrong one tests the wrong branch.
 	failStatus int
+	callback   string
+}
+
+func (s *countingSender) lastCallback() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.callback
 }
 
 func (s *countingSender) SendSMS(ctx context.Context, req twilio.SendRequest) (twilio.SendResponse, int, []byte, error) {
 	s.mu.Lock()
 	s.n++
+	s.callback = req.StatusCallbackURL
 	s.mu.Unlock()
 	if s.fail != nil {
 		st := s.failStatus
@@ -411,7 +420,12 @@ func TestProcessor_DuplicateDeliverySendsOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: "p-dup"}); err != nil {
+			// Losers of the race must NOT acknowledge their copy: the winner
+			// may still hand the row back for retry, and then those copies are
+			// all that is left on the queue. ErrHeldElsewhere is the correct
+			// answer for them; anything else is a failure.
+			if err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: "p-dup"}); err != nil &&
+				!errors.Is(err, workerproc.ErrHeldElsewhere) {
 				t.Errorf("process: %v", err)
 			}
 		}()
@@ -668,6 +682,166 @@ func TestProcessor_TransientFailureStaysRecoverable(t *testing.T) {
 	}
 }
 
+// TestProcessor_PermanentFailureIsAcknowledged pins the return contract for a
+// final outcome: once the row is durably 'failed', Process returns nil so the
+// consumer deletes the receipt on the FIRST delivery.
+//
+// It used to return the provider error after writing 'failed'. The consumer
+// read that as "not done", left the message on the queue, and SQS redelivered
+// it a visibility timeout later — only for ClaimAndLoad to refuse the terminal
+// row and the redelivery to be acknowledged as a duplicate. The database said
+// done and the queue was told not done; that disagreement is the defect.
+func TestProcessor_PermanentFailureIsAcknowledged(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	const id = "permanent-1"
+	seedMessageInState(t, db, id, "perm-tenant", "perm-idem", "queued", "", util.NowUTC())
+
+	sender := &countingSender{sid: "SM-perm", fail: errPermanent{}, failStatus: 400}
+	p := &workerproc.Processor{
+		Store: pg.New(db), Sender: sender, Templates: map[string]string{"tpl": "hello"},
+	}
+
+	if err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: id}); err != nil {
+		t.Fatalf("Process returned %v after a permanent rejection; the consumer would leave the receipt "+
+			"undeleted and SQS would redeliver a message the database already calls failed", err)
+	}
+	if got := sender.calls(); got != 1 {
+		t.Errorf("provider called %d times, want exactly 1 — a 400 must not be retried", got)
+	}
+	state, lastErr := readMessage(t, db, id)
+	if state != "failed" || lastErr != "twilio_non_retryable" {
+		t.Errorf("state=%q last_error=%q, want failed / twilio_non_retryable", state, lastErr)
+	}
+
+	// Should a duplicate delivery still arrive (SQS is at-least-once), it is
+	// acknowledged without reaching the provider again.
+	if err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: id}); err != nil {
+		t.Fatalf("duplicate delivery of a failed message returned %v, want nil", err)
+	}
+	if got := sender.calls(); got != 1 {
+		t.Errorf("provider called %d times after a duplicate delivery, want 1", got)
+	}
+}
+
+// TestProcessor_HeldMessageIsNotAcknowledged is the regression test for a
+// duplicate delivery that arrived while another worker still held the row.
+//
+// It used to return nil — "finished, delete it" — like any duplicate. If the
+// holder then exhausted its retries it released the row to 'queued' and
+// returned an error, but its own SQS copy could already be gone, and this one
+// had just been deleted: a 'queued' row with nothing left to send it, and
+// nothing in the DLQ to show for it.
+func TestProcessor_HeldMessageIsNotAcknowledged(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	const id = "held-1"
+	// Claimed a moment ago by someone else: fresh, not stale.
+	seedMessageInState(t, db, id, "held-tenant", "held-idem", "processing", "", util.NowUTC())
+
+	sender := &countingSender{sid: "SM-held"}
+	p := &workerproc.Processor{
+		Store: pg.New(db), Sender: sender, Templates: map[string]string{"tpl": "hello"},
+		ClaimStaleAfter: time.Minute,
+	}
+	err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: id})
+	if !errors.Is(err, workerproc.ErrHeldElsewhere) {
+		t.Fatalf("Process = %v, want ErrHeldElsewhere — a copy of a message another worker holds must stay on the queue", err)
+	}
+	if sender.calls() != 0 {
+		t.Errorf("provider called %d times for a message another worker holds, want 0", sender.calls())
+	}
+
+	// Once the holder has finished, the same copy is acknowledged.
+	if _, err := db.Exec(context.Background(), `UPDATE messages SET state='submitted' WHERE id=$1`, id); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: id}); err != nil {
+		t.Errorf("Process after the holder finished = %v, want nil", err)
+	}
+}
+
+// TestRecordAttempt_StaleClaimCannotOverwrite pins the claim token. A worker
+// whose claim went stale and was re-claimed must not overwrite the new holder's
+// result — nor a 'delivered' the webhook already wrote.
+func TestRecordAttempt_StaleClaimCannotOverwrite(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	st := pg.New(db)
+	ctx := context.Background()
+
+	const id = "stale-1"
+	start := util.NowUTC().Add(-2 * time.Minute)
+	seedMessageInState(t, db, id, "stale-tenant", "stale-idem", "queued", "", start)
+
+	// Worker A claims, then stalls past the stale window.
+	a, _, err := st.ClaimAndLoad(ctx, id, start, time.Minute)
+	if err != nil || !a.Claimed {
+		t.Fatalf("A claim: claimed=%v err=%v", a.Claimed, err)
+	}
+	// Worker B re-claims the stale row and records its send.
+	b, _, err := st.ClaimAndLoad(ctx, id, util.NowUTC(), time.Minute)
+	if err != nil || !b.Claimed {
+		t.Fatalf("B re-claim: claimed=%v err=%v", b.Claimed, err)
+	}
+	if err := st.RecordAttempt(ctx, store.AttemptRecord{
+		Attempt:    store.ProviderAttempt{MessageID: id, Provider: "twilio", ProviderMsgID: "SM-B", HTTPStatus: 201},
+		Transition: &store.MessageTransition{State: "submitted", Provider: "twilio", ProviderMsgID: "SM-B", Now: util.NowUTC(), ClaimedAt: b.ClaimedAt},
+	}); err != nil {
+		t.Fatalf("B record: %v", err)
+	}
+
+	// A finally returns with its own (stale) result.
+	err = st.RecordAttempt(ctx, store.AttemptRecord{
+		Attempt:    store.ProviderAttempt{MessageID: id, Provider: "twilio", ProviderMsgID: "SM-A", HTTPStatus: 201},
+		Transition: &store.MessageTransition{State: "submitted", Provider: "twilio", ProviderMsgID: "SM-A", Now: util.NowUTC(), ClaimedAt: a.ClaimedAt},
+	})
+	if !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("stale RecordAttempt = %v, want ErrClaimLost", err)
+	}
+	var sid string
+	if err := db.QueryRow(ctx, `SELECT provider_msg_id FROM messages WHERE id=$1`, id).Scan(&sid); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if sid != "SM-B" {
+		t.Errorf("provider_msg_id = %q, want SM-B — the stale worker overwrote the live result", sid)
+	}
+	if n := attemptCount(t, db, id); n != 2 {
+		t.Errorf("attempt rows = %d, want 2 — both sends happened and both must be on record", n)
+	}
+
+	// And a released-after-the-fact stale claim cannot reset the live row.
+	if released, err := st.ReleaseForRetry(ctx, id, "late_release", a.ClaimedAt, util.NowUTC()); err != nil || released {
+		t.Errorf("stale ReleaseForRetry released=%v err=%v, want false/nil", released, err)
+	}
+	if got := stateOf(t, db, id); got != "submitted" {
+		t.Errorf("state = %q, want submitted", got)
+	}
+}
+
+// TestProcessor_SendsStatusCallbackURL pins that every send asks the provider
+// to report delivery. Without it a real account with no console-configured
+// callback sends no delivery reports, and every message stays 'submitted'.
+func TestProcessor_SendsStatusCallbackURL(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	seedMessageInState(t, db, "cb-1", "cb-tenant", "cb-idem", "queued", "", util.NowUTC())
+
+	sender := &countingSender{sid: "SM-cb"}
+	p := &workerproc.Processor{
+		Store: pg.New(db), Sender: sender, Templates: map[string]string{"tpl": "hello"},
+		StatusCallbackURL: "https://hooks.example.test/v1/webhooks/twilio/status",
+	}
+	if err := p.Process(context.Background(), sqsqueue.SMSJob{MessageID: "cb-1"}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if got := sender.lastCallback(); got != p.StatusCallbackURL {
+		t.Errorf("StatusCallback sent = %q, want %q", got, p.StatusCallbackURL)
+	}
+}
+
 // TestReleaseForRetry_DoesNotClobberATerminalState guards the write itself.
 //
 // A send whose response never arrived can still have reached the provider, so a
@@ -684,7 +858,7 @@ func TestReleaseForRetry_DoesNotClobberATerminalState(t *testing.T) {
 			id := "clobber-" + state
 			seedMessageInState(t, db, id, "clob-tenant", "clob-idem-"+state, state, "", util.NowUTC())
 
-			released, err := st.ReleaseForRetry(context.Background(), id, "should_not_apply", util.NowUTC())
+			released, err := st.ReleaseForRetry(context.Background(), id, "should_not_apply", time.Time{}, util.NowUTC())
 			if err != nil {
 				t.Fatalf("ReleaseForRetry: %v", err)
 			}
@@ -700,7 +874,7 @@ func TestReleaseForRetry_DoesNotClobberATerminalState(t *testing.T) {
 	// The one case it must act on.
 	id := "clobber-processing"
 	seedMessageInState(t, db, id, "clob-tenant", "clob-idem-processing", "processing", "", util.NowUTC())
-	released, err := st.ReleaseForRetry(context.Background(), id, "twilio_retry_exhausted", util.NowUTC())
+	released, err := st.ReleaseForRetry(context.Background(), id, "twilio_retry_exhausted", time.Time{}, util.NowUTC())
 	if err != nil {
 		t.Fatalf("ReleaseForRetry: %v", err)
 	}

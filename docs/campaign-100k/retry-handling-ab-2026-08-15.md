@@ -1,9 +1,33 @@
-# Failure handling under load — controlled A/B, 15 August 2026
+# Failure handling under load — before/after runs on AWS, 15 August 2026
 
 > Historical record: this ran on the pre-2026-08-20 architecture (NAT + private subnets, internal API NLB path, bastion, RDS Postgres behind RDS Proxy, role-pinned node pools). The infrastructure has since been simplified — see `docs/architecture/` — but the numbers here describe the runs as they ran and are not restated.
 
-Three 100,000-message campaigns on the same AWS stack, run to answer one
-question: **what happens to a message when the provider says no?**
+## In short
+
+- **The bug.** The worker's retry check looked at "was there an error?" before
+  "what HTTP status came back?". Every non-2xx response carries an error, so
+  temporary failures (429 rate-limit, 500) were treated as permanent and the
+  message was marked `failed` after one attempt.
+- **Why nothing noticed.** Marking it `failed` also defeated the queue's own
+  retry: SQS redelivered the job, the worker refused to re-claim a finished
+  row, treated the redelivery as a duplicate and deleted it. The message never
+  reached the dead-letter queue, so the DLQ — the alarm meant for lost
+  messages — read zero while 8.8% of a 100,000-message campaign was discarded.
+- **The fix.** Check the status first, and on a temporary failure hand the
+  message back to the queue (`queued`) instead of failing it, so the queue's
+  retries and the DLQ work as designed.
+- **The proof.** Same campaign, same 10% injected failures, only the worker
+  image changed: delivered 90,146 → 98,874; remaining failures (1,125) equal
+  the provider's permanent 400s (1,125) exactly. A 58-second provider outage
+  then lost zero messages, and a 9-minute outage that filled the DLQ was fully
+  recovered with one redrive.
+- **Follow-up (2 Oct 2026).** The same "write a final state, then tell the
+  queue it is not done" pattern survived for genuine 400s — harmless, but each
+  one cost a pointless redelivery. Fixed; see [the end of this page](#follow-up-2-october-2026--one-meaning-per-return-value).
+
+Three 100,000-message campaigns and one 20,000-message outage run on the same
+AWS stack, run to answer one question: **what happens to a message when the
+provider says no?**
 
 Every earlier campaign on this project ran with `MOCK_SUCCESS_RATE=1.0`. Nothing
 failed, so nothing about failure handling was ever exercised, and "messages in
@@ -140,8 +164,6 @@ run look tidier than it was.
 
 ---
 
----
-
 ## Run D — exhausting the dead-letter queue, and getting the messages back
 
 Runs A–C all ended with an empty dead-letter queue, so the redrive path was
@@ -233,3 +255,40 @@ and AWS documents that the purge can take up to 60 seconds and may delete
 messages sent while it is in progress. Run C waited out that window and lost
 nothing, which supports the explanation without proving it. Recorded rather than
 rounded away.
+
+---
+
+## Follow-up, 2 October 2026 — one meaning per return value
+
+The fix above changed what the worker *writes* for a temporary failure. It did
+not change what the worker *tells the queue* after a permanent one, and that
+was the same mistake in a quieter form.
+
+`Process` returns an error to the SQS consumer, and the consumer deletes the
+job only when the error is nil. So the return value is an instruction —
+**nil: finished, delete it; error: not finished, redeliver it** — not a report
+of whether the SMS succeeded. For a genuine HTTP 400 the worker still wrote
+`state='failed'` and then returned the provider's error. The database said
+*finished*; the queue was told *not finished*:
+
+1. The job stayed on the queue for the 60 s visibility timeout.
+2. SQS redelivered it.
+3. `ClaimAndLoad` refused the `failed` row; the delivery was counted `skipped`.
+4. The worker returned nil and the consumer deleted it.
+
+No message was lost and the provider was not called twice — but every
+permanent failure cost a wasted receive, a claim query and an `sqs handler
+error` log for a message that had been handled correctly (1,125 of them in
+run B). It is also exactly the pairing — terminal write, then error return —
+that turned run A's misclassification into silent loss instead of a
+dead-letter-queue alarm.
+
+**Change.** After a permanent rejection is durably recorded, `Process` returns
+nil and logs the rejection itself; the outcome metric (`provider_rejected`),
+the stored attempt and `last_error` still record it. The return contract is
+now written on `Process`, and errors are returned only when the row is still
+claimable on the next delivery (released to `queued`) or nothing was written.
+Regression test: `TestProcessor_PermanentFailureIsAcknowledged` — a 400 is
+attempted once, `Process` returns nil on the first delivery, and a duplicate
+delivery does not reach the provider.
+

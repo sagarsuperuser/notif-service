@@ -29,8 +29,8 @@ HTTP status — and every provider response carries both, so the status branches
 were dead code and a 429 was treated as permanent. A terminally failed message
 cannot be re-claimed, so its queue redelivery was acknowledged and deleted: the
 sends vanished with the dead-letter queue reading zero, which is why no alarm
-existed to catch it. Proved by a controlled A/B on AWS — same injection, same
-duration, only the worker image differing: 90,146 delivered against 98,874, with
+existed to catch it. Proved with two runs on AWS that differed only in the
+worker image — same injection, same duration: 90,146 delivered against 98,874, with
 failures afterwards matching the provider's permanent rejections exactly
 (1,125 = 1,125).
 
@@ -52,6 +52,15 @@ still available. During the outage the circuit breaker released 15,434 in-flight
 messages back to the queue and shielded the provider from those calls entirely;
 all of them were re-claimed and delivered on recovery, and the run reconciled at
 100,000 of 100,000.
+
+**Made the worker's answer to the queue mean one thing** (2 Oct 2026). The
+handler's return value decides whether SQS deletes a job, so it is an
+instruction, not a report: nil means finished, an error means redeliver. A
+permanent rejection was still written `failed` and then returned as an error,
+so each one was redelivered once and skipped — the same disagreement between
+the database and the queue that made run A's loss invisible. Final outcomes
+now return nil; the contract is documented on `Process` and in
+`docs/architecture/03`, and pinned by `TestProcessor_PermanentFailureIsAcknowledged`.
 
 **Cut database round-trips per message from 13 to 4** by collapsing
 multi-statement sequences into single CTEs — the accept path from 7 statements
@@ -186,3 +195,69 @@ measurement is real; the mechanism is unknown, so the figure is not quoted.
 Each was caught by verification that kept running after the claim was made: CI
 found the race in code that already had tests, an adversarial review pass killed
 the throughput headline, and reading a library's source killed the last one.
+
+## Correctness review, 2 October 2026
+
+A full review of the four services, the schema and the infrastructure, with
+every finding traced in code before it was acted on. Fixed (see CHANGELOG):
+
+- **Queue answer vs database state.** Permanent rejections now acknowledged;
+  a duplicate delivery of a message another worker holds is *not* (it was
+  deleted, which could strand a row the holder later released for retry).
+- **Claim token on every write.** The worker's final write had no guard, so a
+  worker whose claim went stale could overwrite the new holder's result or a
+  `delivered` from the webhook.
+- **Sent-but-unrecorded.** A failed write after a successful send led to a
+  second SMS on redelivery; the write is now retried on its own deadline.
+- **Breaker and classification.** 400s no longer open the circuit breaker;
+  401/403/404 are configuration errors that reach the DLQ instead of failing
+  a campaign.
+- **Status callbacks.** The worker never sent `StatusCallback`; on a real
+  account without a console-configured callback, nothing would report
+  delivery.
+- **API.** Shutdown now drains before closing the database; an enqueue
+  failure no longer poisons the idempotency key; a reused key with a
+  different payload is 409; request size is bounded; errors no longer leak
+  SQL/SQS text.
+- **Infrastructure.** Terraform had reverted the queues to FIFO (the next
+  apply would have destroyed them and broken sending); DLQ retention now
+  outlasts the main queue's; visibility timeout sized to the worker's real
+  receive-to-finish time; liveness no longer depends on Postgres/SQS; IMDSv2.
+- **Hygiene.** 29 reachable vulnerabilities patched (stdlib, pgx, x/text);
+  gofmt, staticcheck and govulncheck gates in CI.
+
+### Known gaps, deliberately not fixed in this pass
+
+Each needs a design decision or a deploy, not a patch:
+
+- **No sweeper for stranded `queued` rows.** A row committed by an API that
+  died before enqueueing, or one dead-lettered and never redriven, waits for a
+  client retry or an operator. The invariant checker reports both; a job that
+  re-enqueues stale `queued` rows (an outbox relay over the row that is
+  already the source of truth) is the fix. It has to coexist with DLQ
+  semantics — re-enqueueing dead letters automatically during an outage would
+  cycle them forever — so it is a design, not a patch.
+- **Ambiguous timeouts can double-send.** A 6 s request timeout that actually
+  reached the provider is retried, in-process or by redelivery. Twilio's
+  Messages API has no idempotency key; the mitigation is a recorded send
+  intent plus a provider-side lookup before resending.
+- **Concurrent duplicates can spend two cap units.** Two in-flight requests
+  with the same key can both pass the cap's `NOT EXISTS` check (statement
+  snapshots); the second's message insert then resolves to the first row.
+  Closing it without giving up the single round-trip needs a pipelined
+  advisory lock.
+- **Producer head-of-line blocking.** One goroutine sends every SQS batch; a
+  slow call stalls every accept on the pod.
+- **Reconcile scans all terminal events.** Bounded by the index, but it grows
+  with history; needs a retention policy on `delivery_events`.
+- **Webhook write failure.** A callback whose insert fails is answered 503;
+  whether Twilio retries depends on connection overrides (`#rc=`) on the
+  callback URL, which are not configured.
+- **Deploy-side, needs the owner:** prod images are pinned to `sha-2d5b9b8`,
+  older than the message-loss fixes (the tag-bump PR is opened with
+  `GITHUB_TOKEN`, which does not trigger CI, so it cannot merge); KEDA uses
+  static AWS keys; RDS has no deletion protection or final snapshot;
+  `admin_cidr` is a /8; ingress rate-limits all clients as one bucket under
+  `externalTrafficPolicy: Cluster`; the migration job re-runs the seed and
+  resets test consents; `PUBLIC_WEBHOOK_URL` is the in-cluster address,
+  correct only while prod sends to the mock provider.

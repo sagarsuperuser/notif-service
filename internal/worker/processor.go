@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -19,7 +20,7 @@ type Store interface {
 	ClaimAndLoad(ctx context.Context, msgID string, now time.Time, staleAfter time.Duration) (store.ClaimedMessage, bool, error)
 	RecordAttempt(ctx context.Context, in store.AttemptRecord) error
 	MarkMessageState(ctx context.Context, in store.MessageStateUpdate) error
-	ReleaseForRetry(ctx context.Context, id, lastErr string, now time.Time) (bool, error)
+	ReleaseForRetry(ctx context.Context, id, lastErr string, claimedAt, now time.Time) (bool, error)
 }
 
 type TwilioSender interface {
@@ -32,8 +33,44 @@ type Processor struct {
 	Templates       map[string]string
 	Breaker         *gobreaker.CircuitBreaker
 	ClaimStaleAfter time.Duration
+	// StatusCallbackURL is sent with every message so the provider reports
+	// delivery to the webhook service. Without it, delivery reports depend on
+	// a callback configured out-of-band in the provider console — and if that
+	// is missing, every message stays 'submitted' forever.
+	StatusCallbackURL string
 }
 
+// ErrHeldElsewhere is returned for a delivery whose message another worker is
+// still processing. It is deliberately an error: the job is not finished, so
+// SQS must keep a copy until the holder settles the row.
+var ErrHeldElsewhere = errors.New("message is held by another worker; leaving it for redelivery")
+
+// workerIsDone reports whether a message needs nothing further from the
+// worker. 'submitted' counts: the provider has it, and the delivery callback
+// (or reconcile) finishes it, not another send.
+func workerIsDone(state string) bool {
+	switch state {
+	case "submitted", "delivered", "failed", "suppressed":
+		return true
+	}
+	return false
+}
+
+// Process handles one delivery of a job. Its return value is an instruction to
+// the queue, not a report on the message:
+//
+//   - nil   — this job is finished; delete it. The message reached a state the
+//     database has recorded (submitted, or failed permanently), or this
+//     delivery was a duplicate of one that did.
+//   - error — this job is NOT finished; leave it for SQS to redeliver, and to
+//     dead-letter after maxReceiveCount. Only returned when the row is still
+//     claimable on the next delivery (released to 'queued') or nothing was
+//     written at all.
+//
+// Never return an error after writing a terminal state. The redelivery cannot
+// re-claim a terminal row, so it is skipped and acknowledged: the error buys a
+// wasted round-trip at best and, when the terminal write was wrong, a message
+// discarded without ever reaching the DLQ.
 func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 	started := util.NowUTC()
 	processed := false
@@ -74,11 +111,24 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 		return errors.New("message not found: " + job.MessageID)
 	}
 	if !msg.Claimed {
-		// Terminal, already submitted, or held by another worker. Ordinary
-		// duplicate delivery — counted as a claim result, NOT as a message
-		// outcome, so redeliveries stop inflating any per-message ratio.
-		observability.ClaimResult.WithLabelValues("skipped").Inc()
-		return nil
+		if workerIsDone(msg.State) {
+			// Already submitted, delivered, failed or suppressed: an ordinary
+			// duplicate delivery of a job that is finished. Counted as a claim
+			// result, NOT as a message outcome, so redeliveries stop inflating
+			// any per-message ratio — and acknowledged, because it is done.
+			observability.ClaimResult.WithLabelValues("skipped").Inc()
+			return nil
+		}
+		// Held by another worker whose claim is still fresh (or racing ours:
+		// the pre-claim read can still say 'queued' when another claim lands
+		// first). This copy must NOT be acknowledged. The holder may yet hand
+		// the row back for retry — retries exhausted, breaker open — and its
+		// own SQS copy may already be gone, so deleting this one would leave a
+		// 'queued' row with nothing left on the queue to ever send it.
+		// Returning an error lets SQS redeliver it; once the holder finishes,
+		// the next delivery sees a finished row and is acknowledged above.
+		observability.ClaimResult.WithLabelValues("held").Inc()
+		return ErrHeldElsewhere
 	}
 	observability.ClaimResult.WithLabelValues("claimed").Inc()
 	processed = true
@@ -93,10 +143,8 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 		// in the DLQ where it can be redriven once the template is restored.
 		// Of the two ways to be wrong, only one loses messages.
 		outcome = "template_not_found"
-		if _, err := p.Store.ReleaseForRetry(ctx, job.MessageID, "template_not_found", util.NowUTC()); err != nil {
-			return err
-		}
-		return errors.New("template_not_found: " + msg.TemplateID)
+		return p.release(ctx, job.MessageID, msg.ClaimedAt, "template_not_found",
+			errors.New("template_not_found: "+msg.TemplateID))
 	}
 	body := util.RenderTemplate(bodyTmpl, msg.Vars)
 
@@ -129,10 +177,7 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 			// timeouts lining up. Releasing it makes the next delivery claimable
 			// immediately and leaves the stale window as a backstop for crashes,
 			// which is the only thing it can actually cover.
-			if _, relErr := p.Store.ReleaseForRetry(ctx, job.MessageID, "circuit_breaker_open", util.NowUTC()); relErr != nil {
-				return relErr
-			}
-			return err
+			return p.release(ctx, job.MessageID, msg.ClaimedAt, "circuit_breaker_open", err)
 		}
 
 		var resp twilio.SendResponse
@@ -145,7 +190,6 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 
 			observability.ProviderAttempts.WithLabelValues("ok", strconv.Itoa(httpStatus)).Inc()
 			observability.ProviderCallSeconds.WithLabelValues("ok").Observe(callSeconds)
-			outcome = "submitted"
 			if !endToEndRecorded {
 				observability.EndToEndLatency.Observe(time.Since(msg.CreatedAt).Seconds())
 				endToEndRecorded = true
@@ -154,7 +198,14 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 			// The attempt and the state it produces are written together: one
 			// round-trip, and no window in which an attempt exists for a message
 			// still reading 'processing'.
-			if err := p.Store.RecordAttempt(ctx, store.AttemptRecord{
+			//
+			// This is the one write that must not be lost. The SMS has already
+			// gone out; if the row stays 'processing', the redelivery re-claims
+			// it once the claim goes stale and sends it AGAIN, and the provider
+			// id that would tie delivery callbacks to the row is gone. So it is
+			// retried, on a deadline of its own that survives cancellation of
+			// the job context (shutdown drain, request timeouts).
+			err := p.recordSubmit(ctx, store.AttemptRecord{
 				Attempt: store.ProviderAttempt{
 					MessageID:     job.MessageID,
 					Provider:      "twilio",
@@ -170,10 +221,23 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 					Provider:      "twilio",
 					ProviderMsgID: resp.Sid,
 					Now:           util.NowUTC(),
+					ClaimedAt:     msg.ClaimedAt,
 				},
-			}); err != nil {
+			})
+			if errors.Is(err, store.ErrClaimLost) {
+				// Sent, but the row is no longer ours: another worker re-claimed
+				// it after our claim went stale, or a delivery callback already
+				// moved it on. The attempt row is recorded; the row's state is
+				// the other party's to settle. Nothing left for this job to do.
+				outcome = "claim_lost"
+				slog.Warn("sent, but claim was lost before the result was recorded",
+					"message_id", job.MessageID, "provider_msg_id", resp.Sid)
+				return nil
+			}
+			if err != nil {
 				return err
 			}
+			outcome = "submitted"
 			return nil
 		}
 
@@ -218,14 +282,36 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 				State:     "failed",
 				LastError: "twilio_non_retryable",
 				Now:       util.NowUTC(),
+				ClaimedAt: msg.ClaimedAt,
 			}
 		}
 		if recErr := p.Store.RecordAttempt(ctx, attempt); recErr != nil {
+			if errors.Is(recErr, store.ErrClaimLost) {
+				outcome = "claim_lost"
+				return nil
+			}
 			return recErr
 		}
 		if nonRetryable {
+			// Final, and durably recorded: the row is 'failed' and the attempt
+			// that failed it is stored. So the job is done and returns nil.
+			//
+			// It used to return err, which told the consumer the opposite — "not
+			// done, redeliver" — while the database said "done". SQS redelivered
+			// it after the visibility timeout, ClaimAndLoad refused the failed
+			// row, and the redelivery was acknowledged as a duplicate. Harmless
+			// for a real 400, but it cost every permanent failure one wasted
+			// receive, one claim query and a misleading "sqs handler error" log.
+			// And it was the same pairing — terminal write plus error return —
+			// that silently discarded transient failures when they were
+			// misclassified as permanent (docs/campaign-100k/retry-handling-ab-2026-08-15.md).
+			//
+			// The failure is still reported: the outcome metric, the stored
+			// attempt and last_error, and this log line.
 			outcome = "provider_rejected"
-			return err
+			slog.Warn("provider rejected message permanently",
+				"message_id", job.MessageID, "http_status", httpStatus, "err", err)
+			return nil
 		}
 
 		time.Sleep(twilio.Backoff(attemptNum))
@@ -250,11 +336,50 @@ func (p *Processor) Process(ctx context.Context, job sqsqueue.SMSJob) error {
 	// The branch above for an open circuit already states this rule ("do NOT
 	// mark message failed; this is transient provider protection"). This path
 	// now follows it.
-	if _, err := p.Store.ReleaseForRetry(ctx, job.MessageID, "twilio_retry_exhausted", util.NowUTC()); err != nil {
+	outcome = "retries_exhausted"
+	return p.release(ctx, job.MessageID, msg.ClaimedAt, "twilio_retry_exhausted", lastErr)
+}
+
+// release hands a claimed message back to the queue and returns the error that
+// tells the consumer to leave the job for redelivery. If the release did not
+// apply — the claim was lost to another worker, or a callback already finished
+// the row — there is nothing left for this job to retry, so it returns nil and
+// the job is acknowledged; the row's current owner settles it.
+func (p *Processor) release(ctx context.Context, id string, claimedAt time.Time, reason string, cause error) error {
+	released, err := p.Store.ReleaseForRetry(ctx, id, reason, claimedAt, util.NowUTC())
+	if err != nil {
 		return err
 	}
-	outcome = "retries_exhausted"
-	return lastErr
+	if !released {
+		slog.Info("release skipped: message no longer held by this claim", "message_id", id, "reason", reason)
+		return nil
+	}
+	return cause
+}
+
+// recordSubmit writes a successful send's attempt and transition, retrying a
+// failed write a few times on its own deadline. A claim-lost result is final
+// and returned at once.
+func (p *Processor) recordSubmit(ctx context.Context, rec store.AttemptRecord) error {
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	var err error
+	for i, wait := range []time.Duration{0, 200 * time.Millisecond, time.Second, 3 * time.Second} {
+		if wait > 0 {
+			select {
+			case <-time.After(wait):
+			case <-wctx.Done():
+				return err
+			}
+		}
+		err = p.Store.RecordAttempt(wctx, rec)
+		if err == nil || errors.Is(err, store.ErrClaimLost) {
+			return err
+		}
+		slog.Warn("recording a sent message failed; retrying",
+			"message_id", rec.Attempt.MessageID, "try", i+1, "err", err)
+	}
+	return err
 }
 
 func (p *Processor) executeWithBreaker(ctx context.Context, to, body string) (any, error) {
@@ -263,8 +388,9 @@ func (p *Processor) executeWithBreaker(ctx context.Context, to, body string) (an
 		defer cancel()
 
 		resp, httpStatus, raw, callErr := p.Sender.SendSMS(reqCtx, twilio.SendRequest{
-			To:   to,
-			Body: body,
+			To:                to,
+			Body:              body,
+			StatusCallbackURL: p.StatusCallbackURL,
 		})
 		if callErr != nil {
 			return nil, twilioCallError{err: callErr, httpStatus: httpStatus, raw: raw}
@@ -300,4 +426,15 @@ type twilioCallError struct {
 }
 
 func (e twilioCallError) Error() string { return e.err.Error() }
+
+// IsPermanentRejection reports whether err is the provider answering with a
+// status that will not improve on retry (e.g. 400) — a correct answer about one
+// message, not a sign the provider is unhealthy.
+func IsPermanentRejection(err error) bool {
+	var tce twilioCallError
+	if !errors.As(err, &tce) || tce.httpStatus == 0 {
+		return false
+	}
+	return !twilio.ShouldRetry(err, tce.httpStatus)
+}
 func (e twilioCallError) Unwrap() error { return e.err }

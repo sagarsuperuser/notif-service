@@ -67,6 +67,13 @@ type WorkerConfig struct {
 	TwilioMessagingServiceSID string `envconfig:"TWILIO_MESSAGING_SERVICE_SID"`
 	TwilioFromNumber          string `envconfig:"TWILIO_FROM_NUMBER"`
 	TwilioBaseURL             string `envconfig:"TWILIO_BASE_URL" default:"https://api.twilio.com"`
+
+	// StatusCallbackURL is sent with every message as Twilio's StatusCallback.
+	// It reads the same variable the webhook service verifies signatures
+	// against, so the URL the provider calls and the URL the signature is
+	// checked over cannot drift apart. Empty means rely on a callback
+	// configured in the provider console.
+	StatusCallbackURL string `envconfig:"PUBLIC_WEBHOOK_URL"`
 }
 
 type WebhookConfig struct {

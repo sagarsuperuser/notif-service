@@ -161,8 +161,13 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 
 	assertMessageStateDB(t, db, "msg-3", string(domain.StateQueued))
 
-	// Advance the message the way the worker does, so this walk covers the real
-	// submit path rather than a shortcut that writes the same row.
+	// Advance the message the way the worker does — claim, then record the
+	// send under that claim — so this walk covers the real submit path rather
+	// than a shortcut that writes the same row.
+	claimed, _, err := dbStore.ClaimAndLoad(ctx, "msg-3", util.NowUTC(), time.Minute)
+	if err != nil || !claimed.Claimed {
+		t.Fatalf("claim: claimed=%v err=%v", claimed.Claimed, err)
+	}
 	if err := dbStore.RecordAttempt(ctx, store.AttemptRecord{
 		Attempt: store.ProviderAttempt{
 			MessageID:     "msg-3",
@@ -175,6 +180,7 @@ func TestHappyPathQueuedSubmittedDelivered(t *testing.T) {
 			Provider:      "twilio",
 			ProviderMsgID: "SM123",
 			Now:           util.NowUTC(),
+			ClaimedAt:     claimed.ClaimedAt,
 		},
 	}); err != nil {
 		t.Fatalf("record attempt: %v", err)
@@ -365,7 +371,11 @@ func withSearchPath(dsn, schema string) (string, error) {
 		opts = "-c search_path=" + schema
 	}
 	q.Set("options", opts)
-	u.RawQuery = q.Encode()
+	// Encode spaces as %20, not '+'. url.Values.Encode writes '+', which pgx
+	// v5.6 happened to read back as a space; newer pgx does not, and Postgres
+	// then rejects a parameter literally named "+search_path". %20 is
+	// unambiguous to both (a literal '+' in a value is already escaped as %2B).
+	u.RawQuery = strings.ReplaceAll(q.Encode(), "+", "%20")
 	return u.String(), nil
 }
 
