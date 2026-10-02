@@ -140,12 +140,6 @@ func (q *senderQueue) admit(now time.Time) (wait time.Duration, ok bool) {
 	return wait, true
 }
 
-func (q *senderQueue) currentDepth() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.depth
-}
-
 // accountPacer is the ceiling that sits above every sender.
 //
 // Providers cap total account throughput as well as per-sender throughput, so
@@ -261,16 +255,6 @@ func (p *senderPool) admit(sender string, now time.Time) (time.Duration, bool) {
 		wait = acct
 	}
 	return wait, true
-}
-
-func (p *senderPool) snapshot() map[string]int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make(map[string]int, len(p.queues))
-	for k, q := range p.queues {
-		out[k] = q.currentDepth()
-	}
-	return out
 }
 
 // apiLatency draws a call duration with a right tail, because a fixed delay

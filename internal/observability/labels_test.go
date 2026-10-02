@@ -45,17 +45,12 @@ func TestMetricLabelsAvoidOperatorReservedNames(t *testing.T) {
 		}
 	}
 
-	families, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-
 	// A CounterVec emits nothing until a label set is used, so touch each one
 	// to make its labels observable.
 	APIRequests.WithLabelValues("/v1/sms/messages", "202")
 	WebhookRequests.WithLabelValues("/v1/webhooks/twilio/status", "200")
 	DBQueryCalls.WithLabelValues("api", "ok")
-	families, err = reg.Gather()
+	families, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}

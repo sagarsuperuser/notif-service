@@ -371,7 +371,11 @@ func withSearchPath(dsn, schema string) (string, error) {
 		opts = "-c search_path=" + schema
 	}
 	q.Set("options", opts)
-	u.RawQuery = q.Encode()
+	// Encode spaces as %20, not '+'. url.Values.Encode writes '+', which pgx
+	// v5.6 happened to read back as a space; newer pgx does not, and Postgres
+	// then rejects a parameter literally named "+search_path". %20 is
+	// unambiguous to both (a literal '+' in a value is already escaped as %2B).
+	u.RawQuery = strings.ReplaceAll(q.Encode(), "+", "%20")
 	return u.String(), nil
 }
 

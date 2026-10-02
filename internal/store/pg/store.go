@@ -219,7 +219,7 @@ func (s *Store) GetMessage(ctx context.Context, msgID string) (store.Message, bo
 		&m.Provider, &m.ProviderMsgID, &m.LastError, &m.CreatedAt, &m.UpdatedAt)
 
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Message{}, false, nil
 		}
 		return store.Message{}, false, err
