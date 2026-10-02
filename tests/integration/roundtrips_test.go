@@ -33,6 +33,15 @@ func (c *roundTripCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ p
 }
 func (c *roundTripCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
+// A pipelined batch is one network round-trip however many statements it
+// carries; pgx reports it through the batch hooks, so count it there, once.
+func (c *roundTripCounter) TraceBatchStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceBatchStartData) context.Context {
+	c.n.Add(1)
+	return ctx
+}
+func (c *roundTripCounter) TraceBatchQuery(context.Context, *pgx.Conn, pgx.TraceBatchQueryData) {}
+func (c *roundTripCounter) TraceBatchEnd(context.Context, *pgx.Conn, pgx.TraceBatchEndData)     {}
+
 func (c *roundTripCounter) reset() { c.n.Store(0) }
 func (c *roundTripCounter) count() int {
 	return int(c.n.Load())

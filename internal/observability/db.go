@@ -110,6 +110,39 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	}
 }
 
+// A pipelined batch is ONE round-trip however many statements it carries, and
+// pgx reports it through the batch hooks, not the query hooks — so without
+// these a batched call would be invisible to the counter. It is counted once,
+// as an error if any statement in it failed.
+type batchState struct {
+	start  time.Time
+	failed bool
+}
+
+type batchStateKey struct{}
+
+func (t *QueryTracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceBatchStartData) context.Context {
+	return context.WithValue(ctx, batchStateKey{}, &batchState{start: time.Now()})
+}
+
+func (t *QueryTracer) TraceBatchQuery(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchQueryData) {
+	if st, ok := ctx.Value(batchStateKey{}).(*batchState); ok && data.Err != nil {
+		st.failed = true
+	}
+}
+
+func (t *QueryTracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchEndData) {
+	st, _ := ctx.Value(batchStateKey{}).(*batchState)
+	outcome := "ok"
+	if data.Err != nil || (st != nil && st.failed) {
+		outcome = "error"
+	}
+	DBQueryCalls.WithLabelValues(t.Service, outcome).Inc()
+	if st != nil {
+		DBQuerySeconds.Observe(time.Since(st.start).Seconds())
+	}
+}
+
 // SamplePool publishes pgx's pool statistics until ctx is cancelled. These are
 // gauges pgx already maintains; nothing here is derived or estimated.
 func SamplePool(ctx context.Context, service string, pool *pgxpool.Pool, every time.Duration) {
