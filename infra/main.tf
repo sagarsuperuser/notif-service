@@ -354,6 +354,17 @@ resource "aws_instance" "k3s_server" {
 
   user_data = local.server_user_data
 
+  # IMDSv2 only. hop limit 2, not 1: pods are one network hop from the node
+  # and the services authenticate to SQS with the node role through IMDS.
+  # Requiring tokens still closes the IMDSv1 path (any SSRF that can issue a
+  # GET could read the role credentials and the user data, which holds the
+  # k3s join token).
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
   tags = {
     Name = "${local.name}-k3s-server"
     Role = "k3s-server"
@@ -388,6 +399,13 @@ resource "aws_launch_template" "k3s_worker" {
 
   user_data              = base64encode(local.agent_user_data)
   vpc_security_group_ids = [aws_security_group.nodes.id]
+
+  # IMDSv2 only; see the k3s server for why the hop limit is 2.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
 
   iam_instance_profile {
     name = aws_iam_instance_profile.k3s_nodes.name
@@ -473,19 +491,25 @@ resource "aws_db_instance" "postgres" {
 }
 
 # -------------------------
-# SQS FIFO + DLQ
+# SQS standard + DLQ
 # -------------------------
+# STANDARD queues, not FIFO. #8 moved off FIFO deliberately: the producer sends
+# no MessageGroupId (so a FIFO queue rejects every batch), ordering is not a
+# requirement, and duplicate safety comes from the worker's claim, not from
+# FIFO deduplication. The manifests point at "<name>-send" with no .fifo.
+#
+# Retention: SQS keeps a message's ORIGINAL enqueue time when it moves it to
+# the DLQ, so a DLQ with the same retention as the main queue expires
+# dead-lettered messages early. The DLQ keeps them for the 14-day maximum.
 resource "aws_sqs_queue" "dlq" {
-  name                        = "${local.name}-send-dlq.fifo"
-  fifo_queue                  = true
-  content_based_deduplication = true
+  name                      = "${local.name}-send-dlq"
+  message_retention_seconds = 1209600 # 14 days
 }
 
 resource "aws_sqs_queue" "main" {
-  name                        = "${local.name}-send.fifo"
-  fifo_queue                  = true
-  content_based_deduplication = true
-  visibility_timeout_seconds  = var.sqs_send_visibility_timeout_seconds
+  name                       = "${local.name}-send"
+  message_retention_seconds  = 345600 # 4 days
+  visibility_timeout_seconds = var.sqs_send_visibility_timeout_seconds
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn

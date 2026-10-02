@@ -13,7 +13,9 @@ data:
   WORKER_CONCURRENCY: "20"
   SQS_WAIT_TIME: "20"
   SQS_MAX_MSGS: "10"
-  SQS_VISIBILITY_TIMEOUT: "60"
+  # Must equal sqs_send_visibility_timeout_seconds in infra/variables.tf; the
+  # worker's stale-claim window is half of it. See the variable for why 180.
+  SQS_VISIBILITY_TIMEOUT: "180"
   # Concurrent ReceiveMessage calls. 0 = one per ten handler slots.
   SQS_RECEIVERS: "0"
   SQS_SEND_BATCH_SIZE: "10"

@@ -144,8 +144,16 @@ variable "postgres_port" {
 
 # SQS
 variable "sqs_send_visibility_timeout_seconds" {
-  type        = number
-  default     = 60
+  type    = number
+  default = 180
+  # 180, not 60. The clock starts at RECEIVE, not at claim, and each worker pod
+  # holds received messages in a buffer before a handler is free: up to
+  # 2 receivers x 10 plus the job channel, behind 20 handlers whose worst case
+  # is ~20s (3 attempts x 6s + backoff). At 60s (stale window 30s) a message
+  # could wait long enough to be claimed late and redelivered while still
+  # held. 180 (stale window 90s) leaves that margin, and also means the
+  # 5-receive DLQ budget spans a ~15-minute provider outage instead of ~5.
+  # Must equal SQS_VISIBILITY_TIMEOUT in deploy/k8s/base/notif-config.yaml.
   description = "Visibility timeout for the send queue (seconds)."
 }
 

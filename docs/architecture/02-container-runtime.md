@@ -10,7 +10,7 @@ flowchart TB
   subgraph aws[AWS VPC — public subnets, SG-locked]
     entry["server EIP :30080/:30443 (ingress-nginx NodePort)"]
 
-    subgraph k8s["k3s: 1 server (m7i.large) + worker ASG (c7i.large, spot)"]
+    subgraph k8s["k3s: 1 server (m7i.large) + worker ASG (c7i.large, on-demand)"]
       api[notif-api]
       worker[notif-worker]
       webhook["notif-webhook ingest"]
@@ -19,7 +19,7 @@ flowchart TB
       grafana[Grafana]
     end
 
-    qsend[(SQS send.fifo + DLQ)]
+    qsend[(SQS send queue + DLQ, standard)]
     db[(Postgres RDS — direct, pgx pools)]
   end
 

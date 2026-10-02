@@ -99,6 +99,8 @@ func main() {
 	// health server (dependency checks)
 	healthMux := httpserver.New().Mux
 	healthMux.Use(httpserver.Logging)
+	// /livez: process liveness only. /healthz: dependency readiness.
+	healthMux.HandleFunc("/livez", httpserver.Healthz()).Methods(http.MethodGet)
 	healthMux.HandleFunc("/healthz", httpserver.Readyz(2*time.Second,
 		func(c context.Context) error { return db.Ping(c) },
 		func(c context.Context) error {
