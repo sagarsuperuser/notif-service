@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Permanent provider rejections no longer bounce through the queue**
+  (2026-10-02). After writing `state='failed'` for a non-retryable send (e.g.
+  HTTP 400), the worker returned the provider error, which the SQS consumer
+  reads as "not finished": the job was redelivered after the visibility
+  timeout, refused by `ClaimAndLoad`, and deleted as a duplicate. No loss, but
+  one wasted receive, claim query and misleading `sqs handler error` log per
+  permanent failure — and the same terminal-write-plus-error pairing behind
+  the 15 August silent-loss bug. `Process` now returns nil for outcomes the
+  database records as final and logs the rejection itself. The return
+  contract is documented on `Process` and in `docs/architecture/03`.
+  Regression test: `TestProcessor_PermanentFailureIsAcknowledged`.
+- Docs: the 15 August failure-handling write-up gains a plain-language summary
+  and drops the "A/B" framing for "before/after runs".
+- **Worker: duplicate of a held message no longer deleted; every claimed write
+  guarded by a claim token; sent-but-unrecorded write retried; 400s no longer
+  trip the breaker; 401/403/404 treated as configuration errors; StatusCallback
+  sent with every message.**
+- **API: drains before exit; enqueue failure keeps the key retryable (503 +
+  retry re-enqueues); reused key with a different payload is 409; 64 KiB body
+  and field limits; fixed error messages.**
+- **Infra: standard SQS queues restored** (#75 had reverted them to FIFO); DLQ
+  retention 14 days; visibility timeout 180 s; worker liveness process-only;
+  IMDSv2.
+- Invariants: lost delivery updates and enqueue-failed rows are now caught;
+  cap check compares UTC days.
+
+### Security
+
+- Patched 29 reachable vulnerabilities (toolchain go1.25.13, pgx v5.11.0,
+  x/text v0.41.0). CI gains gofmt, staticcheck and govulncheck gates.
+
+Review notes and the deliberately deferred gaps: `docs/engineering-notes.md`,
+"Correctness review, 2 October 2026".
+
 ### Changed
 
 - **Infrastructure simplified to pragmatic components** (2026-08-20). The

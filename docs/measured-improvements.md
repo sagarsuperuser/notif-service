@@ -4,13 +4,13 @@ Every figure here came from a counter or a test that can be re-run. Where a
 number is not independently measured, it says so. Claims that did not survive
 checking were removed rather than softened — several were.
 
-## 1. Retry classification — controlled A/B on AWS
+## 1. Retry classification — before/after on AWS
 
 Same 100,000-message campaign, same 10% failure injection (6:3:1 across HTTP
 429 / 500 / 400, verified against the provider before use), same 408-second
 accept duration. One variable: the worker image.
 
-| | `sha-41c0375` | `sha-96bad7d` | change |
+| | before — `sha-41c0375` | after — `sha-96bad7d` | change |
 |---|---|---|---|
 | delivered | 90,146 | 98,874 | **+8,728** |
 | failed | 9,854 | 1,125 | **−8,729** |
@@ -22,7 +22,7 @@ accept duration. One variable: the worker image.
 The last two rows are the controls: identical acceptance and identical duration
 show the accept path did not move.
 
-The two deltas differ by one because the after arm's own rows do: 98,874 + 1,125
+The two deltas differ by one because the after run's own rows do: 98,874 + 1,125
 = 99,999. One accepted message was never attempted and appears in neither queue.
 `PurgeQueue` was issued seconds before that run, and AWS documents that a purge
 can take up to 60 seconds and may delete messages sent while it is in progress.
@@ -32,20 +32,26 @@ timeline.
 **What is established.** `ShouldRetry` tested `err != nil` before the HTTP
 status, and `SendSMS` returns a non-nil error alongside every non-2xx response,
 so the status branches were unreachable. The "attempts per message" row measures
-this directly rather than inferring it: in the before arm every message was
+this directly rather than inferring it: in the before run every message was
 attempted exactly once, so the three-attempt loop never ran at all.
 
-**Why the dead-letter queue is 0 on both arms, and why that is the point.** A
+**Why the dead-letter queue is 0 in both runs, and why that is the point.** A
 message written `state='failed'` cannot be re-claimed, so its redelivery was
 counted a duplicate and acknowledged. The 8,838 abandoned sends never reached
 the dead-letter queue, which is why the metric that existed to catch this
 reported success throughout.
 
-**The strongest single check** is that the after arm's 1,125 failures equal the
+**The strongest single check** is that the after run's 1,125 failures equal the
 1,125 HTTP 400s the provider returned. Every remaining failure is a permanent
 rejection; no transient failure was lost.
 
 Full method and the outage run: [campaign-100k/retry-handling-ab-2026-08-15.md](campaign-100k/retry-handling-ab-2026-08-15.md).
+
+**Follow-up (2 Oct 2026).** Permanent failures still returned an error *after*
+writing `failed`, so each one was redelivered once and then skipped — the same
+"done in the database, not done to the queue" pairing, minus the loss. `Process`
+now returns nil for any outcome the database has recorded as final; see the
+follow-up section of the linked page.
 
 ## 2. HTTP connection pool — re-measured, and the original claim withdrawn
 
