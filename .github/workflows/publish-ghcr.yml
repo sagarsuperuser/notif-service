@@ -3,6 +3,11 @@ name: Publish images to GHCR
 on:
   push:
     branches: ["main"]
+    # A merged tag bump changes only this file. Building on it would publish
+    # images identical to the ones just deployed and open another bump PR —
+    # every bump merge would beget the next, forever.
+    paths-ignore:
+      - deploy/k8s/overlays/prod/kustomization.yaml
   workflow_dispatch: {}
 
 permissions:
