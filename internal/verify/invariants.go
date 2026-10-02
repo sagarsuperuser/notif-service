@@ -98,11 +98,13 @@ func Checks(o Options) []Invariant {
 			// has actually been attempted.
 			Name: "no message was left queued without being attempted",
 			Why: "a queued message with no recorded error is one the API accepted and no worker ever picked up — " +
-				"a silent drop. Run this after the queue has drained, or it reports work still legitimately in flight.",
+				"a silent drop. 'enqueue_failed' counts too: the API could not hand it to the queue and the client " +
+				"never retried. Run this after the queue has drained, or it reports work still legitimately in flight.",
 			Query: `
 				SELECT count(*), coalesce(max(id), '')
 				  FROM messages
-				 WHERE created_at >= $1 AND state = 'queued' AND last_error IS NULL`,
+				 WHERE created_at >= $1 AND state = 'queued'
+				   AND (last_error IS NULL OR last_error = 'enqueue_failed')`,
 			Args: []any{o.Since},
 		},
 		{
@@ -113,7 +115,24 @@ func Checks(o Options) []Invariant {
 			Query: `
 				SELECT count(*), coalesce(max(id), '')
 				  FROM messages
-				 WHERE created_at >= $1 AND state = 'queued' AND last_error IS NOT NULL`,
+				 WHERE created_at >= $1 AND state = 'queued'
+				   AND last_error IS NOT NULL AND last_error <> 'enqueue_failed'`,
+			Args: []any{o.Since},
+		},
+		{
+			Name: "no message is still submitted after its final delivery report",
+			Why: "a terminal callback that arrived but never advanced its message means the webhook's update was " +
+				"lost and reconcile (every 5 minutes) has not repaired it. Without this check a run in which no " +
+				"delivery report was applied still passes every other invariant.",
+			Query: `
+				SELECT count(*), coalesce(max(m.id || ' has ' || e.vendor_status || ' since ' || e.received_at::text), '')
+				  FROM messages m
+				  JOIN delivery_events e
+				    ON e.provider = m.provider AND e.provider_msg_id = m.provider_msg_id
+				 WHERE m.created_at >= $1
+				   AND m.state = 'submitted'
+				   AND e.vendor_status IN ('delivered','failed','undelivered')
+				   AND e.received_at < now() - interval '10 minutes'`,
 			Args: []any{o.Since},
 		},
 		{
@@ -165,7 +184,9 @@ func Checks(o Options) []Invariant {
 					"send with no increment.",
 				Query: `
 					WITH accepted AS (
-						SELECT tenant_id, to_phone, created_at::date AS day, count(*) AS n
+						-- UTC day: the counter's day is truncated in UTC when written,
+						-- and a bare ::date would use the session time zone.
+						SELECT tenant_id, to_phone, (created_at AT TIME ZONE 'UTC')::date AS day, count(*) AS n
 						  FROM messages
 						 WHERE created_at >= $1 AND state <> 'suppressed'
 						 GROUP BY 1,2,3
