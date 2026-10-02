@@ -115,7 +115,18 @@ type CreateMessageResult struct {
 	State     string
 	LastError string
 	Existing  bool
+	// The request the row was created from, so an idempotent retry can be
+	// checked against it: a reused key with a different payload is a conflict,
+	// not a retry.
+	To         string
+	TemplateID string
+	CampaignID string
+	Vars       map[string]string
 }
+
+// LastErrorEnqueueFailed marks a 'queued' row whose job may never have reached
+// the queue. A retry with the same idempotency key re-enqueues it.
+const LastErrorEnqueueFailed = "enqueue_failed"
 
 // DeliveryEventRecord is one provider callback, applied in a single round-trip:
 // the event is always persisted, and the message row is advanced only when the

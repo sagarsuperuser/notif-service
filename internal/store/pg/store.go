@@ -122,17 +122,40 @@ func (s *Store) CreateMessage(ctx context.Context, in store.CreateMessageInput) 
 			SELECT $1,$2,$3,$4,$5,$6,$7, d.state, NULLIF(d.last_error,''), $10,$10 FROM decision d
 			ON CONFLICT (tenant_id, idempotency_key) DO UPDATE
 				SET updated_at = messages.updated_at
-			RETURNING id, state, COALESCE(last_error,'') AS last_error, (xmax = 0) AS inserted
+			RETURNING id, state, COALESCE(last_error,'') AS last_error, (xmax = 0) AS inserted,
+			          to_phone, template_id, COALESCE(campaign_id,'') AS campaign_id, vars_json
 		)
-		SELECT id, state, last_error, inserted FROM ins
+		SELECT id, state, last_error, inserted, to_phone, template_id, campaign_id, vars_json FROM ins
 	`, in.ID, in.TenantID, in.IdemKey, in.To, in.TemplateID, b, nullIfEmpty(in.CampaignID),
 		day, in.MaxPerDay, in.Now)
 
-	if err := row.Scan(&out.MessageID, &out.State, &out.LastError, &inserted); err != nil {
+	var varsJSON []byte
+	if err := row.Scan(&out.MessageID, &out.State, &out.LastError, &inserted,
+		&out.To, &out.TemplateID, &out.CampaignID, &varsJSON); err != nil {
 		return store.CreateMessageResult{}, err
 	}
+	_ = json.Unmarshal(varsJSON, &out.Vars)
 	out.Existing = !inserted
 	return out, nil
+}
+
+// SetEnqueueFailed marks (failed=true) or clears the "job may not have reached
+// the queue" flag on a message. Guarded on state='queued': once a worker has
+// claimed the row the job evidently arrived, and nothing here may move a row
+// the worker or webhook owns.
+func (s *Store) SetEnqueueFailed(ctx context.Context, id string, failed bool, now time.Time) error {
+	if failed {
+		_, err := s.DB.Exec(ctx, `
+			UPDATE messages SET last_error=$2, updated_at=$3
+			 WHERE id=$1 AND state='queued'
+		`, id, store.LastErrorEnqueueFailed, now)
+		return err
+	}
+	_, err := s.DB.Exec(ctx, `
+		UPDATE messages SET last_error=NULL
+		 WHERE id=$1 AND state='queued' AND last_error=$2
+	`, id, store.LastErrorEnqueueFailed)
+	return err
 }
 
 // RecordDeliveryEvent applies one provider callback in a SINGLE round-trip:

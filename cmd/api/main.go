@@ -67,7 +67,6 @@ func main() {
 		MaxBatch: cfg.SQSSendBatchSize,
 		MaxDelay: sendDelay,
 	}
-	defer producer.Close()
 
 	svc := &service.NotificationService{
 		Store:     store,
@@ -92,6 +91,12 @@ func main() {
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
 		Handler: s.Mux,
+		// Without these a slow or idle client holds a connection and a goroutine
+		// indefinitely. The accept path itself is milliseconds.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	metricsSrv := &http.Server{
 		Addr:    ":" + cfg.MetricsPort,
@@ -110,15 +115,28 @@ func main() {
 		serverErrCh <- srv.ListenAndServe()
 	}()
 
+	// Shutdown order matters, and main must WAIT for it.
+	//
+	// srv.Shutdown makes ListenAndServe return ErrServerClosed at once, before
+	// in-flight handlers finish. The previous version returned from main on
+	// that, closing the database and exiting while requests were still between
+	// "row committed" and "job enqueued" — leaving 'queued' rows with no job.
+	// So: stop accepting and drain handlers, then flush the producer, then
+	// close the database, and only then return.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		sig := <-sigCh
 		slog.Info("api shutdown", "signal", sig.String())
-		cancel()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Within terminationGracePeriodSeconds (20s), leaving room for the
+		// producer flush and the database close that follow.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer shutdownCancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("api drain did not complete", "err", err)
+		}
 		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 
@@ -128,12 +146,16 @@ func main() {
 			slog.Error("api server failed", "err", err)
 			os.Exit(1)
 		}
+		<-shutdownDone
 	case err := <-metricsErrCh:
 		if err != nil && err != http.ErrServerClosed {
 			slog.Error("api metrics server failed", "err", err)
 			os.Exit(1)
 		}
+		<-shutdownDone
 	}
 
+	producer.Close() // flushes anything still batched
+	cancel()
 	db.Close()
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -246,4 +247,147 @@ func TestAPI_ConcurrentDuplicatesEnqueueOnce(t *testing.T) {
 	if n := capCount(t, db, tenant, phone, util.NowUTC()); n != 1 {
 		t.Errorf("concurrent duplicates consumed %d of the daily cap, want 1", n)
 	}
+}
+
+// flakyQueue fails the first n enqueues, then records like recordingQueue.
+type flakyQueue struct {
+	*recordingQueue
+	mu       sync.Mutex
+	failures int
+}
+
+func (q *flakyQueue) EnqueueSMS(ctx context.Context, tenantID, messageID, idempotencyKey, to, templateID string, vars map[string]string, campaignID string) error {
+	q.mu.Lock()
+	if q.failures > 0 {
+		q.failures--
+		q.mu.Unlock()
+		return fmt.Errorf("sqs: SendMessageBatch: RequestError: send request failed")
+	}
+	q.mu.Unlock()
+	return q.recordingQueue.EnqueueSMS(ctx, tenantID, messageID, idempotencyKey, to, templateID, vars, campaignID)
+}
+
+// TestAPI_EnqueueFailureIsRetryableWithTheSameKey is the regression test for a
+// poisoned idempotency key. An enqueue failure used to mark the row 'failed'
+// and answer 502 — and the client's retry, doing exactly what a 5xx invites,
+// got 202 {state: failed} forever: the message could never be sent under that
+// key, and a unit of the recipient's daily cap was already spent.
+func TestAPI_EnqueueFailureIsRetryableWithTheSameKey(t *testing.T) {
+	q := &flakyQueue{recordingQueue: newRecordingQueue(), failures: 1}
+	h, db := newAPI(t, q, 10)
+	now := util.NowUTC()
+
+	tenant, phone := "e2e-flaky-tenant", "+15550007777"
+	seedTenantOptedIn(t, db, tenant, phone)
+	body := map[string]any{
+		"tenantId": tenant, "idempotencyKey": "e2e-flaky-idem", "to": phone,
+		"templateId": "tpl", "vars": map[string]string{"n": "1"},
+	}
+
+	code, _ := postSMSRaw(t, h, body)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("enqueue failure answered %d, want 503", code)
+	}
+	if got := stateOfKey(t, db, tenant, "e2e-flaky-idem"); got != "queued" {
+		t.Fatalf("state after enqueue failure = %q, want queued — the row must stay sendable", got)
+	}
+
+	code, resp := postSMS(t, h, body)
+	if code != http.StatusAccepted || resp["state"] != "queued" {
+		t.Fatalf("retry got %d %v, want 202 queued", code, resp)
+	}
+	if n := q.total(); n != 1 {
+		t.Errorf("enqueued %d times after the retry, want 1", n)
+	}
+	if n := capCount(t, db, tenant, phone, now); n != 1 {
+		t.Errorf("cap consumed %d units, want 1 — a retry must not spend another", n)
+	}
+
+	// A further duplicate of the now-healthy request enqueues nothing more.
+	if code, _ := postSMS(t, h, body); code != http.StatusAccepted {
+		t.Fatalf("duplicate got %d, want 202", code)
+	}
+	if n := q.total(); n != 1 {
+		t.Errorf("enqueued %d times after a healthy duplicate, want 1", n)
+	}
+}
+
+// TestAPI_ReusedKeyWithDifferentRequestIsAConflict: the conflict path used to
+// return the original row whatever the new payload was, so a caller reusing a
+// key for a different recipient was told 202 for a send that never happens.
+func TestAPI_ReusedKeyWithDifferentRequestIsAConflict(t *testing.T) {
+	q := newRecordingQueue()
+	h, db := newAPI(t, q, 10)
+
+	tenant := "e2e-conflict-tenant"
+	seedTenantOptedIn(t, db, tenant, "+15550006666")
+	seedTenantOptedIn(t, db, tenant, "+15550006667")
+
+	first := map[string]any{"tenantId": tenant, "idempotencyKey": "k", "to": "+15550006666",
+		"templateId": "tpl", "vars": map[string]string{"n": "1"}}
+	if code, _ := postSMS(t, h, first); code != http.StatusAccepted {
+		t.Fatalf("first got %d, want 202", code)
+	}
+	// Same payload with harmless whitespace in the number is still a retry.
+	retry := map[string]any{"tenantId": tenant, "idempotencyKey": "k", "to": "+1 5550006666",
+		"templateId": "tpl", "vars": map[string]string{"n": "1"}}
+	if code, _ := postSMS(t, h, retry); code != http.StatusAccepted {
+		t.Errorf("identical retry got %d, want 202", code)
+	}
+	for name, body := range map[string]map[string]any{
+		"different recipient": {"tenantId": tenant, "idempotencyKey": "k", "to": "+15550006667",
+			"templateId": "tpl", "vars": map[string]string{"n": "1"}},
+		"different vars": {"tenantId": tenant, "idempotencyKey": "k", "to": "+15550006666",
+			"templateId": "tpl", "vars": map[string]string{"n": "2"}},
+	} {
+		if code, _ := postSMSRaw(t, h, body); code != http.StatusConflict {
+			t.Errorf("%s: got %d, want 409", name, code)
+		}
+	}
+	if n := q.total(); n != 1 {
+		t.Errorf("enqueued %d times, want 1", n)
+	}
+}
+
+// TestAPI_OversizedRequestIsRejectedAtTheEdge: with no bound, one oversized
+// payload was read whole and then failed the SQS batch it landed in, taking
+// up to nine other callers' requests down with it.
+func TestAPI_OversizedRequestIsRejectedAtTheEdge(t *testing.T) {
+	q := newRecordingQueue()
+	h, _ := newAPI(t, q, 10)
+
+	huge := map[string]string{"blob": strings.Repeat("x", 200<<10)}
+	code, _ := postSMSRaw(t, h, map[string]any{"tenantId": "t", "idempotencyKey": "big", "to": "+15550005555",
+		"templateId": "tpl", "vars": huge})
+	if code != http.StatusRequestEntityTooLarge {
+		t.Errorf("200 KiB body got %d, want 413", code)
+	}
+	long := map[string]string{"v": strings.Repeat("x", 600)}
+	code, _ = postSMSRaw(t, h, map[string]any{"tenantId": "t", "idempotencyKey": "long", "to": "+15550005555",
+		"templateId": "tpl", "vars": long})
+	if code != http.StatusBadRequest {
+		t.Errorf("oversized var got %d, want 400", code)
+	}
+	if q.total() != 0 {
+		t.Errorf("a rejected request reached the queue")
+	}
+}
+
+// postSMSRaw is postSMS for responses that are not JSON (errors).
+func postSMSRaw(t *testing.T, h http.Handler, body map[string]any) (int, string) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	rw := httptest.NewRecorder()
+	h.ServeHTTP(rw, httptest.NewRequest(http.MethodPost, "/v1/sms/messages", bytes.NewReader(b)))
+	return rw.Code, rw.Body.String()
+}
+
+func stateOfKey(t *testing.T, db *pgxpool.Pool, tenant, key string) string {
+	t.Helper()
+	var s string
+	if err := db.QueryRow(context.Background(),
+		`SELECT state FROM messages WHERE tenant_id=$1 AND idempotency_key=$2`, tenant, key).Scan(&s); err != nil {
+		t.Fatalf("state of %s/%s: %v", tenant, key, err)
+	}
+	return s
 }
