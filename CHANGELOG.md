@@ -33,6 +33,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Invariants: lost delivery updates and enqueue-failed rows are now caught;
   cap check compares UTC days.
 
+- **Concurrent duplicate accepts no longer double-spend the daily cap**
+  (2026-10-03): per-(tenant, key) advisory lock in the same pipelined batch
+  as the accept statement; still one round-trip. The query tracer and the
+  round-trip test count a pipelined batch as one call.
+- **Tag-bump PRs can merge again**: the publish workflow dispatches CI on the
+  bump branch (GITHUB_TOKEN-opened PRs start no workflows) and closes
+  superseded bump PRs.
+
 ### Security
 
 - Patched 29 reachable vulnerabilities (toolchain go1.25.13, pgx v5.11.0,

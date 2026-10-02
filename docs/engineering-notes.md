@@ -223,6 +223,17 @@ every finding traced in code before it was acted on. Fixed (see CHANGELOG):
   apply would have destroyed them and broken sending); DLQ retention now
   outlasts the main queue's; visibility timeout sized to the worker's real
   receive-to-finish time; liveness no longer depends on Postgres/SQS; IMDSv2.
+- **Concurrent duplicates spent two cap units** (fixed 3 Oct, after it failed
+  CI on a slower runner). A duplicate arriving while the original was in
+  flight ran on a snapshot that missed it, then incremented the cap row the
+  original had updated. A per-(tenant, key) advisory lock now precedes the
+  accept statement in the same pipelined batch — still one round-trip.
+  `TestCreateMessage_InFlightDuplicateSpendsNoCap` forces the interleaving
+  deterministically; it failed 3/3 before the fix.
+- **Tag-bump PRs could never merge.** They were opened with `GITHUB_TOKEN`,
+  which starts no workflows, so the required check never reported; 17
+  accumulated. The publish workflow now dispatches CI on the bump branch and
+  closes superseded bumps.
 - **Hygiene.** 29 reachable vulnerabilities patched (stdlib, pgx, x/text);
   gofmt, staticcheck and govulncheck gates in CI.
 
@@ -241,11 +252,6 @@ Each needs a design decision or a deploy, not a patch:
   reached the provider is retried, in-process or by redelivery. Twilio's
   Messages API has no idempotency key; the mitigation is a recorded send
   intent plus a provider-side lookup before resending.
-- **Concurrent duplicates can spend two cap units.** Two in-flight requests
-  with the same key can both pass the cap's `NOT EXISTS` check (statement
-  snapshots); the second's message insert then resolves to the first row.
-  Closing it without giving up the single round-trip needs a pipelined
-  advisory lock.
 - **Producer head-of-line blocking.** One goroutine sends every SQS batch; a
   slow call stalls every accept on the pod.
 - **Reconcile scans all terminal events.** Bounded by the index, but it grows
@@ -254,8 +260,7 @@ Each needs a design decision or a deploy, not a patch:
   whether Twilio retries depends on connection overrides (`#rc=`) on the
   callback URL, which are not configured.
 - **Deploy-side, needs the owner:** prod images are pinned to `sha-2d5b9b8`,
-  older than the message-loss fixes (the tag-bump PR is opened with
-  `GITHUB_TOKEN`, which does not trigger CI, so it cannot merge); KEDA uses
+  older than the message-loss fixes; KEDA uses
   static AWS keys; RDS has no deletion protection or final snapshot;
   `admin_cidr` is a /8; ingress rate-limits all clients as one bucket under
   `externalTrafficPolicy: Cluster`; the migration job re-runs the seed and
