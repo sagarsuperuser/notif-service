@@ -99,8 +99,16 @@ func ShouldRetry(err error, httpStatus int) bool {
 			return true // throttled or request timeout: back off and retry
 		case httpStatus >= 500 && httpStatus <= 599:
 			return true // provider-side fault
+		case httpStatus == 401, httpStatus == 403, httpStatus == 404:
+			// Credentials, permissions, or the account path — our CONFIGURATION,
+			// not this message. A rotated auth token or wrong account SID
+			// answers every send this way, so treating it as permanent fails an
+			// entire campaign for a deploy mistake, with nothing in the DLQ to
+			// redrive. The same reasoning as a missing template: hand it back,
+			// let it reach the DLQ where it is visible, redrive once fixed.
+			return true
 		default:
-			return false // 4xx other than the above is our fault and will not improve
+			return false // other 4xx (e.g. 400): the request itself is bad and will not improve
 		}
 	}
 

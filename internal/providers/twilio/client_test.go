@@ -35,8 +35,10 @@ func TestShouldRetry_ClassifiesRealProviderResponses(t *testing.T) {
 		{503, true, "provider unavailable"},
 		{502, true, "bad gateway"},
 		{400, false, "malformed request will not improve on retry"},
-		{401, false, "bad credentials will not improve on retry"},
-		{404, false, "wrong endpoint"},
+		{401, true, "bad credentials are a deploy problem, not a bad message: must reach the DLQ, not fail"},
+		{403, true, "permission/config problem: same as 401"},
+		{404, true, "wrong account path: configuration, not the message"},
+		{422, false, "unprocessable request will not improve on retry"},
 	}
 
 	for _, tc := range cases {

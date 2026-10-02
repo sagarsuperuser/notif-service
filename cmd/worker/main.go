@@ -147,16 +147,25 @@ func main() {
 		MaxRequests: 3,
 		Timeout:     20 * time.Second,
 		ReadyToTrip: func(c gobreaker.Counts) bool { return c.ConsecutiveFailures >= 10 },
+		// The breaker protects against an UNHEALTHY provider. A permanent
+		// rejection (400 and similar) is the provider answering correctly about
+		// a bad message; counted as a failure, ten invalid numbers in a row
+		// would open the breaker and push every healthy message onto the
+		// redelivery path for 20s.
+		IsSuccessful: func(err error) bool {
+			return err == nil || workerproc.IsPermanentRejection(err)
+		},
 	})
 	templates := map[string]string{
 		"txn_confirm_v1": "Hi {name}, your request is confirmed. Ref: {ref}. Thanks.",
 	}
 	processor := &workerproc.Processor{
-		Store:           store,
-		Sender:          sender,
-		Templates:       templates,
-		Breaker:         cb,
-		ClaimStaleAfter: claimStaleAfter(cfg.SQSVizTimeout),
+		Store:             store,
+		Sender:            sender,
+		Templates:         templates,
+		Breaker:           cb,
+		ClaimStaleAfter:   claimStaleAfter(cfg.SQSVizTimeout),
+		StatusCallbackURL: cfg.StatusCallbackURL,
 	}
 
 	// start polling

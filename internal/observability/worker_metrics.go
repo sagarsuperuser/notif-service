@@ -49,7 +49,7 @@ var (
 	ClaimResult = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "notif_worker_claim_total",
-			Help: "Outcome of attempting to claim a delivered message: claimed, skipped, or missing",
+			Help: "Outcome of attempting to claim a delivered message: claimed, skipped (already finished), held (another worker has it), or missing",
 		},
 		[]string{"result"},
 	)
