@@ -83,13 +83,26 @@ func (s *Store) ReleaseForRetry(ctx context.Context, id, lastErr string, claimed
 // xmax distinguishes the two cases: it is 0 on a row this statement inserted
 // and non-zero on one it locked, which is how a fresh accept is told apart from
 // an idempotent retry without a second query.
+//
+// Concurrent duplicates are serialised by a per-(tenant, key) advisory lock
+// taken BEFORE the statement, in the same pipelined batch — so still one
+// network round-trip. Without it, a duplicate arriving while the original is
+// in flight runs on a snapshot that predates the original's commit: its
+// "is this key already known?" check misses the original's message, it waits
+// on the cap row the original updated, then increments it again. One message,
+// two cap units. Under READ COMMITTED each statement takes a fresh snapshot,
+// so once the lock is granted the duplicate sees the committed original and
+// spends nothing. The lock is transaction-scoped and released when the batch's
+// implicit transaction ends.
 func (s *Store) CreateMessage(ctx context.Context, in store.CreateMessageInput) (store.CreateMessageResult, error) {
 	b, _ := json.Marshal(in.Vars)
 	day := in.Day.UTC().Truncate(24 * time.Hour)
 
 	var out store.CreateMessageResult
 	var inserted bool
-	row := s.DB.QueryRow(ctx, `
+	batch := &pgx.Batch{}
+	batch.Queue(`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 0))`, in.TenantID, in.IdemKey)
+	batch.Queue(`
 		WITH gate AS (
 			SELECT
 				EXISTS(SELECT 1 FROM suppression_list WHERE tenant_id=$2 AND phone=$4) AS suppressed,
@@ -129,9 +142,18 @@ func (s *Store) CreateMessage(ctx context.Context, in store.CreateMessageInput) 
 	`, in.ID, in.TenantID, in.IdemKey, in.To, in.TemplateID, b, nullIfEmpty(in.CampaignID),
 		day, in.MaxPerDay, in.Now)
 
+	br := s.DB.SendBatch(ctx, batch)
+	if _, err := br.Exec(); err != nil {
+		_ = br.Close()
+		return store.CreateMessageResult{}, err
+	}
 	var varsJSON []byte
-	if err := row.Scan(&out.MessageID, &out.State, &out.LastError, &inserted,
+	if err := br.QueryRow().Scan(&out.MessageID, &out.State, &out.LastError, &inserted,
 		&out.To, &out.TemplateID, &out.CampaignID, &varsJSON); err != nil {
+		_ = br.Close()
+		return store.CreateMessageResult{}, err
+	}
+	if err := br.Close(); err != nil {
 		return store.CreateMessageResult{}, err
 	}
 	_ = json.Unmarshal(varsJSON, &out.Vars)

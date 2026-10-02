@@ -10,6 +10,8 @@ permissions:
   packages: write
   # the tag bump is delivered as a PR, not a push to main
   pull-requests: write
+  # to dispatch CI on the bump PR's branch (see the last step)
+  actions: write
 
 env:
   REGISTRY: ghcr.io
@@ -128,7 +130,28 @@ jobs:
           git commit -m "chore: point prod at image tag sha-${short_sha}"
           git push -u origin "$branch"
 
-          gh pr create \
+          pr_url=$(gh pr create \
             --title "chore: point prod at image tag sha-${short_sha}" \
             --body "Built from ${GITHUB_SHA}. Opened automatically after the images for this commit were pushed to GHCR." \
-            --head "$branch"
+            --head "$branch")
+          echo "opened $pr_url"
+
+          # Events created with GITHUB_TOKEN do not trigger workflows, so the
+          # push above and the PR it opened start NO CI run, the required check
+          # never reports, and the PR can never merge — 17 of them piled up
+          # this way. workflow_dispatch is the documented exception: a run
+          # dispatched with GITHUB_TOKEN does start, on the branch's head
+          # commit, and its check satisfies branch protection.
+          gh workflow run ci.yml --ref "$branch"
+
+          # Each bump supersedes every earlier one (they all rewrite the same
+          # four lines), so close the older ones instead of leaving a queue.
+          new_number="${pr_url##*/}"
+          gh pr list --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("chore/image-tags-")) | "\(.number) \(.headRefName)"' |
+          while read -r number head; do
+            if [ "$head" != "$branch" ]; then
+              gh pr close "$number" --delete-branch \
+                --comment "Superseded by #${new_number}, which points prod at a newer image."
+            fi
+          done

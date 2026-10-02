@@ -430,3 +430,79 @@ func TestCreateMessage_ConcurrentDuplicatesUnderHeavyContention(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateMessage_InFlightDuplicateSpendsNoCap forces the interleaving behind
+// a flaky CI failure ("concurrent duplicates consumed 4 of the daily cap").
+//
+// Request A is mid-flight: it holds the per-key accept lock and has written its
+// message and its cap increment, but has not committed. Duplicate B arrives
+// with the same key. Without serialisation, B's statement snapshot predates A's
+// commit, so B's "is this key already known?" check misses A's message; B
+// blocks on the cap row A updated, then increments it again once A commits.
+// B's own message insert resolves to A's row — one message, two cap units, and
+// with a small MAX_SMS_PER_DAY the recipient is wrongly capped for the day.
+func TestCreateMessage_InFlightDuplicateSpendsNoCap(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := util.NowUTC()
+	day := now.UTC().Truncate(24 * time.Hour)
+
+	const tenant, phone, key = "race-tenant", "+15550009999", "race-key"
+	seedTenantOptedIn(t, db, tenant, phone)
+
+	// A, by hand: the same lock CreateMessage takes, then the writes a first
+	// accept makes, left uncommitted.
+	txA, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin A: %v", err)
+	}
+	defer txA.Rollback(ctx)
+	if _, err := txA.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 0))`, tenant, key); err != nil {
+		t.Fatalf("A lock: %v", err)
+	}
+	if _, err := txA.Exec(ctx, `
+		INSERT INTO messages (id, tenant_id, idempotency_key, to_phone, template_id, vars_json, state, created_at, updated_at)
+		VALUES ('race-A', $1, $2, $3, 'tpl', '{}'::jsonb, 'queued', $4, $4)`, tenant, key, phone, now); err != nil {
+		t.Fatalf("A message: %v", err)
+	}
+	if _, err := txA.Exec(ctx, `
+		INSERT INTO send_caps_daily (tenant_id, phone, day, count, updated_at) VALUES ($1,$2,$3,1,$4)`,
+		tenant, phone, day, now); err != nil {
+		t.Fatalf("A cap: %v", err)
+	}
+
+	// B: the real accept path, same key, while A is in flight.
+	type result struct {
+		res store.CreateMessageResult
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := pg.New(db).CreateMessage(ctx, store.CreateMessageInput{
+			ID: "race-B", TenantID: tenant, IdemKey: key, To: phone, TemplateID: "tpl",
+			Vars: map[string]string{}, Day: now, MaxPerDay: 2, Now: now,
+		})
+		done <- result{res, err}
+	}()
+
+	time.Sleep(300 * time.Millisecond) // let B reach the point where it must wait
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("B: %v", r.err)
+		}
+		if !r.res.Existing || r.res.MessageID != "race-A" {
+			t.Errorf("B resolved to %q (existing=%v), want A's row", r.res.MessageID, r.res.Existing)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("B never returned")
+	}
+	if n := capCount(t, db, tenant, phone, now); n != 1 {
+		t.Errorf("one message consumed %d units of the daily cap, want 1 — the duplicate's check ran on a snapshot that missed the in-flight original", n)
+	}
+}
