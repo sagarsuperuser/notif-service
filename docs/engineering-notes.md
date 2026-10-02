@@ -230,10 +230,14 @@ every finding traced in code before it was acted on. Fixed (see CHANGELOG):
   accept statement in the same pipelined batch — still one round-trip.
   `TestCreateMessage_InFlightDuplicateSpendsNoCap` forces the interleaving
   deterministically; it failed 3/3 before the fix.
-- **Tag-bump PRs could never merge.** They were opened with `GITHUB_TOKEN`,
-  which starts no workflows, so the required check never reported; 17
-  accumulated. The publish workflow now dispatches CI on the bump branch and
-  closes superseded bumps.
+- **Tag-bump PRs could never merge.** GitHub creates their CI run but, since
+  `github-actions[bot]` opened the PR, holds it for a maintainer's approval;
+  nobody approved, the held runs expired, the required check never passed,
+  and 17 accumulated. (The review first concluded that `GITHUB_TOKEN`-opened
+  PRs start no CI at all, and a `workflow_dispatch` step was added on that
+  basis; it ran, but branch protection counts only the PR's own run. Corrected
+  once the expired runs were found.) The publish workflow now approves the
+  held run and closes superseded bumps; merging remains a human decision.
 - **Hygiene.** 29 reachable vulnerabilities patched (stdlib, pgx, x/text);
   gofmt, staticcheck and govulncheck gates in CI.
 

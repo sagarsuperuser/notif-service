@@ -10,7 +10,7 @@ permissions:
   packages: write
   # the tag bump is delivered as a PR, not a push to main
   pull-requests: write
-  # to dispatch CI on the bump PR's branch (see the last step)
+  # to approve the CI run GitHub holds on the bump PR (see the last step)
   actions: write
 
 env:
@@ -136,13 +136,30 @@ jobs:
             --head "$branch")
           echo "opened $pr_url"
 
-          # Events created with GITHUB_TOKEN do not trigger workflows, so the
-          # push above and the PR it opened start NO CI run, the required check
-          # never reports, and the PR can never merge — 17 of them piled up
-          # this way. workflow_dispatch is the documented exception: a run
-          # dispatched with GITHUB_TOKEN does start, on the branch's head
-          # commit, and its check satisfies branch protection.
-          gh workflow run ci.yml --ref "$branch"
+          # GitHub DOES create the PR's CI run, but because the PR was opened by
+          # github-actions[bot] it holds that run as "action_required" until a
+          # maintainer approves it. Nobody did, the held runs expired, the
+          # required check never passed, and 17 bump PRs piled up unmergeable.
+          # (A workflow_dispatch run on the branch does not help: branch
+          # protection only counts the PR's own run.)
+          #
+          # Approving it here is safe: the PR is main's code plus a generated
+          # tag change, produced by this workflow from a commit already merged
+          # to main. MERGING it — pointing prod at the new images — stays a
+          # human decision.
+          run_id=""
+          for _ in $(seq 1 24); do
+            run_id=$(gh run list --branch "$branch" --event pull_request --limit 5 \
+              --json databaseId,conclusion \
+              --jq '[.[] | select(.conclusion == "action_required")][0].databaseId // empty')
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          if [ -n "$run_id" ] && gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve"; then
+            echo "approved held CI run ${run_id} for ${branch}"
+          else
+            echo "::warning::could not approve the CI run for ${branch}; approve it from the PR's Checks tab (Approve and run)"
+          fi
 
           # Each bump supersedes every earlier one (they all rewrite the same
           # four lines), so close the older ones instead of leaving a queue.

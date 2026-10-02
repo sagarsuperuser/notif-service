@@ -37,9 +37,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (2026-10-03): per-(tenant, key) advisory lock in the same pipelined batch
   as the accept statement; still one round-trip. The query tracer and the
   round-trip test count a pipelined batch as one call.
-- **Tag-bump PRs can merge again**: the publish workflow dispatches CI on the
-  bump branch (GITHUB_TOKEN-opened PRs start no workflows) and closes
-  superseded bump PRs.
+- **Tag-bump PRs can merge again**: GitHub holds the CI run of a PR opened by
+  `github-actions[bot]` for approval, and those runs had been expiring. The
+  publish workflow now approves the held run and closes superseded bump PRs.
+  (Replaces a `workflow_dispatch` step from #79, which ran but did not count
+  toward branch protection.)
 
 ### Security
 
