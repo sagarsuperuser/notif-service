@@ -65,7 +65,8 @@ now return nil; the contract is documented on `Process` and in
 **Cut database round-trips per message from 13 to 4** by collapsing
 multi-statement sequences into single CTEs — the accept path from 7 statements
 to 1, the worker from 4 to 2, the provider callback from 2 plus a retried UPDATE
-to 1. The first two are differential — the old sequence is replayed on the same
+to 1 (13 counts the callback at its minimum of 2; with all ten UPDATE attempts
+it took 11). The first two are differential — the old sequence is replayed on the same
 counter — and the callback's old count is read from the previous code, not
 replayed. Each differential test requires identical results from both paths, so
 the reduction cannot come from doing less work.
@@ -137,11 +138,10 @@ against the database.
 
 | claim | source | reproducible |
 |---|---|---|
-| round-trips 7→1, 4→2, 11→1 | pgx query tracer, old sequence replayed | `go test -tags=integration ./tests/integration -run RoundTrip -v` |
+| round-trips 7→1, 4→2, 2–11→1 | pgx query tracer, old sequence replayed | `go test -tags=integration ./tests/integration -run RoundTrip -v` |
 | receiver concurrency ~8x | deterministic fake, injected latency | `go test ./internal/queue/sqs -run ReceivesConcurrently -v` |
 | batching 10 messages per API call | test output | `go test ./internal/queue/sqs -run 'Coalesces\|BatchesDeletes' -v` |
-| connection-pool A/B | live cluster, fresh counters both arms | recorded in docs/measured-improvements.md |
-| 380,000 delivered, 6/6 invariants zero | Postgres, captured before teardown | recorded |
+| 380,000 delivered, 6 invariants checked by direct SQL, all zero | Postgres, captured before teardown | recorded |
 | campaign reconciliation | Postgres + CloudWatch + Prometheus | CloudWatch retains 15 months |
 
 CloudWatch matters disproportionately: it is AWS's own recording of the queue,

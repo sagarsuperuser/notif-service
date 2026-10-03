@@ -46,7 +46,7 @@ init: up queues migrate seed
 
 
 env:
-	@test -f $(ENV_FILE) || (echo "Missing $(ENV_FILE). Create it from .env.example" && exit 1)
+	@test -f $(ENV_FILE) || (echo "Missing $(ENV_FILE). Create it: see README, Local Quick Start, step 2" && exit 1)
 
 run-api: env
 	@set -a; . ./$(ENV_FILE); set +a; \

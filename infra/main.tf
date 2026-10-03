@@ -43,7 +43,7 @@ data "aws_availability_zones" "azs" {
 # Kept on purpose: non-burstable instance types (t-family CPU credits make
 # sustained behaviour time-dependent — the original tfvars reasoning holds for
 # any long-running work, not just benchmarks), ssm.tf (SSM access + SQS via
-# the instance role instead of static keys), SQS FIFO + DLQ, RDS, EBS-CSI IAM.
+# the instance role instead of static keys), SQS standard queue + DLQ, RDS, EBS-CSI IAM.
 # -----------------------------------------------------------------------------
 
 locals {
