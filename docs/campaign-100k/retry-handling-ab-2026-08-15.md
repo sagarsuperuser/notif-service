@@ -1,6 +1,10 @@
 # Failure handling under load — before/after runs on AWS, 15 August 2026
 
-> Historical record: this ran on the pre-2026-08-20 architecture (NAT + private subnets, internal API NLB path, bastion, RDS Postgres behind RDS Proxy, role-pinned node pools). The infrastructure has since been simplified — see `docs/architecture/` — but the numbers here describe the runs as they ran and are not restated.
+> Historical record: this ran on the pre-2026-08-20 architecture. That stack
+> had NAT and private subnets, an internal API NLB path, a bastion, RDS Postgres
+> behind RDS Proxy, and role-pinned node pools. The infrastructure has since
+> been simplified (see `docs/architecture/`). The numbers here describe the runs
+> as they ran and are not restated.
 
 ## In short
 
@@ -9,10 +13,10 @@
   temporary failures (429 rate-limit, 500) were treated as permanent and the
   message was marked `failed` after one attempt.
 - **Why nothing noticed.** Marking it `failed` also defeated the queue's own
-  retry: SQS redelivered the job, the worker refused to re-claim a finished
-  row, treated the redelivery as a duplicate and deleted it. The message never
-  reached the dead-letter queue, so the DLQ — the alarm meant for lost
-  messages — read zero while 8.8% of a 100,000-message campaign was discarded.
+  retry. SQS redelivered the job, but the worker refused to re-claim a finished
+  row. It treated the redelivery as a duplicate and deleted it. The message
+  never reached the dead-letter queue (DLQ), the alarm meant for lost messages.
+  So the DLQ read zero while 8.8% of a 100,000-message campaign was discarded.
 - **The fix.** Check the status first, and on a temporary failure hand the
   message back to the queue (`queued`) instead of failing it, so the queue's
   retries and the DLQ work as designed.
@@ -22,8 +26,8 @@
   then lost zero messages, and a 9-minute outage that filled the DLQ was fully
   recovered with one redrive.
 - **Follow-up (2 Oct 2026).** The same "write a final state, then tell the
-  queue it is not done" pattern survived for genuine 400s — harmless, but each
-  one cost a pointless redelivery. Fixed; see [the end of this page](#follow-up-2-october-2026--one-meaning-per-return-value).
+  queue it is not done" pattern survived for genuine 400s. It was harmless, but
+  each one cost a pointless redelivery. Fixed; see [the end of this page](#follow-up-2-october-2026--one-meaning-per-return-value).
 
 Three 100,000-message campaigns and one 20,000-message outage run on the same
 AWS stack, run to answer one question: **what happens to a message when the
@@ -37,9 +41,10 @@ DLQ: 0" was quoted as evidence of correctness. It was not evidence of anything.
 
 Unchanged from `benchmark-2026-08-14.md`: k3s on 8 EC2 nodes, 2 worker pods
 (`WORKER_CONCURRENCY=100`), RDS `db.m7g.xlarge` via RDS Proxy, SQS standard with
-`maxReceiveCount=5` and a 60s visibility timeout. Sends go to the in-cluster
-provider simulator. The load generator sends 100,000 accepts and then waits for
-the message-state histogram to stop moving for a minute.
+`maxReceiveCount=5` and a 60s visibility timeout. Sends go to the mock provider
+(`cmd/mock-provider`), running in the cluster. The load generator sends 100,000
+accepts. It then waits until the count of messages in each state has not
+changed for a minute.
 
 ---
 
@@ -66,14 +71,14 @@ Only the worker image differs between the runs.
 ### What run A shows
 
 Every message was attempted **exactly once**. The three-attempt retry loop was
-present in the code and never executed, because `ShouldRetry` tested the error
-before the status and `SendSMS` returns a non-nil error alongside every non-2xx
+present in the code and never executed. `ShouldRetry` tested the error before
+the status, and `SendSMS` returns a non-nil error alongside every non-2xx
 response. The status branches were unreachable.
 
-So 8,838 messages that answered 429 or 500 — both documented by the provider as
-safe to retry — were marked `failed` on first contact. A terminal message cannot
-be re-claimed, so the SQS redelivery was counted as a duplicate, acknowledged,
-and deleted.
+So 8,838 messages that answered 429 or 500 were marked `failed` on first
+contact. The provider documents both codes as safe to retry. A terminal message
+cannot be re-claimed, so the SQS redelivery was counted as a duplicate,
+acknowledged, and deleted.
 
 **8.8% of the campaign was discarded, and the dead-letter queue stayed at zero
 throughout.** No alarm could have fired. That is the part worth keeping: the
@@ -85,10 +90,10 @@ defect was invisible to the metric that existed to catch it.
 numbers matching exactly means every remaining failure is a genuine permanent
 rejection and no transient failure was lost.
 
-The attempts histogram is the mechanism made visible. The in-process loop caps
-at three, so the 83 messages at 4, 5 and 6 attempts can only have got there by
-being released back to the queue and re-delivered by SQS — the outer retry loop
-that run A's terminal writes had disabled.
+The attempts histogram shows the mechanism. The in-process loop caps at three
+attempts. So the 83 messages at 4, 5 and 6 attempts got there one way only:
+they were released back to the queue and redelivered by SQS. That outer retry
+loop is the one that run A's terminal writes had disabled.
 
 **+8,728 messages delivered, same code path, same injection, same duration.**
 
@@ -101,10 +106,10 @@ Real failures arrive **correlated** and at the **connection** level: everything
 in flight fails at once, and the client sees connection-refused rather than a
 polite 429.
 
-So run C uses a realistic steady state — `MOCK_SUCCESS_RATE=0.995`, weighted
-toward bad numbers, which is what a real recipient list contains — and then
-takes the provider away completely by scaling it to zero for **58 seconds**
-mid-campaign (08:04:02–08:05:00 UTC).
+So run C first sets a realistic steady state: `MOCK_SUCCESS_RATE=0.995`,
+weighted toward bad numbers, which is what a real recipient list contains. It
+then takes the provider away completely, by scaling it to zero for
+**58 seconds** mid-campaign (08:04:02–08:05:00 UTC).
 
 Worker image `sha-da47d34`.
 
@@ -137,25 +142,28 @@ failed         146   last_error = twilio_non_retryable
 ```
 
 15,434 messages had their claim **released back to the queue** rather than being
-failed. The circuit breaker opened within seconds and shielded the provider from
-roughly fifteen thousand pointless calls; only 70 requests reached it and got
+failed. (A claim is the worker marking a message row `processing` so that no
+other worker takes it while it sends; a claim that goes stale can be taken
+over.) The circuit breaker opened within seconds and shielded the provider from roughly
+fifteen thousand pointless calls. Only 70 requests reached it and got
 connection-refused before the breaker tripped. Every released message was
 re-claimed and sent once the provider returned.
 
 Those 70 are the ones that matter for classification. Until `sha-da47d34`, a
-transport failure with no HTTP status was classified permanent — the reasoning
-being that a refused connection would not recover inside the three in-process
-attempts. True, and irrelevant: the code path that reasoning justified marks the
-message `failed`, which also cancels the SQS redelivery that exists precisely for
-faults outlasting a couple of seconds. Preparing this run is what surfaced it;
-the test covering that branch had asserted the wrong belief in as many words.
+transport failure with no HTTP status was classified permanent. The reasoning
+was that a refused connection would not recover inside the three in-process
+attempts. That is correct, but it does not justify the outcome. The code path
+it justified marks the message `failed`, and that also cancels the SQS
+redelivery. That redelivery exists precisely for faults outlasting a couple of
+seconds. Preparing this run is what surfaced the problem. The test covering
+that branch had explicitly asserted the wrong belief.
 
 ### Caveat: the 1,655 `submitted`
 
-All 1,655 were submitted between 08:03:48 and 08:03:57 — a nine-second window
-ending five seconds before the provider pod was killed. The provider had issued
-each a SID and scheduled its delivery callback in memory; scaling to zero
-destroyed that state.
+All 1,655 were submitted between 08:03:48 and 08:03:57. That is a nine-second
+window ending five seconds before the provider pod was killed. The provider
+had issued each one a SID (the provider's message ID) and scheduled its
+delivery callback in memory. Scaling to zero destroyed that state.
 
 This is an artifact of how the outage was injected, not a property of the
 service. A real provider does not lose its callback queue when it recovers. It
@@ -168,8 +176,8 @@ run look tidier than it was.
 
 Runs A–C all ended with an empty dead-letter queue, so the redrive path was
 still unproven. Reaching it needs a fault outlasting `maxReceiveCount ×
-visibility timeout` — 5 × 60s. Run D sends 20,000 messages and takes the
-provider away for **8 minutes 51 seconds** (08:32:40–08:41:31 UTC).
+visibility timeout`, which is 5 × 60s. Run D sends 20,000 messages and takes
+the provider away for **8 minutes 51 seconds** (08:32:40–08:41:31 UTC).
 
 Queue depths through the outage, from CloudWatch-independent SQS attributes:
 
@@ -182,7 +190,7 @@ Queue depths through the outage, from CloudWatch-independent SQS attributes:
 | 08:38:25 | 0 / 18,067 | **8,253** |
 | 08:39:21 | 0 / 0 | **18,067** |
 
-The five redeliveries take about five minutes to burn, which is why the
+The five redeliveries take about five minutes to use up. That is why the
 dead-letter queue stays empty for the first six minutes and then fills in
 roughly ninety seconds.
 
@@ -197,11 +205,11 @@ delivered      599
                         total 20,000 ✓
 ```
 
-Not one message is `failed`. That is the whole point of the arc: the rows stay
-claimable, so the copies sitting in the dead-letter queue are still worth
-something. Under the pre-#59 code these 18,067 would have been terminally
-`failed` **and** absent from the dead-letter queue — invisible to an operator and
-unrecoverable by any means short of a manual SQL replay.
+Not one message is `failed`, and that is the purpose of this whole series of
+retry-handling fixes. The rows stay claimable, so the copies in the dead-letter queue can still be delivered.
+Before the fix (PR #59), these 18,067 would have been terminally `failed`
+**and** absent from the dead-letter queue. An operator could not have seen
+them, and only a manual SQL replay could have recovered them.
 
 ### Recovery
 
@@ -228,33 +236,36 @@ dead-letter      0
 **Every dead-lettered message was recovered and delivered, with zero permanent
 failures.** Elapsed from redrive to empty: about ninety seconds.
 
-The 1,334 `submitted` were all submitted between 08:32:27 and 08:32:35 — the
-eight seconds before the provider pod was killed — reproducing run C's artifact
-exactly: the provider had issued their SIDs and held their delivery callbacks in
-memory. Two runs, same window, same cause.
+The 1,334 `submitted` were all submitted between 08:32:27 and 08:32:35, the
+eight seconds before the provider pod was killed. This reproduces run C's
+artifact exactly. The provider had issued their SIDs and held their delivery
+callbacks in memory. Two runs, same window, same cause.
 
 ---
 
-## What these runs do not show
+## What this does not show
 
-- **A real provider.** Still the in-cluster simulator. It models documented
-  limits (concurrency 429s, per-sender MPS, queue overflow) and now failure
-  injection, but it is not Twilio.
+- **A real provider.** Still the mock provider. It models documented limits
+  (concurrency 429s, per-sender messages per second (MPS), queue overflow) and
+  now failure injection, but it is not Twilio.
 - **Multi-segment messages**, which halve effective throughput per segment.
 
 ## One procedural note
 
-Run B ended with a single message accepted but never attempted — `queued`, no
-error, no provider attempt, absent from both queues. The accept path cannot
-produce that state on an enqueue failure: it marks `enqueue_failed` and returns
-an error, and the batching producer blocks each caller until SQS acknowledges
-its specific entry, propagating per-entry batch failures individually.
+Run B ended with a single message accepted but never attempted. It was
+`queued`, with no error and no provider attempt, and was absent from both
+queues. The accept path (the API code that stores and enqueues a new message)
+cannot produce that state on an enqueue failure:
+
+- It marks `enqueue_failed` and returns an error.
+- The batching producer blocks each caller until SQS acknowledges its specific
+  entry, and reports each per-entry batch failure to its own caller.
 
 The likely cause is procedural. `PurgeQueue` was issued seconds before the run,
 and AWS documents that the purge can take up to 60 seconds and may delete
 messages sent while it is in progress. Run C waited out that window and lost
-nothing, which supports the explanation without proving it. Recorded rather than
-rounded away.
+nothing, which supports the explanation without proving it. It is recorded here
+instead of being left out.
 
 ---
 
@@ -265,30 +276,32 @@ not change what the worker *tells the queue* after a permanent one, and that
 was the same mistake in a quieter form.
 
 `Process` returns an error to the SQS consumer, and the consumer deletes the
-job only when the error is nil. So the return value is an instruction —
-**nil: finished, delete it; error: not finished, redeliver it** — not a report
-of whether the SMS succeeded. For a genuine HTTP 400 the worker still wrote
-`state='failed'` and then returned the provider's error. The database said
-*finished*; the queue was told *not finished*:
+job only when the error is nil. So the return value is an instruction, not a
+report of whether the SMS succeeded:
+
+- **nil:** finished, delete it.
+- **error:** not finished, redeliver it.
+
+For a genuine HTTP 400 the worker still wrote `state='failed'` and then
+returned the provider's error. The database said *finished*; the queue was
+told *not finished*:
 
 1. The job stayed on the queue for the 60 s visibility timeout.
 2. SQS redelivered it.
 3. `ClaimAndLoad` refused the `failed` row; the delivery was counted `skipped`.
 4. The worker returned nil and the consumer deleted it.
 
-No message was lost and the provider was not called twice — but every
-permanent failure cost a wasted receive, a claim query and an `sqs handler
-error` log for a message that had been handled correctly (1,125 of them in
-run B). It is also exactly the pairing — terminal write, then error return —
-that turned run A's misclassification into silent loss instead of a
-dead-letter-queue alarm.
+No message was lost and the provider was not called twice. But every permanent
+failure cost a wasted receive, a claim query and an `sqs handler error` log,
+for a message that had been handled correctly. Run B had 1,125 of them. It is
+also the same pairing (terminal write, then error return) that turned run A's
+misclassification into silent loss instead of a dead-letter-queue alarm.
 
 **Change.** After a permanent rejection is durably recorded, `Process` returns
 nil and logs the rejection itself; the outcome metric (`provider_rejected`),
 the stored attempt and `last_error` still record it. The return contract is
 now written on `Process`, and errors are returned only when the row is still
 claimable on the next delivery (released to `queued`) or nothing was written.
-Regression test: `TestProcessor_PermanentFailureIsAcknowledged` — a 400 is
+Regression test: `TestProcessor_PermanentFailureIsAcknowledged`. A 400 is
 attempted once, `Process` returns nil on the first delivery, and a duplicate
 delivery does not reach the provider.
-

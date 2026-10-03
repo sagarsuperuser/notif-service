@@ -1,5 +1,8 @@
 # 04) Scaling and Failure Domains
 
+This page shows how the system scales and where it can fail. It also lists
+the controls that limit those failures.
+
 ```mermaid
 flowchart LR
   subgraph ext[External]
@@ -44,18 +47,33 @@ flowchart LR
   controls -.-> data
 ```
 
-Backpressure operating rule:
-- Tune `notif-worker` concurrency and autoscaling bounds based on queue lag and DB headroom, so backlog is absorbed in SQS while Postgres and downstream dependencies stay within safe CPU, connection, and timeout limits.
-- Keep retries bounded with exponential backoff and use circuit breakers to fail fast during sustained downstream failures, preventing retry storms from exhausting DB and compute resources.
+How to read the diagram:
+- The "Runtime Domains" box names the three failure domains: ingress, app
+  processing, and data. It is a summary, so its nodes are not wired to the
+  components (`notif-api`, SQS, Postgres) next to it.
+- Red nodes are failure risks. The blue node lists the controls, which apply
+  to the app processing and data domains.
 
-How this scales (and what it costs today by not pre-building it):
+Backpressure operating rule:
+- Tune `notif-worker` concurrency and autoscaling bounds based on queue lag
+  and DB headroom. The backlog then waits in SQS, while Postgres and
+  downstream dependencies stay within safe CPU, connection, and timeout
+  limits.
+- Keep retries bounded with exponential backoff, and use circuit breakers to
+  fail fast during sustained downstream failures. Together these stop retry
+  storms from exhausting DB and compute resources.
+
+How this scales, and what it costs today not to build more in advance:
 - Workers scale by one variable (`worker_count`; KEDA scales pods within the
-  pool). Workers are on-demand (`workers_use_spot = false`, the default and the
-  only option this account's spot quota allows); a spot pool is a one-variable
-  change once the quota is raised, at the cost of interruption risk.
-- The single k3s server is the availability trade: control plane and ingress
-  entry ride one instance (its EIP survives replacement; ~5 min to recreate
-  from Terraform). If that ever stops being acceptable, the upgrade path is
-  the machinery deliberately removed on 2026-08-20: 3 servers with etcd, a
-  join endpoint, and a load balancer in front of ingress — reintroduce it
-  when the requirement is real, not before.
+  pool).
+- Workers are on-demand (`workers_use_spot = false`). This is the default,
+  and the only option this account's spot quota allows.
+- A spot pool is a one-variable change once the quota is raised. The cost is
+  interruption risk.
+- The single k3s server is the availability trade. The control plane and the
+  ingress entry both run on one instance. Its EIP survives replacement, and
+  the instance takes ~5 min to recreate from Terraform.
+- If the single-server trade ever stops being acceptable, the upgrade path
+  is the machinery deliberately removed on 2026-08-20. That machinery is 3
+  servers with etcd, a join endpoint, and a load balancer in front of
+  ingress. Reintroduce it when the requirement is real, not before.

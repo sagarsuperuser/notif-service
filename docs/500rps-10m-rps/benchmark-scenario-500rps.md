@@ -1,14 +1,23 @@
 # Benchmark Scenario: 500 RPS for 10 Minutes
 
-> **Superseded.** This is the February 2026 run that found the processing ceiling at ~241 ops/sec; the current measurements are in [benchmark-2026-08-14.md](../benchmark-2026-08-14.md).
+> **Superseded.** This is the February 2026 run that found the processing ceiling at ~241 ops/sec.
+> The current measurements are in [benchmark-2026-08-14.md](../benchmark-2026-08-14.md).
 
+> **Historical record.** This run used the pre-2026-08-20 architecture:
+> - NAT + private subnets
+> - internal API NLB path
+> - bastion
+> - RDS Postgres behind RDS Proxy
+> - role-pinned node pools
+>
+> The infrastructure has since been simplified (see `docs/architecture/`).
+> The numbers here describe the runs as they ran and are not restated.
 
-> Historical record: this ran on the pre-2026-08-20 architecture (NAT + private subnets, internal API NLB path, bastion, RDS Postgres behind RDS Proxy, role-pinned node pools). The infrastructure has since been simplified — see `docs/architecture/` — but the numbers here describe the runs as they ran and are not restated.
 ## 1) Test Goal
 Validate steady-state behavior at **500 RPS** for **10 minutes**.
 
 ## 2) Environment
-Fill these with exact run values for traceability.
+Exact run values, recorded for traceability.
 
 - Commit SHA: `sha-e409a91`
 - Region: `ap-south-1`
@@ -71,13 +80,14 @@ Fill these with exact run values for traceability.
 - p99: **943 ms**
 
 ## 5) Interpretation
-- System is functional and stable end-to-end, but slow at this load profile.
+- System is functional and stable end-to-end. It is slow at this load profile.
 - System is **over capacity** at 500 RPS for this topology.
 - Backlog grows because **ingress (500 RPS) > processing (~241 ops/sec)**.
-- Elevated E2E latency is dominated by **queueing delay**, not provider call latency (provider p95 is sub-500ms).
+- Elevated end-to-end (E2E) latency comes mostly from **queueing delay**. Provider call latency is a small part (provider p95 is sub-500ms).
 
 ## 6) Pass/Fail vs SLO
 ### Example SLO
+This example SLO is the bar this run is judged against:
 - E2E p95 < 2 minutes
 - API success rate >= 99.9%
 - No sustained queue growth over steady window
@@ -96,7 +106,7 @@ Primary bottleneck appears in the processing path:
 3. Compare before/after using identical Grafana queries and SQL windows.
 
 ## 9) Evidence Checklist
-Attach the following artifacts for review:
+Artifacts to attach for review:
 - Grafana screenshots:
   - API RPS, Queue Enqueue RPS
   - queue depth / queue age

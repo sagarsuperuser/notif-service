@@ -48,7 +48,25 @@ flowchart TB
   prom --> grafana
 ```
 
-Access for operators is SSM (no bastion, no SSH required); kubectl reaches
-the server EIP on 6443, SG-locked to the admin CIDR. SQS is reached via the
-internet gateway (public subnets — no NAT, so no per-GB toll on the
-worker→SQS path).
+The diagram shows three paths:
+
+- **Requests:** clients reach `notif-api` through the ingress-nginx NodePort
+  (ports 30080/30443) on the server EIP (Elastic IP, a fixed public address).
+  The provider reaches the webhook ingest service through the same entry
+  point.
+- **Messages:** `notif-api` puts messages on the SQS send queue.
+  `notif-worker` reads from that queue and calls the provider. KEDA scales
+  the worker by queue depth.
+- **Data and metrics:** all three services connect to Postgres RDS directly
+  through pgx pools. Each service exposes metrics to Prometheus, and Grafana
+  reads from Prometheus.
+
+How operators and the services reach the cluster and AWS:
+
+- Operators get access through SSM (AWS Systems Manager). There is
+  no bastion host, and SSH is not required.
+- `kubectl` reaches the server EIP on port 6443. The security group (SG)
+  allows that port only from the admin CIDR.
+- SQS is reached through the internet gateway, because the nodes sit in
+  public subnets. There is no NAT gateway, so the worker-to-SQS
+  path carries no NAT charge, which AWS bills per GB.

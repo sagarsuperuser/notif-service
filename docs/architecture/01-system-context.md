@@ -40,8 +40,27 @@ flowchart LR
     webhook -. metrics .-> mon
 ```
 
-No load balancer (the account cannot create them; DNS points at the server
-EIP), no RDS Proxy (each service's pgx pool talks to Postgres directly), no
-webhook queue (the webhook handler applies the status update in one
-statement). The pre-2026-08-20 topology these replaced is recorded in the
-campaign docs.
+How to read the diagram:
+
+- Clients, campaign systems and the k6 load job reach the server EIP. The
+  EIP leads to an ingress-nginx NodePort, which routes requests to
+  `notif-api`.
+- `notif-api` writes to Postgres (RDS) and puts messages on the SQS send
+  queue.
+- `notif-worker` reads the send queue and calls the provider, a Twilio mock.
+  It also writes to Postgres.
+- The provider sends status callbacks back through the same entry point. They
+  reach `notif-webhook`, which writes the status to Postgres.
+- KEDA scales `notif-worker`.
+- All three services send metrics to Prometheus and Grafana.
+
+Three parts are not in this topology:
+
+- **No load balancer.** The account cannot create them, so DNS points at the
+  server EIP.
+- **No RDS Proxy.** Each service's pgx pool talks to Postgres directly.
+- **No webhook queue.** The webhook handler applies the status update in one
+  statement.
+
+The campaign docs record the pre-2026-08-20 topology that these choices
+replaced.
