@@ -5,6 +5,8 @@ This folder contains in-cluster k6 jobs with per-request dynamic `idempotencyKey
 ## Scenarios
 
 ### 1) Steady 500 req/sec for 10 minutes
+
+The file name says `30m`, but the manifest runs for 10 minutes.
 ```bash
 kubectl apply -f deploy/k8s/tools/k6/notif-api-500rps-30m.yaml
 kubectl logs -l job-name=k6-notif-api-500rps-30m -f
@@ -46,9 +48,10 @@ at half of it. The knee is the step where p99 departs from flat.
 Thresholds fail the run if acceptance drops below 99.9% or accept p99 passes
 500ms, so the knee is identified by the run rather than by eye.
 
-The job is pinned to the monitoring pool. k6 has no scheduling constraints of
-its own, so it otherwise lands on the general pool next to the API pods and
-competes for CPU with the thing being measured.
+The job has no node pin: the role-pinned node pools were removed on
+2026-08-20. k6 can therefore land on a worker next to the API pods and compete
+for CPU with the thing being measured. For a measurement run, give it its own
+node by scaling `worker_count` up by one.
 
 ## After any run
 

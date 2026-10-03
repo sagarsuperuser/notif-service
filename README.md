@@ -2,7 +2,7 @@
 
 Event-driven SMS notification service built in Go.
 
-Correctness under injected provider failure: idempotent at-least-once delivery, no duplicate sends, no drops, dead-letter redrive drilled — and throughput reported only alongside invariants checked against the database in SQL (`internal/verify` defines nine), never latency alone.
+Correctness under injected provider failure: idempotent at-least-once delivery, no duplicate sends, no drops, dead-letter redrive drilled — and throughput reported only alongside invariants checked against the database in SQL (`internal/verify` defines ten; two of them apply only when a daily cap is set), never latency alone.
 
 It accepts message requests, enqueues send jobs to SQS, processes sends asynchronously in workers, ingests provider webhooks, and reconciles final delivery state.
 
@@ -10,9 +10,11 @@ It accepts message requests, enqueues send jobs to SQS, processes sends asynchro
 - `cmd/api`: HTTP API (`POST /v1/sms/messages`, `GET /v1/messages/{id}`)
 - `cmd/worker`: SQS consumer that sends messages to provider
 - `cmd/webhook`: webhook ingest endpoint
+- `cmd/mock-provider`: simulated SMS provider (Twilio-shaped send endpoint that posts status callbacks to the webhook) for local and load-test runs
+- `cmd/verify-run`: checks a load test's results against the database; exits non-zero if an invariant is violated
 - `internal/`: domain, service, queue, store, provider, observability code
 - `deploy/k8s`: Kubernetes manifests and overlays
-- `infra`: Terraform infrastructure — deliberately small: public subnets + SG-locked ingress (no NAT), no load balancer (DNS → server EIP → ingress-nginx NodePort), one k3s server + one spot worker ASG, RDS Postgres reached directly by the pgx pools (no RDS Proxy), SQS FIFO + DLQ, SSM for access
+- `infra`: Terraform infrastructure — deliberately small: public subnets + SG-locked ingress (no NAT), no load balancer (DNS → server EIP → ingress-nginx NodePort), one k3s server + one on-demand worker ASG (spot optional via `workers_use_spot`), RDS Postgres reached directly by the pgx pools (no RDS Proxy), SQS standard queue + DLQ, SSM for access
 - `docs/architecture`: architecture diagrams
 
 ## Architecture (High Level)
@@ -34,8 +36,21 @@ Prerequisites:
 make init
 ```
 
-2. Ensure env file exists:
-- `make run-*` targets load `.env.local`
+2. Create the env file:
+- `make run-*` targets load `.env.local`. It is gitignored and the repo has no template for it (`notif-secrets.example.env` lists only the secret keys for the k8s `notif-secrets` secret), so create it yourself. The required variables, with values for the `make init` stack (Postgres and LocalStack from `docker-compose.local.yml`):
+```bash
+cat > .env.local <<'EOF'
+DB_DSN=postgres://notif:notif@localhost:5432/notif?sslmode=disable
+AWS_REGION=ap-south-1
+LOCALSTACK_ENDPOINT=http://localhost:4566
+SQS_QUEUE_URL=<the notif-send URL that make init printed>
+TWILIO_ACCOUNT_SID=<your-sid>
+TWILIO_AUTH_TOKEN=<your-token>
+PUBLIC_WEBHOOK_URL=http://localhost:8081/v1/webhooks/twilio/status
+EOF
+```
+- `make init` lists the queues it created; copy the `notif-send` URL from that output (or run `docker exec notif-localstack awslocal sqs get-queue-url --queue-name notif-send`).
+- The worker sends to `TWILIO_BASE_URL`, which defaults to the real Twilio API (`https://api.twilio.com`). Set it if you do not want real sends. Other optional variables and their defaults are in `internal/config/config.go`.
 - Update `.env.local` values for your local setup if needed.
 
 3. Run services (separate terminals):

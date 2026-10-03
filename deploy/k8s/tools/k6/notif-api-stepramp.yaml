@@ -6,10 +6,10 @@
 # long enough for queues to reach steady state at each one, so the knee shows
 # up as the step where latency departs from flat.
 #
-# The load generator is pinned to the monitoring pool. k6 has no scheduling
-# constraints by default, so it would otherwise land on the general pool
-# alongside the API pods — the generator competing for CPU with the thing being
-# measured, which turns the result into a statement about the harness.
+# The load generator has no node pin (the role-pinned pools were removed on
+# 2026-08-20), so it can land next to the API pods and compete for CPU with the
+# thing being measured. For a measurement run, give it its own node; see the
+# note above `containers` below.
 apiVersion: batch/v1
 kind: Job
 metadata:
