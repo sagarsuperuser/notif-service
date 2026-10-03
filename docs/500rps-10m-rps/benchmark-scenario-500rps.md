@@ -48,7 +48,7 @@ Exact run values, recorded for traceability.
 - Enqueue rate (peak): **500 RPS**
 - Worker processed rate (peak): **242 ops/sec**
 - Webhook RPS (peak): **733 RPS**
-- Backlog drain result: **~293,000 messages drained in ~28 minutes** (during + post-load)
+- Backlog drain result: **~294,000 messages drained in ~28 minutes** (during + post-load; 293,702 messages created in the run window, see `postgres/db_events.png`)
 
 ### Latency
 - End-to-end latency (message created -> first provider hit):
@@ -142,4 +142,4 @@ kubectl top nodes
 
 ## 11) Change Log
 - v1: Initial report for 500 RPS steady 10-minute scenario.
-- v2: Added backlog drain observation (~294k in ~30 min).
+- v2: Added backlog drain observation (~294k in ~28 min; first noted as ~30 min, both approximations of the same run — the SQL snapshot does not pin the exact drain end time).

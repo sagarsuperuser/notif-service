@@ -64,8 +64,10 @@ instruction, not a report: nil means finished, and an error means redeliver.
 A permanent rejection was still written `failed` and then returned as an
 error, so each one was redelivered once and skipped. This was the same
 disagreement between the database and the queue that made run A's loss
-invisible. Final outcomes now return nil. The contract is documented on
-`Process` and in `docs/architecture/03`, and pinned by
+invisible (run A is the pre-fix worker image in the 15 August before/after
+runs, [retry-handling-ab-2026-08-15.md](campaign-100k/retry-handling-ab-2026-08-15.md)).
+Final outcomes now return nil. The contract is documented on `Process` and in
+`docs/architecture/03`, and pinned by
 `TestProcessor_PermanentFailureIsAcknowledged`.
 
 **Cut database round-trips per message from 13 to 4** by collapsing
@@ -123,9 +125,9 @@ tested by injecting the violation it exists to detect.
 
 ## The two-minute walkthrough
 
-**Shape.** Three services around one state machine: queued, processing,
-submitted, delivered or failed. The API's only job is to accept and durably
-queue. Everything slow lives behind the queue.
+**Shape.** Three services (API, worker, webhook) around one state machine:
+queued, processing, submitted, delivered or failed. The API's only job is to
+accept and durably queue. Everything slow lives behind the queue.
 
 **The design decision.** Statements per request, not requests per second, set
 a database's CPU. At 500 requests/second, seven statements per request means
@@ -221,9 +223,10 @@ last one.
 
 ## Correctness review, 2 October 2026
 
-This section records what a full review of the four services, the schema and
-the infrastructure found: what was fixed, and the gaps left open. Every finding
-was traced in code before it was acted on. Fixed (see CHANGELOG):
+This section records what a full review of the four deployed services (API,
+worker, webhook, mock provider), the schema and the infrastructure found: what
+was fixed, and the gaps left open. Every finding was traced in code before it
+was acted on. Fixed (see CHANGELOG):
 
 - **Queue answer vs database state.** Permanent rejections are now
   acknowledged. A duplicate delivery of a message another worker holds is
