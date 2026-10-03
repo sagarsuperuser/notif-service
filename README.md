@@ -2,9 +2,15 @@
 
 Event-driven SMS notification service built in Go.
 
-Correctness under injected provider failure: idempotent at-least-once delivery, no duplicate sends, no drops, dead-letter redrive drilled — and throughput reported only alongside invariants checked against the database in SQL (`internal/verify` defines ten; two of them apply only when a daily cap is set), never latency alone.
-
 It accepts message requests, enqueues send jobs to SQS, processes sends asynchronously in workers, ingests provider webhooks, and reconciles final delivery state.
+
+**Start here:** [engineering notes](docs/engineering-notes.md) (a two-minute read on what this project demonstrates), then [Results](#results).
+
+It is correct under injected provider failure:
+
+- Delivery is idempotent and at-least-once, with no duplicate sends and no drops.
+- Dead-letter redrive has been drilled.
+- Throughput is reported only together with invariants checked against the database in SQL, never as latency alone. `internal/verify` defines ten invariants; two of them apply only when a daily cap is set.
 
 ## What Is In This Repo
 - `cmd/api`: HTTP API (`POST /v1/sms/messages`, `GET /v1/messages/{id}`)
@@ -14,7 +20,13 @@ It accepts message requests, enqueues send jobs to SQS, processes sends asynchro
 - `cmd/verify-run`: checks a load test's results against the database; exits non-zero if an invariant is violated
 - `internal/`: domain, service, queue, store, provider, observability code
 - `deploy/k8s`: Kubernetes manifests and overlays
-- `infra`: Terraform infrastructure — deliberately small: public subnets + SG-locked ingress (no NAT), no load balancer (DNS → server EIP → ingress-nginx NodePort), one k3s server + one on-demand worker ASG (spot optional via `workers_use_spot`), RDS Postgres reached directly by the pgx pools (no RDS Proxy), SQS standard queue + DLQ, SSM for access
+- `infra`: Terraform infrastructure, kept deliberately small:
+  - public subnets and SG-locked ingress (no NAT)
+  - no load balancer: DNS → server EIP (Elastic IP) → ingress-nginx NodePort
+  - one k3s server and one on-demand worker ASG (spot optional via `workers_use_spot`)
+  - RDS Postgres reached directly by the pgx pools (no RDS Proxy)
+  - SQS standard queue + DLQ
+  - SSM for access
 - `docs/architecture`: architecture diagrams
 
 ## Architecture (High Level)
@@ -23,6 +35,27 @@ It accepts message requests, enqueues send jobs to SQS, processes sends asynchro
 3. Provider webhook applies the terminal status update in one statement (ingest-only handler; no intermediate queue).
 
 See diagrams: `docs/architecture/README.md`.
+
+## Results
+
+- [100k campaign](docs/campaign-100k/README.md): 100,000 delivered in 293 s, with zero
+  duplicates, zero drops and zero dead-lettered. The run was reconciled against AWS
+  CloudWatch, a recording this service does not produce. Sends went to the mock
+  provider, and nothing was set to fail.
+- [Failure handling under load](docs/campaign-100k/retry-handling-ab-2026-08-15.md):
+  before/after runs on live AWS. Before the fix, 8,728 of 100,000 sends were being
+  silently discarded by a classifier that tested the error before the HTTP status.
+  After the fix, a provider outage lost zero messages, and one redrive recovered a full
+  dead-letter queue.
+- [Accept-path benchmark](docs/benchmark-2026-08-14.md): the accept path sustained
+  2,000 accepts/sec at p99 142 ms. The doc also explains why the send path had a
+  separate ceiling of ~142/s: our own limiter.
+- [Measured improvements](docs/measured-improvements.md): every figure is re-derivable,
+  and withdrawn claims are kept, not deleted.
+- [Architecture](docs/architecture/) · [Grafana dashboards](deploy/grafana/dashboards/)
+- [500 RPS capacity study (Feb 2026)](docs/500rps-10m-rps/benchmark-scenario-500rps.md):
+  the earlier run that found the processing ceiling at ~241 ops/sec. It is superseded,
+  and kept because it is where the bottleneck work started.
 
 ## Local Quick Start
 
@@ -37,7 +70,9 @@ make init
 ```
 
 2. Create the env file:
-- `make run-*` targets load `.env.local`. It is gitignored and the repo has no template for it (`notif-secrets.example.env` lists only the secret keys for the k8s `notif-secrets` secret), so create it yourself. The required variables, with values for the `make init` stack (Postgres and LocalStack from `docker-compose.local.yml`):
+- `make run-*` targets load `.env.local`. It is gitignored and the repo has no template for it, so create it yourself.
+- `notif-secrets.example.env` is not that template: it lists only the secret keys for the k8s `notif-secrets` secret.
+- The required variables are below, with values for the `make init` stack (Postgres and LocalStack from `docker-compose.local.yml`):
 ```bash
 cat > .env.local <<'EOF'
 DB_DSN=postgres://notif:notif@localhost:5432/notif?sslmode=disable
@@ -89,26 +124,8 @@ make reset             # stop + delete volumes
 - K8s deploy (dev overlay): `make k8s-up`
 - Restart workloads: `make k8s-restart`
 - Terraform stack: `infra/`
-- Dev note: **branch from `origin/main` explicitly** (`git fetch origin && git switch -c my-branch origin/main`). Local `main` checkouts in worktree setups run behind — three stale-base incidents in one week, including the PR that added this line.
-
-## Results
-
-- [100k campaign](docs/campaign-100k/README.md) — 100,000 delivered in 293 s, reconciled
-  against AWS CloudWatch (a recording this service does not produce), zero duplicates,
-  zero drops, zero dead-lettered.
-- [Failure handling under load](docs/campaign-100k/retry-handling-ab-2026-08-15.md) —
-  before/after runs on live AWS: 8,728 of 100,000 sends were being silently discarded by
-  a classifier that tested the error before the HTTP status; after the fix, a provider
-  outage lost zero messages and a full dead-letter queue was recovered with one redrive.
-- [Accept-path benchmark](docs/benchmark-2026-08-14.md) — 2,000 accepts/sec sustained,
-  p99 142 ms, and why the send path's separate ~142/s ceiling was our own limiter.
-- [Measured improvements](docs/measured-improvements.md) — every figure re-derivable;
-  withdrawn claims kept, not deleted.
-- [Architecture](docs/architecture/) · [Grafana dashboards](deploy/grafana/dashboards/)
-- [500 RPS capacity study (Feb 2026)](docs/500rps-10m-rps/benchmark-scenario-500rps.md)
-  — the earlier run that found the processing ceiling at ~241 ops/sec. Superseded;
-  kept because it is where the bottleneck work started.
+- Dev note: branch from `origin/main` explicitly (`git fetch origin && git switch -c my-branch origin/main`). Local `main` checkouts in worktree setups run behind. This caused three stale-base incidents in one week, including the PR that added this line.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
