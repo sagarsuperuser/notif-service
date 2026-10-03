@@ -159,7 +159,7 @@ FIFO's five-minute deduplication window is also weaker than the
 to a standard queue removed the ceiling.
 
 Not measured: no run was taken against the FIFO queue, so there is no
-before-and-after here. The 300 figure is Twilio's documented limit, not an
+before-and-after here. The 300 figure is AWS's documented SQS FIFO limit, not an
 observation.
 
 ## 6. Defects found by operating the system
