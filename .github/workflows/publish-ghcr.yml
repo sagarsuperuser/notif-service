@@ -8,6 +8,10 @@ on:
     # every bump merge would beget the next, forever.
     paths-ignore:
       - deploy/k8s/overlays/prod/kustomization.yaml
+      # Docs-only merges change no image: building would publish identical
+      # images and open a tag-bump PR for nothing.
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch: {}
 
 permissions:
